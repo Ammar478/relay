@@ -63,8 +63,11 @@ model derives one from the records that carry a real order: baton mtimes,
 `git log` on the relay's branch, and the check transitions in `state.json`.
 Entries with no honest timestamp are pinned to the leg that claimed them and
 flagged `exact: False`; entries with no honest time at all are not invented.
-Commits are bounded to the relay's own window - the project's history from
-before the run began is not part of the run's story (ACC-DATA-009).
+Commits are bounded to the relay's own window - the branch it runs on, or the
+run's own earliest event where there is no branch - and a commit a baton
+attributes to a leg is kept before any other, and is never dropped for being
+older than that window, so the log tells the run's story rather than the
+repository's (ACC-DATA-009).
 
 Determinism
 -----------
@@ -75,6 +78,7 @@ argv with a timeout and a commit cap, and its absence is not an error.
 """
 
 import json
+import os
 import pathlib
 import re
 import subprocess
@@ -307,8 +311,14 @@ BATON_STATUS = {"success": "completed", "ok": "completed", "partial": "partial",
 # A baton written to the template carries `**Commit:** <sha>` as a field; that
 # wins. Otherwise take the first commit-shaped reference in the prose, which is
 # a guess the view must not dress up as certainty.
+#
+# Markdown bold can close on either side of the colon - `**Commit:** sha` and
+# `**Commit**: sha` are the same field, and runners of this relay have written
+# both. Reading only one of them costs the leg its commit, and a commit no
+# baton is read as naming is a commit the log cannot attribute (ACC-DATA-009).
 COMMIT_FIELD_RE = re.compile(
-    r"^\W*(?:\*\*)?commit(?:\*\*)?\s*:\s*`?([0-9a-f]{7,40})`?", re.I | re.M)
+    r"^\W*(?:\*\*)?commit(?:\*\*)?\s*:\s*(?:\*\*)?\s*`?([0-9a-f]{7,40})`?",
+    re.I | re.M)
 SHA_RE = re.compile(r"(?:commit|sha)[^`\n]*`([0-9a-f]{7,40})`", re.I)
 STATUS_RE = re.compile(r"^\W*(?:\*\*)?status(?:\*\*)?\s*:\s*(\w+)", re.I | re.M)
 
@@ -750,12 +760,28 @@ def _attention(checks, extras, leg_counts):
 # entries. Batons are already bounded by the number of legs.
 #
 # These three are the outer safety net, sized for the repaint budget rather
-# than for the run. What a commit belongs to the log at all is decided by the
-# relay's own window in `_commit_entries` (ACC-DATA-009), which is a much
-# tighter bound in practice and is not a replacement for these.
+# than for the run. Whether a commit belongs to the log at all is decided by
+# the relay's own window in `_relay_commits` and the attribution budget in
+# `_commit_entries` (ACC-DATA-009), which are much tighter bounds in practice
+# and are not a replacement for these. The entry bound is applied to the
+# relay's own events before the budget is worked out, so that the loosest bound
+# in the module cannot re-order what the tightest one decided.
 LOG_MAX_COMMITS = 200
 LOG_MAX_ENTRIES = 300
 GIT_TIMEOUT = 3.0
+
+# The names a repository's default branch goes by, as full refs so nothing has
+# to be resolved from a shorthand that could mean two things. A commit
+# reachable from one of these was in the project before the relay's branch
+# existed; the run's own commits are exactly the ones its branch adds on top,
+# which is the branch point ACC-DATA-009 opens the window at.
+GIT_DEFAULT_REFS = (
+    "refs/heads/main",
+    "refs/heads/master",
+    "refs/remotes/origin/HEAD",
+    "refs/remotes/origin/main",
+    "refs/remotes/origin/master",
+)
 
 # Deterministic tie-break when two events share a timestamp. A check transition
 # is pinned to the landing it was claimed at, so it reads just above it; the
@@ -827,31 +853,47 @@ def _in_a_repo(path, project):
     return False
 
 
-def _git_commits(relay_dir, project):
-    """[(epoch, short sha, subject)] for the tip of the relay's branch.
+def _git(relay_dir, *args):
+    """`git -C <relay_dir> <args>` stdout, or None when git could not answer.
 
     Never raises: git may be absent, the directory may not be a repository, the
     repository may have no commits, or git may be slow enough to be worth
     giving up on. Any of those degrades to no commit entries, and the log is
     still worth having from the batons alone.
-    """
-    if not _in_a_repo(relay_dir, project):
-        return []
-    try:
-        # A list argv, never a shell: `relay_dir` is a path from the caller and
-        # is passed as one argument, not interpolated into a command string.
-        out = subprocess.run(
-            ["git", "-C", str(relay_dir), "log", "--no-color",
-             f"--max-count={LOG_MAX_COMMITS}", "--format=%ct%x1f%h%x1f%s"],
-            capture_output=True, text=True, timeout=GIT_TIMEOUT,
-        )
-    except (OSError, ValueError, subprocess.SubprocessError):
-        return []
-    if out.returncode != 0:
-        return []
 
+    RULE: the caller's git environment is dropped. `GIT_DIR` points git at a
+    repository of the environment's choosing whatever `-C` says, and
+    `GIT_WORK_TREE`, `GIT_COMMON_DIR`, `GIT_OBJECT_DIRECTORY` and the
+    `GIT_CONFIG_*` overrides each redirect a read in their own way - so a
+    dashboard opened from a shell that exports one would report a foreign
+    repository's commits as this relay's. That is the defect `_in_a_repo`
+    bounds away on the filesystem, walked back in through the environment.
+    Every `GIT_*` name goes, rather than the handful that redirect today.
+    """
+    # A list argv, never a shell: `relay_dir` is a path from the caller and is
+    # passed as one argument, not interpolated into a command string.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    try:
+        out = subprocess.run(["git", "-C", str(relay_dir), *args],
+                             capture_output=True, text=True,
+                             timeout=GIT_TIMEOUT, env=env)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return out.stdout if out.returncode == 0 else None
+
+
+def _git_log(relay_dir, exclude=()):
+    """[(epoch, short sha, subject)] for HEAD, newest first.
+
+    `exclude` is refs whose history is not this run's: git walks back from HEAD
+    and stops at every commit reachable from one of them, so what comes back is
+    the branch's own commits - everything from its branch point onwards.
+    """
+    out = _git(relay_dir, "log", "--no-color", f"--max-count={LOG_MAX_COMMITS}",
+               "--format=%ct%x1f%h%x1f%s", "HEAD",
+               *(("--not", *exclude) if exclude else ()))
     commits = []
-    for line in out.stdout.splitlines():
+    for line in (out or "").splitlines():
         parts = line.split("\x1f")
         if len(parts) != 3 or not parts[2].strip():
             continue
@@ -863,43 +905,106 @@ def _git_commits(relay_dir, project):
     return commits
 
 
-def _commit_entries(relay_dir, project, runners, own, now):
-    """Commit entries for the log, bounded to the relay's own window.
+def _default_branch_refs(relay_dir):
+    """The default-branch refs this repository actually has, in full form.
+
+    `for-each-ref` resolves the patterns and prints only what exists, so a
+    repository with no `main` yields an empty list rather than an error, and no
+    history is walked to find out - it is the cheapest question git answers.
+    """
+    out = _git(relay_dir, "for-each-ref", "--format=%(refname)", *GIT_DEFAULT_REFS)
+    return [line.strip() for line in (out or "").splitlines() if line.strip()]
+
+
+def _relay_commits(relay_dir, project, own):
+    """(commits, since) for this run, newest first (ACC-DATA-009).
+
+    A project's history is far longer and far busier than the relay that
+    supervises one slice of it, so a window decides which commits are the run's
+    at all. It opens in one of three places, in this order:
+
+    1. THE BRANCH POINT, when the relay runs on a branch of its own. Everything
+       the branch adds on top of the default branch is the run's work by
+       construction, and this is the only bound that can hold the first leg's
+       commit: a runner commits *before* it writes its baton, so the first
+       leg's commit is older than the earliest event the relay ever recorded.
+       Bounding by that event drops it - measured in this repository, by 46.7
+       seconds - which is exactly what "every commit attributable to a leg
+       appears" forbids. The walk itself is the window here, so `since` is None.
+    2. THE EARLIEST EVENT the relay recorded, returned as `since`, when there is
+       no branch to bound by: the relay runs on the default branch itself, or
+       the repository has no default branch under any of the names git gives
+       one. Commits older than the relay's first landing are the project's
+       history, not this run's - unless a baton names one, which is why `since`
+       is returned for the caller to apply rather than applied here.
+    3. NOWHERE, when the relay has recorded no event at all. A brand-new relay
+       has no window and nothing to count against, and the outer `--max-count`
+       walk is the only bound left. Showing a fresh relay its recent commits is
+       better than showing it nothing.
+
+    Two git invocations in the common case, both bounded by `GIT_TIMEOUT`: the
+    ref probe walks nothing, and a walk that comes back empty means HEAD is the
+    default branch, which is case 2.
+    """
+    if not _in_a_repo(relay_dir, project):
+        return [], None
+    defaults = _default_branch_refs(relay_dir)
+    if defaults:
+        branch = _git_log(relay_dir, exclude=defaults)
+        if branch:
+            return branch, None
+    commits = _git_log(relay_dir)
+    return commits, (min(entry["t"] for entry in own) if own else None)
+
+
+def _commit_entries(relay_dir, project, batons, own, budget, now):
+    """Commit entries for the log: the run's own commits first (ACC-DATA-009).
 
     `own` is every entry the relay's own records produced - landings, handoffs
-    and check transitions. Both bounds below are derived from it, and both
-    exist because a project's history is far longer and far busier than the
-    relay that supervises one slice of it (ACC-DATA-009).
+    and check transitions. It decides the window (see `_relay_commits`), and
+    `budget` is how many commits may sit beside it.
 
-    1. WINDOW. Commits dated before the earliest event the relay recorded are
-       the project's history, not this run's, and get no entry. The bound is
-       the relay's own oldest timestamp, never a count of commits: a relay
-       whose first baton is minutes old sits in a repo with years of history,
-       and the window is what tells the two apart.
-    2. COUNT. Inside the window a busy project still commits faster than a
-       relay lands legs, so at most as many commits are kept as the relay has
-       events of its own, newest first. The window alone does not achieve
-       ACC-DATA-009's second requirement - measured against the live
-       agent-service relay, the window cuts 200 commits to 28 beside 14 relay
-       events, which still buries the run. Only commits are capped. A baton, a
-       handoff or a check transition is never dropped to make room: they are
-       the events a supervisor came to the pane for.
+    WHICH commits the budget buys is the property, not how many. A relay's own
+    commits are the *oldest* inside its own window, so a budget spent newest
+    first removes exactly them and keeps the project's unrelated traffic: the
+    live agent-service relay carried 12 commit entries under that rule, none of
+    them attributable to a leg, which satisfies a count bound while inverting
+    what the log is for. So attribution is spent first - every commit a baton
+    names is kept - and only what is left over goes to the newest unattributed
+    commits inside the window.
 
-    With no events at all - a brand-new relay, nothing landed yet - there is no
-    window and nothing to count against, and the outer `--max-count` walk is
-    the only bound left. Showing a fresh relay its recent commits is better
-    than showing it nothing.
+    A commit a baton names is the run's own by construction, so no time bound is
+    applied to it: it is kept even where it is older than the relay's earliest
+    event, which is where a first leg's commit sits whenever there is no branch
+    point to open the window at instead.
+
+    Only commits are budgeted. A baton, a handoff or a check transition is
+    never dropped to make room: they are the events a supervisor came to the
+    pane for. And a relay that has recorded no event at all has neither a
+    window nor anything to budget against, so the walk comes through as it
+    came: see `_relay_commits`.
     """
-    commits = _git_commits(relay_dir, project)
+    commits, since = _relay_commits(relay_dir, project, own)
+    commits = sorted(commits, key=lambda c: -c[0])
+    # Attribution comes from the batons rather than from the runner rows, for
+    # the same reason the landings above do: a baton is what happened, and a
+    # leg that `legs.json` forgot - or has not marked done yet - has no runner
+    # row while its baton sits on disk naming the commit it landed.
+    #
+    # `_read_baton` cuts what the baton says and `_git_log` cuts git's own `%h`
+    # to the same seven characters, so this is an equality, not a prefix search.
+    by_commit = {b["commit"]: leg for leg, b in batons.items() if b["commit"]}
     if own:
-        since = min(entry["t"] for entry in own)
-        commits = [c for c in commits if c[0] >= since]
+        attributed = [c for c in commits if by_commit.get(c[1])]
+        rest = [c for c in commits if not by_commit.get(c[1])
+                and (since is None or c[0] >= since)]
+        kept = attributed[:budget]
+        kept += rest[:max(0, budget - len(kept))]
         # `git log` already yields newest first; sorting states the intent and
-        # is stable, so equal commit times keep git's own order and the slice
+        # is stable, so equal commit times keep git's own order and the merge
         # stays deterministic across builds.
-        commits = sorted(commits, key=lambda c: -c[0])[:len(own)]
+        commits = sorted(kept, key=lambda c: -c[0])
 
-    by_commit = {row["commit"]: row["leg"] for row in runners if row["commit"]}
     return [
         _log_entry(when, True, "commit", "note", f"commit {sha}: {subject}", now,
                    leg=by_commit.get(sha), commit=sha)
@@ -969,7 +1074,18 @@ def _derived_log(relay_dir, project, runners, batons, checks, now):
 
     # 2. commits, last: `entries` is now the relay's own record of itself, and
     # it is what bounds them (ACC-DATA-009).
-    entries += _commit_entries(relay_dir, project, runners, list(entries), now)
+    #
+    # The budget is settled here rather than inside `_commit_entries`, because
+    # the outer `LOG_MAX_ENTRIES` truncation would otherwise undo it: with 250
+    # events and 210 commits, a budget of "as many commits as events" merges to
+    # 460 entries, and keeping the newest 300 of those leaves 200 commits above
+    # 100 events - the bound inverted by the safety net meant to be the loosest
+    # thing in the module. Events are never dropped for a commit, so they are
+    # counted first and the commits get what room is left.
+    events = sorted(entries, key=lambda e: -e["t"])[:LOG_MAX_ENTRIES]
+    budget = min(len(events), LOG_MAX_ENTRIES - len(events))
+    entries = events + _commit_entries(
+        relay_dir, project, batons, entries, budget, now)
 
     entries.sort(key=lambda e: (-e["t"], LOG_KIND_ORDER[e["kind"]], e["m"]))
     return entries[:LOG_MAX_ENTRIES]

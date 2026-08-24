@@ -427,6 +427,26 @@ def test_a_baton_without_a_leg_is_reported_not_silently_dropped(relay):
     assert any("s2-test-quality" in w for w in model["warnings"])
 
 
+def test_a_bold_commit_field_is_read_whichever_side_the_colon_is_on(tmp_path):
+    """`**Commit:** <sha>` and `**Commit**: <sha>` are the same field of the
+    same template, and runners write both. A field that is not read costs the
+    leg its commit, and the progress log then has no leg to attribute that
+    commit to (ACC-DATA-009)."""
+    (tmp_path / "batons").mkdir()
+    (tmp_path / "legs.json").write_text(json.dumps(
+        {"relay": "bold",
+         "legs": [{"id": "inside", "status": "done"},
+                  {"id": "outside", "status": "done"}]}))
+    (tmp_path / "batons" / "inside.md").write_text(
+        "# Baton\nSTATUS: success\n**Commit:** 1a2b3c4\n")
+    (tmp_path / "batons" / "outside.md").write_text(
+        "# Baton\nSTATUS: success\n**Commit**: 5d6e7f8\n")
+
+    rows = {r["leg"]: r for r in relay_model.build(tmp_path)["runners"]}
+    assert rows["inside"]["commit"] == "1a2b3c4"
+    assert rows["outside"]["commit"] == "5d6e7f8"
+
+
 def test_baton_status_becomes_runner_status(relay):
     model = relay_model.build(relay("stale-currentleg"))
     rows = {r["leg"]: r for r in model["runners"]}
