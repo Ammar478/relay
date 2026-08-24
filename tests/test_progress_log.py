@@ -214,6 +214,57 @@ def test_no_git_repository_still_yields_a_log(relay):
     assert len(model["log"]) >= 10
 
 
+# --------------------------------------------------------------------------
+# the commit source is bounded at the relay's own project
+#
+# These build the fixture WHERE IT LIVES, not copied into tmp_path. Every other
+# test here copies first, in order to stamp baton mtimes, and that copy lands
+# outside any repository - which is exactly why no test could see the log
+# walking up out of the fixture and reporting THIS repository's commits as the
+# fixture relay's own. Assertions below must not depend on mtimes, since a
+# fresh clone stamps them all to checkout time.
+# --------------------------------------------------------------------------
+
+FIXTURES = REPO / "tests" / "fixtures"
+
+
+def _host_repo_subjects():
+    """Commit subjects of the repository the fixtures happen to live in."""
+    if not HAS_GIT or not (REPO / ".git").exists():
+        return []
+    out = subprocess.run(
+        ["git", "-C", str(REPO), "log", "--no-color", "--format=%s"],
+        capture_output=True, text=True)
+    return [s for s in out.stdout.splitlines() if s.strip()]
+
+
+def test_the_fixture_in_place_derives_no_commits_from_the_host_repo():
+    """`tests/fixtures/agent-service` has no `.git` of its own, so the log has
+    no commits to report - even though the fixture sits inside a repository
+    that has plenty. The search for a repo stops at the relay's own project."""
+    model = relay_model.build(FIXTURES / "agent-service", now=NOW)
+    assert entries_of(model, "commit") == []
+
+
+def test_no_host_repo_commit_subject_reaches_the_fixture_log():
+    """Named separately from the count above: a borrowed commit is a lie about
+    what happened in the fixture's relay, whatever `kind` it arrives under."""
+    model = relay_model.build(FIXTURES / "agent-service", now=NOW)
+    messages = " | ".join(e["m"] for e in model["log"])
+    for subject in _host_repo_subjects():
+        assert subject not in messages, subject
+
+
+def test_the_fixture_in_place_still_clears_the_ten_entry_bar():
+    """ACC-DATA-005's evidence line, asserted where the fixture actually lives.
+    The batons and check transitions carry it on their own; the commits it used
+    to borrow were never its own."""
+    model = relay_model.build(FIXTURES / "agent-service", now=NOW)
+    assert model["logSource"] == "derived"
+    assert len(model["log"]) >= 10
+    assert {e["kind"] for e in model["log"]} <= {"baton", "check", "start"}
+
+
 def _git(cwd, *args, when=None):
     env = dict(os.environ)
     env.update({
@@ -265,6 +316,20 @@ def test_commits_on_the_branch_become_log_entries(repo_relay):
     assert all(e["exact"] for e in commits)
     assert all(isinstance(e["commit"], str) and e["commit"] for e in commits)
     assert [e["t"] for e in commits] == [NOW - 7200, NOW - 9000]
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_project_that_is_itself_a_repo_still_gets_its_commits(repo_relay):
+    """The other side of the bound. A live relay is `<project>/.relay` and the
+    `.git` sits at `<project>` - which is exactly `relay.path`, the last
+    directory the search is allowed to look in. Bounding the walk must not cost
+    a real relay its own history."""
+    model = relay_model.build(repo_relay, now=NOW)
+    project = repo_relay.parent
+    assert model["relay"]["path"] == str(project.resolve())
+    assert (project / ".git").is_dir()
+    assert not (project.parent / ".git").exists()  # nothing above to borrow
+    assert len(entries_of(model, "commit")) == 2
 
 
 @pytest.mark.skipif(not HAS_GIT, reason="git is not installed")

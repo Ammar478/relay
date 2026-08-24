@@ -602,24 +602,42 @@ def _log_entry(t, exact, kind, level, message, now,
     }
 
 
-def _in_a_repo(path):
-    """True when `path` or one of its parents holds a `.git`.
+def _in_a_repo(path, project):
+    """True when `path`, or a parent of it no higher than `project`, holds a `.git`.
 
     Checked before spawning git at all: most relay directories a view opens are
     inside a repo, but a fixture or a copied relay is not, and a process spawn
     per repaint for a guaranteed failure is not free.
+
+    RULE: the search stops at `project` - the same `relay.path` the model
+    reports, so what the dashboard calls the project and where commits are read
+    from cannot drift apart. A live relay is `<project>/.relay` with its `.git`
+    at `<project>`, so it still finds its own repository; a relay that merely
+    happens to sit inside some other repository (every fixture under
+    `tests/fixtures/`) finds nothing, instead of reporting that repository's
+    commits as its own. When `project` is not on the walk at all - a coach can
+    write any `dashboard.json.path` they like - the relay directory itself is
+    the only honest bound left.
     """
     try:
         current = pathlib.Path(path).resolve()
     except OSError:
         return False
+    try:
+        limit = pathlib.Path(project).resolve()
+    except (OSError, TypeError, ValueError):
+        limit = current
+    if limit != current and limit not in current.parents:
+        limit = current
     for candidate in [current, *current.parents]:
         if (candidate / ".git").exists():
             return True
+        if candidate == limit:
+            break
     return False
 
 
-def _git_commits(relay_dir):
+def _git_commits(relay_dir, project):
     """[(epoch, short sha, subject)] for the tip of the relay's branch.
 
     Never raises: git may be absent, the directory may not be a repository, the
@@ -627,7 +645,7 @@ def _git_commits(relay_dir):
     giving up on. Any of those degrades to no commit entries, and the log is
     still worth having from the batons alone.
     """
-    if not _in_a_repo(relay_dir):
+    if not _in_a_repo(relay_dir, project):
         return []
     try:
         # A list argv, never a shell: `relay_dir` is a path from the caller and
@@ -655,7 +673,7 @@ def _git_commits(relay_dir):
     return commits
 
 
-def _derived_log(relay_dir, runners, batons, checks, now):
+def _derived_log(relay_dir, project, runners, batons, checks, now):
     """The story of the run, from the three records that carry a real order.
 
     1. A baton's mtime is when that leg landed, and its STATUS says how. Every
@@ -694,7 +712,7 @@ def _derived_log(relay_dir, runners, batons, checks, now):
 
     # 2. commits.
     by_commit = {row["commit"]: row["leg"] for row in runners if row["commit"]}
-    for when, sha, subject in _git_commits(relay_dir):
+    for when, sha, subject in _git_commits(relay_dir, project):
         entries.append(_log_entry(
             when, True, "commit", "note", f"commit {sha}: {subject}", now,
             leg=by_commit.get(sha), commit=sha))
@@ -724,7 +742,7 @@ def _derived_log(relay_dir, runners, batons, checks, now):
     return entries[:LOG_MAX_ENTRIES]
 
 
-def _log(extras, relay_dir, runners, batons, checks, now):
+def _log(extras, relay_dir, project, runners, batons, checks, now):
     """The Progress Log, and where it came from.
 
     ACC-DATA-006: a coach who writes `dashboard.json.log` is quoted verbatim,
@@ -740,7 +758,7 @@ def _log(extras, relay_dir, runners, batons, checks, now):
                    for e in raw]
         return entries, "dashboard"
 
-    entries = _derived_log(relay_dir, runners, batons, checks, now)
+    entries = _derived_log(relay_dir, project, runners, batons, checks, now)
     return (entries, "derived") if entries else ([], None)
 
 
@@ -845,7 +863,7 @@ def build(relay_dir, now=None):
     elif tokens is not None:
         warnings.append("dashboard.json: `tokens` is not an object; ignored")
 
-    log, log_source = _log(extras, relay_dir, runners, batons, checks, now)
+    log, log_source = _log(extras, relay_dir, path, runners, batons, checks, now)
 
     return {
         "relay": {
