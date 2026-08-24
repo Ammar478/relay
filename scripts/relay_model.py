@@ -39,16 +39,26 @@ seconds, not `"15:08"`. Nothing here is truncated, coloured or padded — a view
 decides how absence looks. Baton prose is left on disk and fetched by
 `baton_text()`; the model carries its path, its line count and its commit.
 
+The Progress Log is derived, not required
+-----------------------------------------
+`dashboard.json.log` is a coach's optional narration. When there is none the
+model derives one from the records that carry a real order: baton mtimes,
+`git log` on the relay's branch, and the check transitions in `state.json`.
+Entries with no honest timestamp are pinned to the leg that claimed them and
+flagged `exact: False`; entries with no honest time at all are not invented.
+
 Determinism
 -----------
 The same directory yields the same model. The only wall-clock input is the
 optional `now` argument, which is required before any elapsed-time field is
-filled in; without it those fields stay `None`.
+filled in; without it those fields stay `None`. `git` is read through a list
+argv with a timeout and a commit cap, and its absence is not an error.
 """
 
 import json
 import pathlib
 import re
+import subprocess
 
 __all__ = [
     "build",
@@ -323,10 +333,11 @@ def _leg_rows(legsfile, warnings):
 # runners
 # --------------------------------------------------------------------------
 
-def _runner_rows(relay_dir, leg_rows, active_id, now, warnings):
-    """One row per leg a runner has worked: every completed leg, plus the
-    running one. A baton fills the row in; without one the fields stay None
-    rather than becoming an em-dash (ACC-DATA-007).
+def _read_batons(relay_dir):
+    """{leg id: baton} for every baton on disk, read once per build.
+
+    Two panels want them - the runner rows and the derived progress log - and
+    the batons directory is read exactly once for both.
     """
     bdir = relay_dir / "batons"
     batons = {}
@@ -335,7 +346,14 @@ def _runner_rows(relay_dir, leg_rows, active_id, now, warnings):
             baton = _read_baton(path)
             if baton is not None:
                 batons[path.stem] = baton
+    return batons
 
+
+def _runner_rows(batons, leg_rows, active_id, now, warnings):
+    """One row per leg a runner has worked: every completed leg, plus the
+    running one. A baton fills the row in; without one the fields stay None
+    rather than becoming an em-dash (ACC-DATA-007).
+    """
     known = {leg["id"] for leg in leg_rows}
     for stem in sorted(batons):
         if stem not in known:
@@ -537,26 +555,193 @@ def _attention(checks, extras, leg_counts):
 
 
 # --------------------------------------------------------------------------
-# log — the seam ACC-DATA-005 fills in
+# log — the running story of what the relay has done (ACC-DATA-005/006)
 # --------------------------------------------------------------------------
 
-def _log(extras, relay_dir, leg_rows, checks, now):
-    """The Progress Log.
+# Bounds. `build()` runs once per repaint and must stay in the low
+# milliseconds, so the two unbounded sources are capped: git is asked for at
+# most this many commits (the walk stops there, it does not read the whole
+# history), and the merged log keeps at most this many of its most recent
+# entries. Batons are already bounded by the number of legs.
+LOG_MAX_COMMITS = 200
+LOG_MAX_ENTRIES = 300
+GIT_TIMEOUT = 3.0
 
-    SEAM (ACC-DATA-005, leg `derive-progress-log`): an explicit
-    `dashboard.json.log` is returned verbatim, which is all ACC-DATA-006 asks
-    for. Deriving a log from baton mtimes, `git log` and check transitions
-    belongs to the next leg and goes here — `leg_rows`, `checks`, `relay_dir`
-    and `now` are already passed in for it. Until then the model reports an
-    empty log and `logSource: None`, so a view can say "none" honestly instead
-    of rendering `1-0 of 0`.
+# Deterministic tie-break when two events share a timestamp. A check transition
+# is pinned to the landing it was claimed at, so it reads just above it; the
+# handoff into the next runner reads just below.
+LOG_KIND_ORDER = {"check": 0, "baton": 1, "commit": 2, "start": 3}
+
+BATON_LOG = {
+    "completed": ("calm", "{leg} landed"),
+    "partial":   ("warn", "{leg} landed partial, with work left undone"),
+    "failed":    ("bad", "{leg} failed"),
+}
+
+
+def _log_entry(t, exact, kind, level, message, now,
+               leg=None, check=None, commit=None):
+    """One row of the Progress Log.
+
+    `t` is epoch seconds and `age` is seconds since `t`, derived through the
+    injectable `now` so a view can render "7h ago" and a test can pin it.
+    `exact` says whether `t` is the event's own recorded time (a baton mtime, a
+    commit date) or a time inherited from the leg the event belongs to, which
+    is the best `state.json` can honestly offer.
+    """
+    return {
+        "t": float(t),
+        "age": (now - t) if now is not None else None,
+        "exact": exact,
+        "kind": kind,
+        "level": level,
+        "leg": leg,
+        "check": check,
+        "commit": commit,
+        "m": message,
+    }
+
+
+def _in_a_repo(path):
+    """True when `path` or one of its parents holds a `.git`.
+
+    Checked before spawning git at all: most relay directories a view opens are
+    inside a repo, but a fixture or a copied relay is not, and a process spawn
+    per repaint for a guaranteed failure is not free.
+    """
+    try:
+        current = pathlib.Path(path).resolve()
+    except OSError:
+        return False
+    for candidate in [current, *current.parents]:
+        if (candidate / ".git").exists():
+            return True
+    return False
+
+
+def _git_commits(relay_dir):
+    """[(epoch, short sha, subject)] for the tip of the relay's branch.
+
+    Never raises: git may be absent, the directory may not be a repository, the
+    repository may have no commits, or git may be slow enough to be worth
+    giving up on. Any of those degrades to no commit entries, and the log is
+    still worth having from the batons alone.
+    """
+    if not _in_a_repo(relay_dir):
+        return []
+    try:
+        # A list argv, never a shell: `relay_dir` is a path from the caller and
+        # is passed as one argument, not interpolated into a command string.
+        out = subprocess.run(
+            ["git", "-C", str(relay_dir), "log", "--no-color",
+             f"--max-count={LOG_MAX_COMMITS}", "--format=%ct%x1f%h%x1f%s"],
+            capture_output=True, text=True, timeout=GIT_TIMEOUT,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
+    if out.returncode != 0:
+        return []
+
+    commits = []
+    for line in out.stdout.splitlines():
+        parts = line.split("\x1f")
+        if len(parts) != 3 or not parts[2].strip():
+            continue
+        try:
+            when = float(parts[0])
+        except ValueError:
+            continue
+        commits.append((when, parts[1].strip()[:7], parts[2].strip()))
+    return commits
+
+
+def _derived_log(relay_dir, runners, batons, checks, now):
+    """The story of the run, from the three records that carry a real order.
+
+    1. A baton's mtime is when that leg landed, and its STATUS says how. Every
+       baton on disk counts, including one whose leg `legs.json` forgot: the
+       log records what happened, not what was planned.
+    2. Commits on the relay's branch are real events with real times. The
+       exchange zone is git, so a commit is a leg's work becoming visible.
+    3. `state.json` records that a check was judged more than once, or was sent
+       to a fix leg, but carries no timestamps. Those entries are pinned to the
+       landing of the leg that claimed the check and marked `exact: False`.
+       A check whose claiming leg has no baton has no honest time at all, and
+       gets no entry rather than a guessed one.
+    """
+    status_of = {row["leg"]: row["status"] for row in runners}
+
+    entries = []
+    # 1. landings.
+    for leg, baton in batons.items():
+        if status_of.get(leg) == "running":
+            continue  # its start is the event; the baton has not landed yet
+        status = status_of.get(leg) or baton["status"] or "completed"
+        level, template = BATON_LOG.get(status, BATON_LOG["completed"])
+        entries.append(_log_entry(
+            baton["mtime"], True, "baton", level, template.format(leg=leg), now,
+            leg=leg, commit=baton["commit"]))
+
+    # The handoff into the running leg. Every other runner's start is the
+    # previous runner's landing and is already an entry above; this one is the
+    # only leg in flight, and without it the log falls silent exactly when a
+    # supervisor is watching.
+    for row in runners:
+        if row["status"] == "running" and row["start"] is not None:
+            entries.append(_log_entry(
+                row["start"], False, "start", "note",
+                f"{row['leg']} started", now, leg=row["leg"]))
+
+    # 2. commits.
+    by_commit = {row["commit"]: row["leg"] for row in runners if row["commit"]}
+    for when, sha, subject in _git_commits(relay_dir):
+        entries.append(_log_entry(
+            when, True, "commit", "note", f"commit {sha}: {subject}", now,
+            leg=by_commit.get(sha), commit=sha))
+
+    # 3. check transitions.
+    anchor = {leg: baton["mtime"] for leg, baton in batons.items()}
+    for check in checks:
+        at = anchor.get(check["claimedBy"])
+        if at is None:
+            continue
+        rounds = check["round"]
+        if isinstance(rounds, int) and rounds > 1:
+            entries.append(_log_entry(
+                at, False, "check",
+                "bad" if check["status"] == "failed" else "warn",
+                f"{check['id']} took {rounds} judging rounds and is now "
+                f"{check['status']}", now,
+                leg=check["claimedBy"], check=check["id"]))
+        if check["fixLeg"]:
+            entries.append(_log_entry(
+                at, False, "check", "bad",
+                f"{check['id']} failed judging and was sent to fix leg "
+                f"{check['fixLeg']}", now,
+                leg=check["claimedBy"], check=check["id"]))
+
+    entries.sort(key=lambda e: (-e["t"], LOG_KIND_ORDER[e["kind"]], e["m"]))
+    return entries[:LOG_MAX_ENTRIES]
+
+
+def _log(extras, relay_dir, runners, batons, checks, now):
+    """The Progress Log, and where it came from.
+
+    ACC-DATA-006: a coach who writes `dashboard.json.log` is quoted verbatim,
+    down to whatever they put in `t` - it is their pane, and `logSource` tells
+    a view it is reading prose rather than the model's own numbers.
+    ACC-DATA-005: otherwise the log is derived. `logSource` is None when there
+    was nothing to derive, so a view says "none" honestly instead of rendering
+    `1-0 of 0`.
     """
     raw = extras.get("log")
     if isinstance(raw, list) and raw:
         entries = [e if isinstance(e, dict) else {"t": None, "m": str(e), "cls": None}
                    for e in raw]
         return entries, "dashboard"
-    return [], None
+
+    entries = _derived_log(relay_dir, runners, batons, checks, now)
+    return (entries, "derived") if entries else ([], None)
 
 
 # --------------------------------------------------------------------------
@@ -606,8 +791,9 @@ def build(relay_dir, now=None):
     if active_leg is not None:
         active_leg["isActive"] = True
 
+    batons = _read_batons(relay_dir)
     runners, runner_counts, active_runner = _runner_rows(
-        relay_dir, leg_rows, active_leg["id"] if active_leg else None, now, warnings)
+        batons, leg_rows, active_leg["id"] if active_leg else None, now, warnings)
 
     checks, check_groups, check_counts = _check_rows(state, extras, warnings)
 
@@ -659,7 +845,7 @@ def build(relay_dir, now=None):
     elif tokens is not None:
         warnings.append("dashboard.json: `tokens` is not an object; ignored")
 
-    log, log_source = _log(extras, relay_dir, leg_rows, checks, now)
+    log, log_source = _log(extras, relay_dir, runners, batons, checks, now)
 
     return {
         "relay": {

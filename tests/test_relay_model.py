@@ -566,12 +566,18 @@ def test_explicit_log_is_returned_verbatim(relay):
     assert model["logSource"] == "dashboard"
 
 
-def test_derived_log_is_left_to_the_next_leg(relay):
-    """ACC-DATA-005 belongs to `derive-progress-log`. Until it lands the model
-    reports an empty log and says where it came from, rather than faking one."""
-    model = relay_model.build(relay("agent-service"))
-    assert model["log"] == []
-    assert model["logSource"] is None
+def test_the_log_is_derived_when_the_coach_writes_none(relay):
+    """ACC-DATA-005. agent-service has no `dashboard.json.log`, and the model
+    still tells the story of the run from baton mtimes, git and the check
+    transitions in state.json. The full behaviour lives in
+    `tests/test_progress_log.py`; this is the model-level contract."""
+    model = relay_model.build(relay("agent-service"), now=1787600000.0)
+    assert model["logSource"] == "derived"
+    assert len(model["log"]) >= 10
+    times = [e["t"] for e in model["log"]]
+    assert times == sorted(times, reverse=True)
+    assert all(isinstance(e["t"], float) and isinstance(e["m"], str)
+               for e in model["log"])
 
 
 # --------------------------------------------------------------------------
