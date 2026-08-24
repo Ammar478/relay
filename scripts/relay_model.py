@@ -46,6 +46,8 @@ model derives one from the records that carry a real order: baton mtimes,
 `git log` on the relay's branch, and the check transitions in `state.json`.
 Entries with no honest timestamp are pinned to the leg that claimed them and
 flagged `exact: False`; entries with no honest time at all are not invented.
+Commits are bounded to the relay's own window - the project's history from
+before the run began is not part of the run's story (ACC-DATA-009).
 
 Determinism
 -----------
@@ -563,6 +565,11 @@ def _attention(checks, extras, leg_counts):
 # most this many commits (the walk stops there, it does not read the whole
 # history), and the merged log keeps at most this many of its most recent
 # entries. Batons are already bounded by the number of legs.
+#
+# These three are the outer safety net, sized for the repaint budget rather
+# than for the run. What a commit belongs to the log at all is decided by the
+# relay's own window in `_commit_entries` (ACC-DATA-009), which is a much
+# tighter bound in practice and is not a replacement for these.
 LOG_MAX_COMMITS = 200
 LOG_MAX_ENTRIES = 300
 GIT_TIMEOUT = 3.0
@@ -673,6 +680,50 @@ def _git_commits(relay_dir, project):
     return commits
 
 
+def _commit_entries(relay_dir, project, runners, own, now):
+    """Commit entries for the log, bounded to the relay's own window.
+
+    `own` is every entry the relay's own records produced - landings, handoffs
+    and check transitions. Both bounds below are derived from it, and both
+    exist because a project's history is far longer and far busier than the
+    relay that supervises one slice of it (ACC-DATA-009).
+
+    1. WINDOW. Commits dated before the earliest event the relay recorded are
+       the project's history, not this run's, and get no entry. The bound is
+       the relay's own oldest timestamp, never a count of commits: a relay
+       whose first baton is minutes old sits in a repo with years of history,
+       and the window is what tells the two apart.
+    2. COUNT. Inside the window a busy project still commits faster than a
+       relay lands legs, so at most as many commits are kept as the relay has
+       events of its own, newest first. The window alone does not achieve
+       ACC-DATA-009's second requirement - measured against the live
+       agent-service relay, the window cuts 200 commits to 28 beside 14 relay
+       events, which still buries the run. Only commits are capped. A baton, a
+       handoff or a check transition is never dropped to make room: they are
+       the events a supervisor came to the pane for.
+
+    With no events at all - a brand-new relay, nothing landed yet - there is no
+    window and nothing to count against, and the outer `--max-count` walk is
+    the only bound left. Showing a fresh relay its recent commits is better
+    than showing it nothing.
+    """
+    commits = _git_commits(relay_dir, project)
+    if own:
+        since = min(entry["t"] for entry in own)
+        commits = [c for c in commits if c[0] >= since]
+        # `git log` already yields newest first; sorting states the intent and
+        # is stable, so equal commit times keep git's own order and the slice
+        # stays deterministic across builds.
+        commits = sorted(commits, key=lambda c: -c[0])[:len(own)]
+
+    by_commit = {row["commit"]: row["leg"] for row in runners if row["commit"]}
+    return [
+        _log_entry(when, True, "commit", "note", f"commit {sha}: {subject}", now,
+                   leg=by_commit.get(sha), commit=sha)
+        for when, sha, subject in commits
+    ]
+
+
 def _derived_log(relay_dir, project, runners, batons, checks, now):
     """The story of the run, from the three records that carry a real order.
 
@@ -681,6 +732,8 @@ def _derived_log(relay_dir, project, runners, batons, checks, now):
        log records what happened, not what was planned.
     2. Commits on the relay's branch are real events with real times. The
        exchange zone is git, so a commit is a leg's work becoming visible.
+       They are derived last, because they are bounded by the other two: see
+       `_commit_entries` for the window and the count.
     3. `state.json` records that a check was judged more than once, or was sent
        to a fix leg, but carries no timestamps. Those entries are pinned to the
        landing of the leg that claimed the check and marked `exact: False`.
@@ -710,13 +763,6 @@ def _derived_log(relay_dir, project, runners, batons, checks, now):
                 row["start"], False, "start", "note",
                 f"{row['leg']} started", now, leg=row["leg"]))
 
-    # 2. commits.
-    by_commit = {row["commit"]: row["leg"] for row in runners if row["commit"]}
-    for when, sha, subject in _git_commits(relay_dir, project):
-        entries.append(_log_entry(
-            when, True, "commit", "note", f"commit {sha}: {subject}", now,
-            leg=by_commit.get(sha), commit=sha))
-
     # 3. check transitions.
     anchor = {leg: baton["mtime"] for leg, baton in batons.items()}
     for check in checks:
@@ -737,6 +783,10 @@ def _derived_log(relay_dir, project, runners, batons, checks, now):
                 f"{check['id']} failed judging and was sent to fix leg "
                 f"{check['fixLeg']}", now,
                 leg=check["claimedBy"], check=check["id"]))
+
+    # 2. commits, last: `entries` is now the relay's own record of itself, and
+    # it is what bounds them (ACC-DATA-009).
+    entries += _commit_entries(relay_dir, project, runners, list(entries), now)
 
     entries.sort(key=lambda e: (-e["t"], LOG_KIND_ORDER[e["kind"]], e["m"]))
     return entries[:LOG_MAX_ENTRIES]

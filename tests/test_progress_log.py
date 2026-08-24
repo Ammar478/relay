@@ -308,14 +308,18 @@ def repo_relay(tmp_path):
 
 @pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
 def test_commits_on_the_branch_become_log_entries(repo_relay):
+    """`seed the relay` is dated NOW - 9000, before alpha's baton landed at
+    NOW - 7200, so ACC-DATA-009 puts it outside the relay's window: it is the
+    commit that created the relay, not work the relay did. The commit inside
+    the window is still an entry, still exact, still carrying its sha."""
     model = relay_model.build(repo_relay, now=NOW)
     commits = entries_of(model, "commit")
     subjects = [e["m"] for e in commits]
     assert any("alpha: land the thing" in s for s in subjects)
-    assert any("seed the relay" in s for s in subjects)
+    assert not any("seed the relay" in s for s in subjects)
     assert all(e["exact"] for e in commits)
     assert all(isinstance(e["commit"], str) and e["commit"] for e in commits)
-    assert [e["t"] for e in commits] == [NOW - 7200, NOW - 9000]
+    assert [e["t"] for e in commits] == [NOW - 7200]
 
 
 @pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
@@ -329,7 +333,12 @@ def test_a_project_that_is_itself_a_repo_still_gets_its_commits(repo_relay):
     assert model["relay"]["path"] == str(project.resolve())
     assert (project / ".git").is_dir()
     assert not (project.parent / ".git").exists()  # nothing above to borrow
-    assert len(entries_of(model, "commit")) == 2
+    # Its own history, inside its own window: the seed commit predates the
+    # relay's first landing and is bounded out by ACC-DATA-009, not by the
+    # repository bound this test is about.
+    commits = entries_of(model, "commit")
+    assert [e["m"] for e in commits] == [f"commit {commits[0]['commit']}: "
+                                         "alpha: land the thing"]
 
 
 @pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
@@ -430,3 +439,158 @@ def test_a_relay_with_hundreds_of_batons_is_bounded(tmp_path):
     # The newest events survive the bound; the oldest are the ones dropped.
     assert model["log"][0]["leg"] == "leg-499"
     assert elapsed < 2.0, elapsed
+
+
+# --------------------------------------------------------------------------
+# the commit source is bounded to the relay's own time window (ACC-DATA-009)
+#
+# `fix-log-repo-scope` bounded WHERE commits come from. These bound WHEN. A
+# project's history from before the relay started is not part of this run, and
+# a busy project commits faster than a relay lands legs, so a second bound
+# keeps commits from outnumbering - and burying - the relay's own events.
+# --------------------------------------------------------------------------
+
+def relay_events(model):
+    """The relay's own events: everything the relay's records produced."""
+    return [e for e in model["log"] if e["kind"] != "commit"]
+
+
+@pytest.fixture
+def windowed_relay(tmp_path):
+    """A relay in a repository whose history starts long before the relay does.
+
+    Three commits land before the first baton and two after it, so the window
+    has a wrong answer available in both directions. Three relay events (two
+    landings and the handoff into the running leg), so the count bound is not
+    what excludes the pre-relay commits here - the window is.
+    """
+    project = tmp_path / "project"
+    (project / ".relay" / "batons").mkdir(parents=True)
+    relay_dir = project / ".relay"
+    (relay_dir / "legs.json").write_text(json.dumps({
+        "relay": "windowed",
+        "stages": [{"id": "S1", "name": "One", "legs": ["alpha", "beta", "gamma"]}],
+        "legs": [{"id": "alpha", "stage": "S1", "status": "done"},
+                 {"id": "beta", "stage": "S1", "status": "done"},
+                 {"id": "gamma", "stage": "S1", "status": "running"}],
+    }))
+    (relay_dir / "state.json").write_text(json.dumps({"checks": {}}))
+
+    _git(project, "init", "-q")
+    _git(project, "add", "-A", when=NOW - 9000)
+    _git(project, "commit", "-q", "-m", "before: the project existed first",
+         when=NOW - 9000)
+    for n, when in enumerate((NOW - 7000, NOW - 6000), start=2):
+        _git(project, "commit", "-q", "--allow-empty",
+             "-m", f"before: unrelated history {n}", when=when)
+
+    # The relay's first landing. Everything above it predates the run.
+    for leg, when in (("alpha", NOW - 5000), ("beta", NOW - 3000)):
+        baton = relay_dir / "batons" / f"{leg}.md"
+        baton.write_text(f"# Baton - {leg}\nSTATUS: success\n")
+        os.utime(baton, (when, when))
+
+    for n, when in enumerate((NOW - 4500, NOW - 2000), start=1):
+        _git(project, "commit", "-q", "--allow-empty",
+             "-m", f"after: the relay did this {n}", when=when)
+    return relay_dir
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_commits_from_before_the_relay_began_are_not_in_the_log(windowed_relay):
+    """ACC-DATA-009: the project's history from before the relay started is not
+    part of this run."""
+    model = relay_model.build(windowed_relay, now=NOW)
+    subjects = [e["m"] for e in entries_of(model, "commit")]
+    assert subjects, "the in-window commits must still be derived"
+    assert not [s for s in subjects if "before:" in s], subjects
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_commits_from_inside_the_window_are_kept(windowed_relay):
+    model = relay_model.build(windowed_relay, now=NOW)
+    subjects = [e["m"] for e in entries_of(model, "commit")]
+    assert any("after: the relay did this 1" in s for s in subjects), subjects
+    assert any("after: the relay did this 2" in s for s in subjects), subjects
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_the_window_opens_at_the_earliest_event_the_relay_recorded(windowed_relay):
+    """The bound is the relay's own earliest recorded event, not a count."""
+    model = relay_model.build(windowed_relay, now=NOW)
+    earliest = min(e["t"] for e in relay_events(model))
+    assert earliest == NOW - 5000  # alpha's baton, the first landing
+    assert all(e["t"] >= earliest for e in entries_of(model, "commit"))
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_commits_never_outnumber_the_relay_s_own_events(windowed_relay):
+    """ACC-DATA-009's second requirement, on a relay whose repo is busy."""
+    model = relay_model.build(windowed_relay, now=NOW)
+    assert len(entries_of(model, "commit")) <= len(relay_events(model))
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_burst_of_commits_inside_the_window_cannot_bury_the_run(tmp_path):
+    """The window alone is not enough: a project can commit forty times between
+    two landings. The newest commits survive; no relay event is dropped."""
+    project = tmp_path / "busy"
+    relay_dir = project / ".relay"
+    (relay_dir / "batons").mkdir(parents=True)
+    (relay_dir / "legs.json").write_text(json.dumps({
+        "relay": "busy",
+        "stages": [{"id": "S1", "legs": ["alpha"]}],
+        "legs": [{"id": "alpha", "stage": "S1", "status": "done"}],
+    }))
+    baton = relay_dir / "batons" / "alpha.md"
+    baton.write_text("# Baton - alpha\nSTATUS: success\n")
+    os.utime(baton, (NOW - 4000, NOW - 4000))
+
+    _git(project, "init", "-q")
+    _git(project, "add", "-A", when=NOW - 4000)
+    _git(project, "commit", "-q", "-m", "in window 00", when=NOW - 4000)
+    for n in range(1, 40):
+        _git(project, "commit", "-q", "--allow-empty",
+             "-m", f"in window {n:02d}", when=NOW - 4000 + n)
+
+    model = relay_model.build(relay_dir, now=NOW)
+    events = relay_events(model)
+    commits = entries_of(model, "commit")
+    assert len(events) == 1, [e["m"] for e in events]  # alpha landed
+    assert len(commits) <= len(events)
+    # A cap on commits, never on the relay's own events.
+    assert any(e["kind"] == "baton" and e["leg"] == "alpha" for e in model["log"])
+    # The newest commits survive, not the oldest.
+    assert commits[0]["m"].endswith("in window 39"), commits[0]["m"]
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_relay_with_no_events_falls_back_to_recent_commits(tmp_path):
+    """A brand-new relay has no window: no baton, no handoff, no check
+    transition, nothing to bound by. Showing the repository's recent commits is
+    better than showing nothing at all."""
+    project = tmp_path / "fresh"
+    relay_dir = project / ".relay"
+    relay_dir.mkdir(parents=True)
+    (relay_dir / "legs.json").write_text(json.dumps({
+        "relay": "fresh",
+        "stages": [{"id": "S1", "legs": ["alpha"]}],
+        "legs": [{"id": "alpha", "stage": "S1", "status": "pending"}],
+    }))
+    _git(project, "init", "-q")
+    _git(project, "add", "-A", when=NOW - 9000)
+    _git(project, "commit", "-q", "-m", "the project before any relay",
+         when=NOW - 9000)
+
+    model = relay_model.build(relay_dir, now=NOW)
+    commits = entries_of(model, "commit")
+    assert relay_events(model) == []
+    assert len(commits) == 1
+    assert "the project before any relay" in commits[0]["m"]
+    assert model["logSource"] == "derived"
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_the_window_is_deterministic(windowed_relay):
+    assert (relay_model.build(windowed_relay, now=NOW)["log"]
+            == relay_model.build(windowed_relay, now=NOW)["log"])
