@@ -1,0 +1,71 @@
+{
+  "relay": "<name>",
+  "stages": [
+    {
+      "id": "S1",
+      "name": "<logical unit of functionality>",
+      "legs": ["bootstrap-workspace", "google-sso-auth-flow", "code-judge-S1", "behaviour-judge-S1"]
+    },
+    {
+      "id": "S2",
+      "name": "<...>",
+      "legs": ["sharing-core", "code-judge-S2", "behaviour-judge-S2"]
+    }
+  ],
+  "legs": [
+    {
+      "id": "google-sso-auth-flow",
+      "stage": "S1",
+      "kind": "impl",
+      "goal": "What exists after this leg is done.",
+      "fulfills": ["ACC-AUTH-001", "ACC-AUTH-002"],
+      "dependsOn": ["bootstrap-workspace"],
+      "touches": ["src/auth/", "tests/auth/"],
+      "boundaries": ["do not modify the database schema"],
+      "skills": ["monorepo-build-order"],
+      "verification": ["pnpm test auth", "pnpm typecheck"],
+      "status": "pending"
+    },
+    {
+      "id": "code-judge-S1",
+      "stage": "S1",
+      "kind": "judge",
+      "goal": "Tests, types, lint, and a parallel review subagent per leg in S1.",
+      "fulfills": [],
+      "dependsOn": ["google-sso-auth-flow"],
+      "status": "pending"
+    },
+    {
+      "id": "behaviour-judge-S1",
+      "stage": "S1",
+      "kind": "judge",
+      "goal": "Drive the product and collect the evidence every S1 check names.",
+      "fulfills": [],
+      "dependsOn": ["google-sso-auth-flow"],
+      "status": "pending"
+    },
+    {
+      "id": "sharing-core",
+      "stage": "S2",
+      "kind": "impl",
+      "goal": "Per-entry key wrapping so an entry can be granted to another user.",
+      "fulfills": ["ACC-SHARE-001"],
+      "dependsOn": ["google-sso-auth-flow"],
+      "touches": ["packages/sharing/"],
+      "verification": ["pnpm test sharing"],
+      "status": "pending"
+    },
+    {
+      "id": "fix-session-cookie-safari",
+      "stage": "S1",
+      "kind": "fix",
+      "goal": "ACC-AUTH-001 passes on Safari as well as Chrome.",
+      "fulfills": [],
+      "repairs": ["ACC-AUTH-001"],
+      "dependsOn": ["google-sso-auth-flow"],
+      "touches": ["src/auth/session.ts"],
+      "verification": ["pnpm test auth"],
+      "status": "pending"
+    }
+  ]
+}

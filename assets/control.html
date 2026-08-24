@@ -1,0 +1,709 @@
+<title>Relay Control</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap">
+
+<style>
+/* Relay Control renders as one deliberate world: a terminal. Single theme by
+   design — every colour is painted explicitly so it holds on any host ground. */
+:root {
+  --bg:        #0B0E0F;
+  --bg-2:      #121718;
+  --rule:      #21292B;
+  --rule-soft: #182022;
+  --sel:       #CFD8D9;
+  --sel-txt:   #0F1415;
+  --txt:       #CFD6D7;
+  --dim:       #7E8A8C;
+  --dimmer:    #545E60;
+  --acc:       #48B3A4;
+  --ok:        #8FC067;
+  --ok-dim:    #68914B;
+  --warn:      #D9A441;
+  --bad:       #D4634F;
+  --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--txt);
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+.screen { max-width: 1400px; margin: 0 auto; min-height: 100vh; display: flex; flex-direction: column; padding: 0 16px; }
+
+/* ---------- title bar ---------- */
+
+.titlebar { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; padding: 16px 4px 12px; }
+.brand { color: var(--acc); font-weight: 700; }
+.brand .glyph { margin-right: 5px; }
+.path { color: var(--dim); }
+.titlebar .right { margin-left: auto; color: var(--dimmer); font-size: 11.5px; }
+.titlebar .right b { color: var(--dim); font-weight: 400; font-variant-numeric: tabular-nums; }
+.sep { color: var(--rule); margin: 0 7px; }
+
+/* ---------- status strip ---------- */
+
+.statusbar { display: flex; align-items: center; gap: 12px; padding: 0 4px 12px; }
+.state { display: flex; align-items: center; gap: 7px; font-weight: 500; letter-spacing: .05em; white-space: nowrap; }
+.dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.state { color: var(--acc); }
+.state.running { color: var(--ok); }
+.state.judging { color: var(--acc); }
+.state.complete, .state.completed { color: var(--ok); }
+.state.running .dot, .state.judging .dot { animation: pulse 2.4s ease-in-out infinite; }
+.state.paused { color: var(--warn); }
+.state.blocked { color: var(--bad); }
+@keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .3 } }
+@media (prefers-reduced-motion: reduce) { .state .dot { animation: none } }
+
+.track { flex: 1; height: 14px; background: var(--rule); min-width: 100px; }
+.fill { height: 100%; background: var(--ok); }
+.count { white-space: nowrap; font-variant-numeric: tabular-nums; color: var(--dim); }
+.count b { color: var(--txt); font-weight: 400; }
+.count .add { color: var(--acc); }
+
+/* ---------- attention band ---------- */
+
+.attention { border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule); }
+.sig { display: grid; grid-template-columns: 96px 1fr auto; gap: 12px; align-items: baseline; padding: 7px 4px 7px 11px; border-left: 2px solid transparent; }
+.sig-lbl { font-size: 10.5px; letter-spacing: .09em; font-weight: 500; }
+.sig-act { color: var(--dimmer); font-size: 11px; text-align: right; white-space: nowrap; }
+.sig.warn { border-left-color: var(--warn); } .sig.warn .sig-lbl { color: var(--warn); }
+.sig.bad  { border-left-color: var(--bad);  } .sig.bad  .sig-lbl { color: var(--bad); }
+.sig.calm { border-left-color: var(--ok-dim); } .sig.calm .sig-lbl { color: var(--ok-dim); }
+
+/* ---------- panes ---------- */
+
+.body { flex: 1; }
+
+.split { display: grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); }
+.pane-l { border-right: 1px solid var(--rule); padding: 14px 20px 20px 4px; min-width: 0; }
+.pane-r { padding: 14px 4px 20px 20px; min-width: 0; }
+@media (max-width: 900px) {
+  .split { grid-template-columns: minmax(0,1fr); }
+  .pane-l { border-right: 0; border-bottom: 1px solid var(--rule); padding-right: 4px; }
+  .pane-r { padding-left: 4px; }
+}
+
+.phead { display: flex; align-items: baseline; gap: 11px; margin-bottom: 12px; }
+.ptitle { color: var(--txt); }
+.psub { color: var(--dim); }
+.pright { margin-left: auto; color: var(--dimmer); font-variant-numeric: tabular-nums; }
+
+.sub { margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--rule); }
+
+/* ---------- active leg ---------- */
+
+.kv { color: var(--dimmer); }
+.kv b { color: var(--txt); font-weight: 400; margin-left: 8px; }
+.blk { margin-top: 16px; }
+.blk h4 { font-size: 12.5px; font-weight: 400; color: var(--txt); margin: 0 0 5px; }
+.blk ul { margin: 0; padding: 0; list-style: none; }
+.blk li { color: var(--dim); padding-left: 15px; position: relative; }
+.blk li::before { content: "·"; position: absolute; left: 4px; color: var(--dimmer); }
+.blk li.more { color: var(--dimmer); }
+.blk p { margin: 0; color: var(--dim); padding-left: 15px; }
+.chips { display: flex; flex-wrap: wrap; gap: 5px; padding-left: 15px; }
+.chip { font-size: 10.5px; border: 1px solid var(--rule); color: var(--dimmer); padding: 0 6px; }
+.chip.pass { border-color: var(--ok-dim); color: var(--ok); }
+.chip.fail { border-color: var(--bad); color: var(--bad); }
+
+/* ---------- checklist ---------- */
+
+.row { display: grid; grid-template-columns: 16px 1fr auto; gap: 9px; align-items: baseline; color: var(--dim); padding: 1px 4px; }
+.row .mk { text-align: center; }
+.row.done .mk { color: var(--ok); }
+.row.run { color: var(--txt); } .row.run .mk { color: var(--txt); }
+.row.fail .mk { color: var(--bad); }
+.row.blk .mk { color: var(--warn); }
+.row .meta { font-size: 10.5px; color: var(--dimmer); font-variant-numeric: tabular-nums; }
+.row .val { color: var(--dimmer); }
+
+/* ---------- log ---------- */
+
+.log { display: grid; grid-template-columns: 66px 1fr; gap: 1px 11px; }
+.log .t { color: var(--dimmer); text-align: right; font-variant-numeric: tabular-nums; }
+.log .m { color: var(--dim); }
+.log .m b { color: var(--txt); font-weight: 400; }
+.log .m .ok { color: var(--ok); }
+.log .m.gate { color: var(--ok); }
+.log .m.gatebad { color: var(--bad); }
+.log .m.note { color: var(--warn); }
+
+/* ---------- runner stream ---------- */
+
+.stream { border-top: 1px solid var(--rule); padding: 14px 4px 18px; }
+.tool { margin-bottom: 6px; }
+.tool .op { color: var(--txt); display: inline-block; min-width: 68px; }
+.tool .arg { color: var(--dim); }
+.tool .res { display: block; color: var(--dimmer); padding-left: 12px; }
+.tool .res.ok { color: var(--ok-dim); }
+.tool .res.bad { color: var(--bad); }
+.prompt { color: var(--dim); }
+.prompt::before { content: "> "; color: var(--acc); }
+
+/* ---------- full-screen tables ---------- */
+
+.fs { padding: 14px 4px 20px; }
+.fs h3 { font-size: 12.5px; font-weight: 400; color: var(--txt); margin: 0 0 10px; }
+.fs h3 span { color: var(--dimmer); }
+
+.filters { display: flex; flex-wrap: wrap; gap: 0; margin-bottom: 14px; padding-bottom: 12px; border-bottom: 1px solid var(--rule); }
+.filt { background: none; border: 0; font-family: var(--mono); font-size: 12.5px; color: var(--dimmer); cursor: pointer; padding: 0 10px; border-right: 1px solid var(--rule); }
+.filt:first-child { padding-left: 0; }
+.filt:last-child { border-right: 0; }
+.filt[aria-pressed="true"] { color: var(--acc); }
+.filt:hover { color: var(--dim); }
+.filt:focus-visible { outline: 1px solid var(--acc); outline-offset: 2px; }
+.filt em { font-style: normal; color: var(--dimmer); }
+
+table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+thead th { text-align: left; font-weight: 400; color: var(--dimmer); padding: 0 12px 6px 0; font-size: 11.5px; }
+tbody td { padding: 1px 12px 1px 0; color: var(--dim); white-space: nowrap; }
+tbody tr { cursor: pointer; }
+tbody tr:hover td { color: var(--txt); }
+tbody tr.sel td { background: var(--sel); color: var(--sel-txt); }
+tbody tr.sel td .s-run, tbody tr.sel td .s-ok { color: var(--sel-txt); }
+td.feat { white-space: nowrap; }
+td.fulfils { max-width: 34ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.s-run { color: var(--txt); }
+.s-ok { color: var(--ok); }
+.s-fail { color: var(--bad); }
+.s-pend { color: var(--dimmer); }
+.tblwrap { overflow-x: auto; }
+
+/* ---------- runner session ---------- */
+
+.meta-blk { margin-bottom: 14px; padding-bottom: 12px; border-bottom: 1px solid var(--rule); }
+.meta-blk div { color: var(--dimmer); }
+.meta-blk b { color: var(--txt); font-weight: 400; }
+.baton { white-space: pre-wrap; color: var(--dim); line-height: 1.55; max-width: 100ch; }
+.baton b { color: var(--txt); font-weight: 400; }
+.baton .bh1, .baton .bh2 { color: var(--acc); display: inline-block; margin-top: 10px; }
+.baton .bh3, .baton .bh4 { color: var(--txt); display: inline-block; margin-top: 8px; }
+.baton code { color: var(--ok-dim); }
+.scrollnote { color: var(--dimmer); margin-bottom: 8px; }
+
+/* ---------- footer ---------- */
+
+.keys { display: flex; flex-wrap: wrap; gap: 6px 22px; border-top: 1px solid var(--rule); padding: 12px 4px 20px; color: var(--dimmer); font-size: 11.5px; margin-top: auto; }
+.keys button { background: none; border: 0; font-family: var(--mono); font-size: 11.5px; color: var(--dimmer); cursor: pointer; padding: 0; }
+.keys button:hover { color: var(--dim); }
+.keys button:focus-visible { outline: 1px solid var(--acc); outline-offset: 2px; }
+.keys .k { color: var(--acc); font-weight: 700; margin-right: 6px; }
+.keys .note { margin-left: auto; color: var(--rule); }
+.hidden { display: none; }
+</style>
+
+<div class="screen">
+
+  <div class="titlebar">
+    <span class="brand"><span class="glyph">⇢</span>Relay Control</span>
+    <span class="path" id="mpath"></span>
+    <span class="right">
+      TIME <b id="mtime"></b><span class="sep">·</span>Input <b id="tin"></b><span class="sep">·</span>Cached <b id="tcache"></b><span class="sep">·</span>Output <b id="tout"></b>
+    </span>
+  </div>
+
+  <div class="statusbar" id="statusbar">
+    <span class="state running" id="mstate"><i class="dot"></i><span id="mstatetxt"></span></span>
+    <div class="track"><div class="fill" id="mfill"></div></div>
+    <span class="count" id="mcount"></span>
+  </div>
+
+  <div class="attention" id="mattn"></div>
+
+  <div class="body">
+
+    <!-- OVERVIEW -->
+    <div id="v-overview">
+      <div class="split">
+        <div class="pane-l">
+          <div class="phead"><span class="ptitle">Active Leg</span><span class="psub" id="afname"></span></div>
+          <div id="afbody"></div>
+        </div>
+        <div class="pane-r">
+          <div class="phead"><span class="ptitle">Legs</span><span class="pright" id="fcount"></span></div>
+          <div id="flist"></div>
+          <div class="sub">
+            <div class="phead"><span class="ptitle">Progress Log</span><span class="pright" id="lcount"></span></div>
+            <div class="log" id="mlog"></div>
+          </div>
+        </div>
+      </div>
+      <div class="stream">
+        <div class="phead"><span class="ptitle">Active Runner</span><span class="psub" id="awid"></span><span class="pright" id="awdur"></span></div>
+        <div id="awbody"></div>
+      </div>
+    </div>
+
+    <!-- FEATURES -->
+    <div id="v-legs" class="fs hidden">
+      <h3>Legs <span id="ftotal"></span></h3>
+      <div class="filters" id="ffilters"></div>
+      <div class="tblwrap"><table>
+        <thead><tr><th style="width:110px">Status</th><th>Stage/ID</th><th>Fulfills</th></tr></thead>
+        <tbody id="ftbody"></tbody>
+      </table></div>
+    </div>
+
+    <!-- WORKERS -->
+    <div id="v-runners" class="fs hidden">
+      <h3>Runners <span id="wtotal"></span></h3>
+      <div class="filters" id="wfilters"></div>
+      <div class="tblwrap"><table>
+        <thead id="wthead"></thead>
+        <tbody id="wtbody"></tbody>
+      </table></div>
+    </div>
+
+    <!-- CONTRACT -->
+    <div id="v-contract" class="fs hidden">
+      <h3>Acceptance Contract <span id="ctotal"></span></h3>
+      <div class="filters" id="cfilters"></div>
+      <div id="cbody"></div>
+    </div>
+
+    <!-- WORKER SESSION -->
+    <div id="v-session" class="fs hidden">
+      <h3>Runner Session</h3>
+      <div class="meta-blk" id="sesmeta"></div>
+      <div id="sesbody"></div>
+    </div>
+
+  </div>
+
+  <div class="keys" id="keys"></div>
+</div>
+
+<script>
+/* ---------------------------------------------------------------------------
+   MISSION — the render script replaces this object wholesale from
+   .relay/{legs.json, state.json, dashboard.json, batons/}.
+   Everything below it is presentation and never needs editing.
+--------------------------------------------------------------------------- */
+/* RELAY-DATA-START */
+const RELAY = {
+  path: "~/Development/password-manager",
+  status: "RUNNING",
+  elapsed: "6h 38m 34s",
+  tokens: { input: "324.0K", cached: "16.8M", output: "111.0K" },
+
+  attention: [
+    { level: "bad",  label: "STALLED", text: "ACC-SHARE-002 has failed 3 validation rounds — the check or the leg spec is wrong, not the code.", action: "P → re-scope" },
+    { level: "warn", label: "SLOW",    text: "Runner #a91f04c has been on sharing-invite-flow for 47m with no commit. Median this stage is 18m.", action: "P → mark complete" },
+    { level: "calm", label: "CLEARED", text: "Stage foundation cleared in 2 judging rounds, 6 of 6 checks evidenced.", action: "" }
+  ],
+
+  activeLeg: {
+    id: "sharing-invite-flow",
+    stage: "sharing",
+    skill: "fullstack-runner",
+    fulfills: [
+      { id: "ACC-SHARE-001", status: "passed" },
+      { id: "ACC-SHARE-002", status: "failed" },
+      { id: "ACC-SHARE-003", status: "pending" }
+    ],
+    preconditions: [
+      "Google SSO auth flow is working",
+      "Vault entry CRUD is committed",
+      "Session management (session.json) is working"
+    ],
+    expected: [
+      "Invite by email creates a pending grant, no vault access yet",
+      "Accepting an invite re-encrypts the entry key to the recipient",
+      "Revoking a grant removes access on the next request",
+      "+7 more"
+    ],
+    description: "Implement `factory-pw-manager share` — invite, accept, and revoke, with per-entry key re-wrapping."
+  },
+
+  /* Validators are scheduled as legs in the queue, not as an out-of-band gate. */
+  legs: [
+    { id: "bootstrap-workspace",             m: "foundation", status: "completed",  kind: "impl",      fulfills: "ACC-AUTH-001" },
+    { id: "google-sso-auth-flow",            m: "foundation", status: "completed",  kind: "impl",      fulfills: "ACC-AUTH-002" },
+    { id: "master-password-setup",           m: "foundation", status: "completed",  kind: "impl",      fulfills: "ACC-AUTH-003" },
+    { id: "vault-entry-crud",                m: "foundation", status: "completed",  kind: "impl",      fulfills: "ACC-VAULT-001,002" },
+    { id: "code-judge-foundation",   m: "foundation", status: "completed",  kind: "judge", fulfills: "—" },
+    { id: "behaviour-judge-foundation", m: "foundation", status: "completed", kind: "judge", fulfills: "—" },
+    { id: "fix-session-expiry-offset",       m: "foundation", status: "completed",  kind: "fix",       fulfills: "ACC-AUTH-002" },
+    { id: "sharing-core",                    m: "sharing",    status: "completed",  kind: "impl",      fulfills: "ACC-SHARE-001" },
+    { id: "fix-grant-leaks-on-revoke",       m: "sharing",    status: "completed",  kind: "fix",       fulfills: "ACC-SHARE-003" },
+    { id: "sharing-invite-flow",             m: "sharing",    status: "running",    kind: "impl",      fulfills: "ACC-SHARE-002,003" },
+    { id: "sharing-audit-log",               m: "sharing",    status: "pending",    kind: "impl",      fulfills: "ACC-SHARE-004" },
+    { id: "code-judge-sharing",      m: "sharing",    status: "pending",    kind: "judge", fulfills: "—" },
+    { id: "behaviour-judge-sharing",  m: "sharing",    status: "pending",    kind: "judge", fulfills: "—" },
+    { id: "sync-device-pairing",             m: "sync",       status: "pending",    kind: "impl",      fulfills: "ACC-SYNC-001" },
+    { id: "sync-conflict-resolution",        m: "sync",       status: "pending",    kind: "impl",      fulfills: "ACC-SYNC-002" },
+    { id: "sync-offline-queue",              m: "sync",       status: "pending",    kind: "impl",      fulfills: "ACC-SYNC-003" },
+    { id: "code-judge-sync",         m: "sync",       status: "pending",    kind: "judge", fulfills: "—" },
+    { id: "behaviour-judge-sync",     m: "sync",       status: "pending",    kind: "judge", fulfills: "—" },
+    { id: "deprecated-legacy-import",        m: "sync",       status: "cancelled",  kind: "impl",      fulfills: "—" }
+  ],
+
+  contract: [
+    { area: "AUTH", checks: [
+      { id: "ACC-AUTH-001", title: "Valid credentials reach the vault",    status: "passed",  evidence: "screenshot · POST /auth → 200", round: 1 },
+      { id: "ACC-AUTH-002", title: "Expired session returns 401, not 500", status: "passed",  evidence: "network log",                   round: 2 },
+      { id: "ACC-AUTH-003", title: "Weak master password is rejected",     status: "passed",  evidence: "e2e run",                       round: 1 }
+    ]},
+    { area: "VAULT", checks: [
+      { id: "ACC-VAULT-001", title: "Entry survives lock and unlock",      status: "passed",  evidence: "e2e run",                       round: 1 },
+      { id: "ACC-VAULT-002", title: "Deleted entry is unrecoverable",      status: "passed",  evidence: "db snapshot",                   round: 1 }
+    ]},
+    { area: "SHARE", checks: [
+      { id: "ACC-SHARE-001", title: "Invite creates a pending grant",      status: "passed",  evidence: "screenshot · GET /grants",      round: 1 },
+      { id: "ACC-SHARE-002", title: "Accepting re-wraps the entry key",    status: "failed",  evidence: "recipient still cannot decrypt", round: 3 },
+      { id: "ACC-SHARE-003", title: "Revoke cuts access next request",     status: "pending", evidence: "—",                             round: 0 },
+      { id: "ACC-SHARE-004", title: "Audit log records every grant change", status: "pending", evidence: "—",                            round: 0 }
+    ]},
+    { area: "SYNC", checks: [
+      { id: "ACC-SYNC-001", title: "Two devices converge after conflict",  status: "pending", evidence: "—",                             round: 0 },
+      { id: "ACC-SYNC-002", title: "Offline edits replay in order",        status: "blocked", evidence: "no second device in harness",   round: 0 },
+      { id: "ACC-SYNC-003", title: "Pairing survives app restart",         status: "pending", evidence: "—",                             round: 0 }
+    ]}
+  ],
+
+  runners: [
+    { n: 9, session: "a91f04c8-2b71-4e09-9c3a-1de77b04aa21", start: "15:08", dur: "47m 12s", status: "Running", input: "—",  cached: "—",    output: "—",
+      leg: "sharing-invite-flow", model: "Opus 4.6 (High)",
+      stream: [
+        { prompt: '## Your Assigned Leg ```json { "id": "sharing-invite-flow", "stage": "sharing", "fulfills": ["ACC-SHARE-002","ACC-SHARE-003"], "description": "Implement `factory-pw-manager share` — invite, accept, and revoke, with per-entry key re-wrapping."...' },
+        { op: "Read",    arg: "packages/sharing/src/core.ts (312 lines)" },
+        { op: "Read",    arg: "packages/crypto/src/keywrap.ts (188 lines)" },
+        { op: "Create",  arg: "packages/sharing/src/invite.ts", res: "File created (241 lines)" },
+        { op: "Execute", arg: "pnpm -r test sharing", res: "142 passed, 3 failed — keywrap.reWrap returns stale key [exit 1]", bad: true },
+        { op: "Read",    arg: "packages/crypto/test/keywrap.spec.ts (96 lines)" },
+        { op: "Edit",    arg: "packages/sharing/src/invite.ts", res: "3 edits applied" },
+        { op: "Execute", arg: "pnpm -r test sharing", res: "running…" }
+      ]},
+    { n: 8, session: "e6b14c75-9a02-41bd-88f1-3cc0a91b7e40", start: "14:41", dur: "12m 04s", status: "Success", input: "38", cached: "4.1M", output: "9.2K",
+      leg: "fix-grant-leaks-on-revoke", model: "Opus 4.6 (High)",
+      stream: [
+        { op: "Execute", arg: "pnpm -r test sharing", res: "148 passed, 0 failed [exit 0]", ok: true },
+        { op: "Execute", arg: 'git commit -m "fix(sharing): drop grant rows on revoke"', res: "[main e6b14c7] 4 files, +61 −12 [exit 0]", ok: true },
+        { op: "End Leg Run", arg: "success", res: '{"recorded":true,"nextAction":"continue","message":"Another runner will continue with next leg."}', ok: true }
+      ]},
+    { n: 7, session: "d5a03b64-7f18-4a55-b2e9-0ab41c7d3355", start: "14:10", dur: "31m 47s", status: "Success", input: "60", cached: "7.3M", output: "21.0K",
+      leg: "sharing-core", model: "Opus 4.6 (High)", stream: [] },
+    { n: 6, session: "c4f92a53-11d6-4f80-9e77-88b2a0e5d114", start: "13:46", dur: "24m 02s", status: "Partial", input: "54", cached: "5.0M", output: "15.1K",
+      leg: "behaviour-judge-foundation", model: "GPT-5.3-Codex", stream: [] },
+    { n: 5, session: "b3e81f42-cc90-4d21-a3b7-6e5099f2a877", start: "13:27", dur: "19m 33s", status: "Success", input: "40", cached: "2.0M", output: "18.0K",
+      leg: "code-judge-foundation", model: "GPT-5.3-Codex", stream: [] }
+  ],
+
+  log: [
+    { t: "58m ago", m: "Runner <b>#d5a03b64</b> completed [sharing-core] <span class='ok'>✓</span>" },
+    { t: "41m ago", m: "Stage judging: sharing — 1 of 3 checks failed", cls: "gatebad" },
+    { t: "41m ago", m: "Orchestrator created fix leg [fix-grant-leaks-on-revoke]", cls: "note" },
+    { t: "29m ago", m: "Runner <b>#e6b14c75</b> completed [fix-grant-leaks-on-revoke] <span class='ok'>✓</span>" },
+    { t: "22m ago", m: "Stage judging: sharing round 2 — ACC-SHARE-002 still failing", cls: "gatebad" },
+    { t: "22m ago", m: "Leg retry limit warning: ACC-SHARE-002 has failed 3 rounds", cls: "note" },
+    { t: "47m ago", m: "Runner <b>#a91f04c8</b> started [sharing-invite-flow]" },
+    { t: "now",     m: "Awaiting your call — pause and re-scope, or let it run", cls: "note" }
+  ]
+};
+/* RELAY-DATA-END */
+
+/* ------------------------------- render ---------------------------------- */
+
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>]/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;" }[c]));
+
+const VIEWS = ["overview", "legs", "runners", "contract", "session"];
+let view = "overview", fFilter = "all", wFilter = "all", cFilter = "all", openSession = null;
+
+const KEYMAP = {
+  overview: [["F","Legs","legs"],["W","Runners","runners"],["C","Contract","contract"],["M","Models",null],["P","Pause",null],["D","Relay Dir",null],["Ctrl+T","Back To Coach",null]],
+  legs: [["↑↓","Select",null],["Enter","View",null],["T","Filter",null],["Esc","Back","overview"],["W","Runners","runners"],["C","Contract","contract"]],
+  runners:  [["↑↓","Select",null],["Enter","View",null],["T","Filter",null],["Esc","Back","overview"],["F","Legs","legs"],["M","Models",null]],
+  contract: [["↑↓","Select",null],["T","Filter",null],["Esc","Back","overview"],["F","Legs","legs"],["W","Runners","runners"]],
+  session:  [["↑↓","Scroll",null],["[]","Density",null],["g","Top",null],["G","Bottom",null],["s","Interrupt/Chat",null],["h","Baton",null],["Esc","Back","runners"]]
+};
+
+function head() {
+  $("mpath").textContent = RELAY.path;
+  $("mtime").textContent = RELAY.elapsed;
+  $("tin").textContent = RELAY.tokens.input;
+  $("tcache").textContent = RELAY.tokens.cached;
+  $("tout").textContent = RELAY.tokens.output;
+
+  const done  = RELAY.legs.filter(f => f.status === "completed").length;
+  const total = RELAY.legs.filter(f => f.status !== "cancelled").length;
+  const added = RELAY.legs.filter(f => f.kind === "fix").length;
+
+  $("mstatetxt").textContent = RELAY.status;
+  $("mstate").className = "state " + String(RELAY.status).toLowerCase().split(/\s+/)[0];
+  $("mfill").style.width = Math.round((done / total) * 100) + "%";
+  $("mcount").innerHTML = `<b>${done}</b>/${total}` + (added ? ` <span class="add">[+${added}]</span>` : "");
+}
+
+function normSignal(s) {
+  // Coaches write objects, or plain strings, or use different key names.
+  if (typeof s === "string") {
+    const m = s.match(/^([A-Z][A-Z0-9 _-]{2,28}):\s*(.+)$/s);   // "LABEL: message"
+    return m ? { level: "warn", label: m[1].trim(), text: m[2].trim(), action: "" }
+             : { level: "calm", label: "NOTE", text: s, action: "" };
+  }
+  s = s || {};
+  const lvl = String(s.level ?? s.severity ?? "calm").toLowerCase();
+  return {
+    level: ["bad", "warn", "calm"].includes(lvl) ? lvl
+         : ["critical", "error", "blocked", "high"].includes(lvl) ? "bad"
+         : ["warning", "medium"].includes(lvl) ? "warn" : "calm",
+    label: s.label ?? s.title ?? s.name ?? "NOTE",
+    text:  s.text ?? s.message ?? s.detail ?? s.body ?? "",
+    action: s.action ?? s.next ?? "",
+  };
+}
+
+function attention() {
+  const raw = Array.isArray(RELAY.attention) ? RELAY.attention : [];
+  $("mattn").innerHTML = raw.map(normSignal).map(s =>
+    `<div class="sig ${s.level}"><span class="sig-lbl">${esc(s.label)}</span><span>${esc(s.text)}</span><span class="sig-act">${esc(s.action)}</span></div>`).join("");
+}
+
+function blk(title, items, row, wrap) {
+  if (!Array.isArray(items) || !items.length) return "";
+  const inner = items.map(row).join("");
+  return `<div class="blk"><h4>${title}</h4>`
+    + (wrap === "ul" ? `<ul>${inner}</ul>` : `<div class="chips">${inner}</div>`)
+    + `</div>`;
+}
+
+const AC = { passed: "pass", failed: "fail", blocked: "", pending: "" };
+
+function activeLeg() {
+  const a = RELAY.activeLeg;
+  $("afname").textContent = a.id;
+  $("afbody").innerHTML = `
+    <div class="kv">skill<b>${esc(a.skill)}</b></div>
+    <div class="kv">stage<b>${esc(a.stage)}</b></div>
+    ${blk("Fulfills", a.fulfills, v =>
+      `<span class="chip ${AC[v.status] || ""}">${esc(v.id)}${v.status === "passed" ? " ✓" : v.status === "failed" ? " ✗" : ""}</span>`, "chips")}
+    ${blk("Preconditions", a.preconditions, p => `<li>${esc(p)}</li>`, "ul")}
+    ${blk("Expected Behavior", a.expected, e =>
+      `<li class="${/^\+\d+ more/.test(e) ? "more" : ""}">${esc(e)}</li>`, "ul")}
+    ${a.description ? `<div class="blk"><h4>Description</h4><p>${esc(a.description).replace(/`([^`]+)`/g, "<code>$1</code>")}</p></div>` : ""}`;
+}
+
+const MARK = { completed: "✓", running: "●", pending: "○", cancelled: "×" };
+const RCLS = { completed: "done", running: "run", cancelled: "" };
+
+function overviewList() {
+  const shown = RELAY.legs.filter(f => f.status !== "cancelled").slice(0, 10);
+  const rest = RELAY.legs.filter(f => f.status !== "cancelled").length - shown.length;
+  const done = RELAY.legs.filter(f => f.status === "completed").length;
+  $("fcount").textContent = `${done}/${RELAY.legs.filter(f => f.status !== "cancelled").length}`;
+  $("flist").innerHTML = shown.map(f => `
+    <div class="row ${RCLS[f.status] || ""}">
+      <span class="mk">${MARK[f.status] || "·"}</span>
+      <span class="${f.kind === "judge" ? "judge" : ""}">${esc(f.id)}</span>
+      <span class="meta">${f.kind === "fix" ? "fix" : f.kind === "judge" ? "judge" : ""}</span>
+    </div>`).join("") + (rest > 0 ? `<div class="row"><span class="mk"></span><span class="meta">+${rest} more</span><span></span></div>` : "");
+}
+
+function log() {
+  $("lcount").textContent = `1-${RELAY.log.length} of ${RELAY.log.length}`;
+  $("mlog").innerHTML = RELAY.log.map(l =>
+    `<span class="t">${esc(l.t)}</span><span class="m ${l.cls || ""}">${l.m}</span>`).join("");
+}
+
+function renderStream(w) {
+  return w.stream.map(s => s.prompt
+    ? `<div class="tool"><span class="prompt">${esc(s.prompt)}</span></div>`
+    : `<div class="tool"><span class="op">${esc(s.op)}</span><span class="arg">${esc(s.arg)}</span>${
+        s.res ? `<span class="res ${s.bad ? "bad" : s.ok ? "ok" : ""}">→ ${esc(s.res)}</span>` : ""}</div>`).join("");
+}
+
+function activeRunner() {
+  const w = RELAY.runners.find(x => x.status === "Running") || RELAY.runners[0];
+  if (!w) {
+    $("awid").textContent = "none recorded";
+    $("awdur").textContent = "";
+    $("awbody").innerHTML = '<div class="scrollnote">No runner detail in dashboard.json. '
+      + 'Batons on disk still drive the Runners view.</div>';
+    return;
+  }
+  $("awid").textContent = `#${w.n}  ${w.leg}`;
+  $("awdur").textContent = "Duration " + w.dur;
+  $("awbody").innerHTML = renderStream(w);
+}
+
+/* --- legs view --- */
+const FSTAT = { pending: "Pending", running: "In Progress", completed: "Completed", cancelled: "Cancelled" };
+const FCLS  = { pending: "s-pend", running: "s-run", completed: "s-ok", cancelled: "s-pend" };
+
+function legsView() {
+  const f = RELAY.legs;
+  const counts = { all: f.length, pending: 0, running: 0, completed: 0, cancelled: 0 };
+  f.forEach(x => counts[x.status]++);
+  $("ftotal").textContent = `(${f.length})`;
+  $("ffilters").innerHTML = [["all","All"],["pending","Pending"],["running","In Progress"],["completed","Completed"],["cancelled","Cancelled"]]
+    .map(([k, l]) => `<button class="filt" data-f="${k}" aria-pressed="${fFilter === k}">${l} <em>(${counts[k]})</em></button>`).join("");
+  $("ffilters").querySelectorAll(".filt").forEach(b =>
+    b.addEventListener("click", () => { fFilter = b.dataset.f; legsView(); }));
+
+  const rows = f.filter(x => fFilter === "all" || x.status === fFilter);
+  $("ftbody").innerHTML = rows.map(x => `
+    <tr class="${x.status === "running" ? "sel" : ""}">
+      <td class="${FCLS[x.status] || ""}">${MARK[x.status] || "·"} ${FSTAT[x.status] || x.status}</td>
+      <td class="feat"><span class="val">${esc(x.m)}/</span>${esc(x.id)}</td>
+      <td class="fulfils" title="${esc(x.fulfills)}">${esc(x.fulfills)}</td>
+    </tr>`).join("");
+}
+
+/* --- runners view --- */
+const WCLS = { Running: "s-run", Success: "s-ok", Partial: "s-pend", Failed: "s-fail" };
+
+function runnersView() {
+  const w = RELAY.runners;
+  const counts = { all: w.length, Running: 0, Success: 0, Failed: 0 };
+  w.forEach(x => { if (counts[x.status] !== undefined) counts[x.status]++; });
+  $("wtotal").textContent = `(${w.length})`;
+  $("wfilters").innerHTML = [["all","All",counts.all],["Running","Active",counts.Running],["Success","Completed",counts.Success],["Failed","Failed",counts.Failed]]
+    .map(([k, l, c]) => `<button class="filt" data-f="${k}" aria-pressed="${wFilter === k}">${l} <em>(${c})</em></button>`).join("");
+  $("wfilters").querySelectorAll(".filt").forEach(b =>
+    b.addEventListener("click", () => { wFilter = b.dataset.f; runnersView(); }));
+
+  // A column earns its place only if some row has a real value in it.
+  const CANDIDATES = [
+    ["#",        r => (r.status === "Running" ? "●" : "✓") + r.n,        () => true],
+    ["Leg",      r => r.leg,                                              r => r.leg],
+    ["Stage",    r => r.stage,                                            r => r.stage],
+    ["Finished", r => r.finished,                                         r => r.finished && r.finished !== "—"],
+    ["Took",     r => r.took,                                             r => r.took && r.took !== "—"],
+    ["Commit",   r => r.commit,                                           r => r.commit && r.commit !== "—"],
+    ["Baton",    r => r.lines ? r.lines + " lines" : "—",                  r => r.lines],
+    ["Start",    r => r.start,                                            r => r.start && r.start !== "—"],
+    ["Duration", r => r.dur,                                              r => r.dur && r.dur !== "—"],
+    ["Input",    r => r.input,                                            r => r.input && r.input !== "—"],
+    ["Cached",   r => r.cached,                                           r => r.cached && r.cached !== "—"],
+    ["Output",   r => r.output,                                           r => r.output && r.output !== "—"],
+    ["Status",   r => r.status,                                           () => true],
+  ];
+  const cols = CANDIDATES.filter(([, , keep]) => w.some(r => keep(r)));
+
+  $("wthead").innerHTML = `<tr>${cols.map(([label]) => `<th>${label}</th>`).join("")}</tr>`;
+
+  const rows = w.filter(x => wFilter === "all" || x.status === wFilter);
+  $("wtbody").innerHTML = rows.map(x => `
+    <tr data-n="${x.n}" class="${x.status === "Running" ? "sel" : ""}">
+      ${cols.map(([label, val]) => {
+        const cls = label === "Status" ? (WCLS[x.status] || "s-pend") : label === "Leg" ? "feat" : "";
+        return `<td class="${cls}">${esc(val(x))}</td>`;
+      }).join("")}
+    </tr>`).join("");
+  $("wtbody").querySelectorAll("tr").forEach(tr =>
+    tr.addEventListener("click", () => { openSession = +tr.dataset.n; setView("session"); }));
+}
+
+/* --- contract view --- */
+const ASTAT = { passed: { mk: "✓", cls: "done" }, failed: { mk: "✗", cls: "fail" }, blocked: { mk: "!", cls: "blk" }, pending: { mk: "○", cls: "" } };
+
+function contractView() {
+  const all = RELAY.contract.flatMap(g => g.checks);
+  const counts = { all: all.length, passed: 0, failed: 0, blocked: 0, pending: 0 };
+  all.forEach(a => counts[a.status]++);
+  $("ctotal").textContent = `(${counts.passed}/${all.length} passed)`;
+  $("cfilters").innerHTML = [["all","All"],["passed","Passed"],["failed","Failed"],["blocked","Blocked"],["pending","Pending"]]
+    .map(([k, l]) => `<button class="filt" data-f="${k}" aria-pressed="${cFilter === k}">${l} <em>(${counts[k]})</em></button>`).join("");
+  $("cfilters").querySelectorAll(".filt").forEach(b =>
+    b.addEventListener("click", () => { cFilter = b.dataset.f; contractView(); }));
+
+  $("cbody").innerHTML = RELAY.contract.map(g => {
+    const rows = g.checks.filter(a => cFilter === "all" || a.status === cFilter);
+    if (!rows.length) return "";
+    const p = g.checks.filter(a => a.status === "passed").length;
+    return `<div style="margin-bottom:16px">
+      <div class="phead" style="margin-bottom:6px"><span class="psub">${esc(g.area)}</span><span class="pright">${p}/${g.checks.length} evidenced</span></div>
+      ${rows.map(a => { const s = ASTAT[a.status];
+        return `<div class="row ${s.cls}"><span class="mk">${s.mk}</span>
+          <span>${esc(a.id)} — ${esc(a.title)}<br><span class="meta">${esc(a.evidence)}</span></span>
+          <span class="meta">${a.round ? "r" + a.round : ""}</span></div>`; }).join("")}
+    </div>`;
+  }).join("");
+}
+
+/* --- runner session view --- */
+function sessionView() {
+  const w = RELAY.runners.find(x => x.n === openSession) || RELAY.runners[0];
+  if (!w) {
+    $("sesmeta").innerHTML = '<div>No runner sessions recorded yet.</div>';
+    $("sesbody").innerHTML = "";
+    return;
+  }
+  const meta = [
+    ["Leg", w.leg], ["Stage", w.stage], ["Status", w.status],
+    ["Finished", w.finished], ["Took", w.took], ["Commit", w.commit],
+    ["Model", w.model],
+  ].filter(([, v]) => v && v !== "—");
+  $("sesmeta").innerHTML = meta.map(([k, v]) =>
+    `<div>${k}: <b class="${k === "Status" ? (WCLS[w.status] || "") : ""}">${esc(v)}</b></div>`).join("");
+
+  if (w.baton) {
+    $("sesbody").innerHTML = `<div class="baton">${renderBaton(w.baton)}</div>`;
+  } else if (w.stream && w.stream.length) {
+    $("sesbody").innerHTML = renderStream(w);
+  } else {
+    $("sesbody").innerHTML = '<div class="scrollnote">This leg left no baton on disk.</div>';
+  }
+}
+
+function renderBaton(md) {
+  // Enough markdown to read a baton comfortably; not a full parser.
+  return esc(md)
+    .replace(/^(#{1,4})\s*(.+)$/gm, (_, h, t) => `<b class="bh${h.length}">${t}</b>`)
+    .replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>")
+    .replace(/`([^`]+)`/g, '<code>$1</code>');
+}
+
+/* --- view switching --- */
+function setView(v) {
+  view = v;
+  VIEWS.forEach(x => $("v-" + x).classList.toggle("hidden", x !== v));
+  $("statusbar").classList.toggle("hidden", v !== "overview");
+  $("mattn").classList.toggle("hidden", v !== "overview");
+  if (v === "legs") legsView();
+  if (v === "runners")  runnersView();
+  if (v === "contract") contractView();
+  if (v === "session")  sessionView();
+  keys();
+}
+
+function keys() {
+  $("keys").innerHTML = KEYMAP[view].map(([k, l, target]) =>
+    target ? `<button data-v="${target}"><span class="k">${k}</span>${l}</button>`
+           : `<span><span class="k">${k}</span>${l}</span>`).join("")
+    + `<span class="note">rendered from .relay/state.json</span>`;
+  $("keys").querySelectorAll("button").forEach(b =>
+    b.addEventListener("click", () => setView(b.dataset.v)));
+}
+
+document.addEventListener("keydown", e => {
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  const k = e.key.toLowerCase();
+  if (k === "escape") return setView(view === "session" ? "runners" : "overview");
+  if (k === "f") setView("legs");
+  if (k === "w") setView("runners");
+  if (k === "c") setView("contract");
+});
+
+function safe(name, fn) {
+  try { fn(); } catch (e) { console.error("[relay-control] " + name + " failed:", e); }
+}
+safe("head", head);
+safe("attention", attention);
+safe("activeLeg", activeLeg);
+safe("legList", overviewList);
+safe("log", log);
+safe("activeRunner", activeRunner);
+setView("overview");
+</script>

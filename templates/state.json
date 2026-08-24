@@ -1,0 +1,31 @@
+{
+  "relay": "<name>",
+  "phase": "running",
+  "currentStage": "S2",
+  "currentLeg": "sharing-core",
+  "checks": {
+    "ACC-AUTH-001": {
+      "status": "passed",
+      "stage": "S1",
+      "claimedBy": "google-sso-auth-flow",
+      "round": 2,
+      "evidence": ".relay/evidence/ACC-AUTH-001-dashboard.png"
+    },
+    "ACC-AUTH-002": {
+      "status": "failed",
+      "stage": "S1",
+      "claimedBy": "google-sso-auth-flow",
+      "round": 2,
+      "reason": "Expired token returns 500, contract requires 401.",
+      "fixLeg": "fix-session-cookie-safari"
+    },
+    "ACC-SHARE-001": {
+      "status": "pending",
+      "stage": "S2",
+      "claimedBy": "sharing-core"
+    }
+  },
+  "rounds": {
+    "S1": 2
+  }
+}
