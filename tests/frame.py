@@ -61,12 +61,39 @@ cursor addressing (CUP/HVP, CUU/CUD/CUF/CUB, CHA/VPA, CNL/CPL), erases (ED, EL,
 ECH), insert/delete of lines and characters (IL/DL, ICH/DCH, IRM), scroll
 regions (DECSTBM) and scrolling (IND, RI, NEL, SU/SD), repeat (REP), tab stops,
 the alternate screen (`?1049`), autowrap (`?7`), save/restore cursor and UTF-8
-decoding across read boundaries. SGR and other attribute or mouse sequences are
-consumed and discarded — frames carry text, never escape bytes.
+decoding across read boundaries. Escape bytes never reach the text: frames carry
+what a human would see, never the sequences that put it there.
 
-Known limits, on purpose: no colour or attribute capture (assert on text and
-layout, not on styling), no scrollback (only the visible screen), no origin mode
-(`?6`), and no reply to cursor-position queries.
+Known limits, on purpose: no scrollback (only the visible screen), no origin
+mode (`?6`), and no reply to cursor-position queries.
+
+The attribute plane
+-------------------
+
+Alongside the text, every cell records *how it was drawn* — the SGR parameters,
+exactly as the program sent them. Nothing is resolved to RGB and nothing is
+normalised, because a judge asserts "this was drawn with SGR 32 and bold", not
+"this was #00ff00":
+
+    frame.attrs_at(row, col)        # the CellAttrs of one cell
+    frame.attr_runs(row)            # contiguous runs of like-attributed cells
+    frame.run_with("FAILED")        # the run containing a substring
+    frame.attrs_for("FAILED")       # that run's CellAttrs
+    frame.assert_attrs("FAILED", fg=31, has="bold")
+    frame.assert_attrs_differ("FAILED", "PASSED")
+
+`CellAttrs.fg` / `.bg` are parameter tuples — `(32,)`, `(38, 5, 214)`,
+`(38, 2, r, g, b)` — or `None` for the terminal default. `.flags` is a frozenset
+of names (`bold`, `dim`, `italic`, `underline`, `blink`, `reverse`, `invisible`,
+`strike`), also reachable as `.bold`, `.reverse` and friends. `.other` keeps any
+SGR parameter the harness does not model, so an unknown parameter is *recorded*
+rather than silently mistaken for something else — a child that emits no SGR at
+all simply has a plane of `DEFAULT_ATTRS`.
+
+Erasing follows back-colour erase, which is what `xterm-256color` advertises
+(`bce`): a cell blanked by ED/EL/ECH, or scrolled/inserted into existence, keeps
+the *current background* and loses everything else. `Screen.reset()` and
+`Screen.resize()` produce default cells.
 
 Gotchas worth knowing before you debug something
 ------------------------------------------------
@@ -114,8 +141,12 @@ import termios
 import time
 import unicodedata
 from pathlib import Path
+from typing import NamedTuple
 
 __all__ = [
+    "DEFAULT_ATTRS",
+    "AttrRun",
+    "CellAttrs",
     "Frame",
     "Screen",
     "TerminalSession",
@@ -150,17 +181,253 @@ def display_width(text: str) -> int:
 
 
 # ---------------------------------------------------------------------------
+# attributes
+# ---------------------------------------------------------------------------
+
+
+class CellAttrs(NamedTuple):
+    """How one cell was drawn: the SGR parameters that drew it, as given.
+
+    `fg` and `bg` are parameter tuples — `(32,)` for SGR 32, `(38, 5, 214)` for
+    256-colour 214, `(38, 2, r, g, b)` for direct colour — or `None` for the
+    terminal's default. Nothing is resolved to a palette or an RGB value: a
+    judge asserts which parameters drew a cell, not what shade they produced.
+
+    `flags` names the boolean attributes that were on. `other` holds any SGR
+    parameter this harness does not model, so an unrecognised one is recorded
+    rather than mistaken for something it is not.
+    """
+
+    fg: tuple = None
+    bg: tuple = None
+    flags: frozenset = frozenset()
+    other: frozenset = frozenset()
+
+    # -- the flags, spelled out for readable assertions -------------------
+
+    @property
+    def bold(self) -> bool:
+        return "bold" in self.flags
+
+    @property
+    def dim(self) -> bool:
+        return "dim" in self.flags
+
+    @property
+    def italic(self) -> bool:
+        return "italic" in self.flags
+
+    @property
+    def underline(self) -> bool:
+        return "underline" in self.flags
+
+    @property
+    def blink(self) -> bool:
+        return "blink" in self.flags
+
+    @property
+    def reverse(self) -> bool:
+        return "reverse" in self.flags
+
+    @property
+    def invisible(self) -> bool:
+        return "invisible" in self.flags
+
+    @property
+    def strike(self) -> bool:
+        return "strike" in self.flags
+
+    @property
+    def is_default(self) -> bool:
+        """True when the cell was drawn with no SGR in effect."""
+        return self == DEFAULT_ATTRS
+
+    def describe(self) -> str:
+        """One short line, for an assertion message."""
+        if self.is_default:
+            return "default"
+        parts = []
+        if self.fg is not None:
+            parts.append("fg=" + ";".join(str(n) for n in self.fg))
+        if self.bg is not None:
+            parts.append("bg=" + ";".join(str(n) for n in self.bg))
+        if self.flags:
+            parts.append("+".join(sorted(self.flags)))
+        if self.other:
+            parts.append("other=" + ",".join(str(n) for n in sorted(self.other)))
+        return " ".join(parts)
+
+    def __repr__(self) -> str:
+        return "<attrs %s>" % self.describe()
+
+
+DEFAULT_ATTRS = CellAttrs()
+
+
+class AttrRun(NamedTuple):
+    """A stretch of one row drawn with identical attributes.
+
+    `start` is inclusive and `end` exclusive, both in grid columns.
+    """
+
+    row: int
+    start: int
+    end: int
+    text: str
+    attrs: CellAttrs
+
+    def __repr__(self) -> str:
+        return "<run row %d cols %d-%d %r %s>" % (
+            self.row,
+            self.start,
+            self.end - 1,
+            self.text,
+            self.attrs.describe(),
+        )
+
+
+# SGR parameters that turn a flag on, and the ones that turn flags off.
+_SGR_ON = {
+    1: "bold",
+    2: "dim",
+    3: "italic",
+    4: "underline",
+    5: "blink",
+    6: "blink",
+    7: "reverse",
+    8: "invisible",
+    9: "strike",
+}
+_SGR_OFF = {
+    22: ("bold", "dim"),
+    23: ("italic",),
+    24: ("underline",),
+    25: ("blink",),
+    26: (),
+    27: ("reverse",),
+    28: ("invisible",),
+    29: ("strike",),
+}
+_SGR_EXTENDED = (38, 48, 58)
+
+
+def _extended_colour(code, tokens, index):
+    """Consume the semicolon-separated arguments of SGR 38/48/58.
+
+    Returns `(value, next_index)`; `value` is the whole parameter list as given,
+    so `38;5;214` becomes `(38, 5, 214)` — the same tuple the colon form
+    `38:5:214` produces.
+    """
+
+    def take():
+        nonlocal index
+        if index < len(tokens):
+            value = tokens[index][0]
+            index += 1
+            return value
+        return None
+
+    kind = take()
+    if kind == 5:
+        which = take()
+        return (code, 5, 0 if which is None else which), index
+    if kind == 2:
+        channels = [take() for _ in range(3)]
+        return (code, 2) + tuple(0 if c is None else c for c in channels), index
+    if kind is None:
+        return None, index
+    return (code, kind), index
+
+
+def _apply_sgr(attrs: CellAttrs, raw: str) -> CellAttrs:
+    """Apply one SGR sequence's parameter string to `attrs`.
+
+    Unknown parameters land in `other` instead of being dropped, and never stop
+    the known ones in the same sequence from applying.
+    """
+    tokens = []
+    for chunk in raw.split(";"):
+        tokens.append(
+            tuple(int(part) if part.isdigit() else None for part in chunk.split(":"))
+        )
+    fg, bg = attrs.fg, attrs.bg
+    flags = set(attrs.flags)
+    other = set(attrs.other)
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        index += 1
+        code = token[0] or 0  # an omitted parameter means 0
+        if len(token) > 1 and code in _SGR_EXTENDED:
+            # colon form: the colour carries its own arguments
+            value = tuple(part for part in token if part is not None)
+            if code == 38:
+                fg = value
+            elif code == 48:
+                bg = value
+            continue
+        if code == 0:
+            fg = bg = None
+            flags.clear()
+            other.clear()
+        elif code in _SGR_ON:
+            flags.add(_SGR_ON[code])
+        elif code in _SGR_OFF:
+            flags.difference_update(_SGR_OFF[code])
+        elif 30 <= code <= 37 or 90 <= code <= 97:
+            fg = (code,)
+        elif code == 39:
+            fg = None
+        elif 40 <= code <= 47 or 100 <= code <= 107:
+            bg = (code,)
+        elif code == 49:
+            bg = None
+        elif code in _SGR_EXTENDED:
+            value, index = _extended_colour(code, tokens, index)
+            if code == 38:
+                fg = value
+            elif code == 48:
+                bg = value
+            # 58 (underline colour) is consumed so its arguments cannot be
+            # mistaken for parameters of their own
+        else:
+            other.add(code)
+    return CellAttrs(fg, bg, frozenset(flags), frozenset(other))
+
+
+def _as_colour(value):
+    """Normalise an expected colour: `32` and `(32,)` mean the same thing."""
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return (value,)
+    return tuple(value)
+
+
+def _as_flags(value):
+    return (value,) if isinstance(value, str) else tuple(value)
+
+
+_UNSET = object()
+
+
+# ---------------------------------------------------------------------------
 # Frame
 # ---------------------------------------------------------------------------
 
 
 class Frame:
-    """One captured screen, as plain text.
+    """One captured screen: a text plane and, when captured, an attribute plane.
 
     `lines` are right-stripped; `raw_lines` are padded to the full width.
+    `attrs` is a row-major grid of `CellAttrs`, or None for a frame built from
+    text alone (the attribute helpers then fail with that explanation rather
+    than a `TypeError`). `cells` is the grid one string per cell, which is how
+    column positions stay right when a wide character occupies two of them.
     """
 
-    def __init__(self, lines, rows=None, cols=None, wrapped=(), label=None):
+    def __init__(self, lines, rows=None, cols=None, wrapped=(), label=None,
+                 attrs=None, cells=None):
         self.lines = [line.rstrip() for line in lines]
         self.rows = rows if rows is not None else len(self.lines)
         self.cols = cols if cols is not None else max(
@@ -168,6 +435,9 @@ class Frame:
         )
         self.wrapped = frozenset(wrapped)
         self.label = label
+        # Taken as given: Screen.frame() hands over fresh copies.
+        self.attrs = attrs
+        self.cells = cells
 
     # -- text ------------------------------------------------------------
 
@@ -228,6 +498,172 @@ class Frame:
             if rx.search(line):
                 return i
         return None
+
+    # -- attributes ------------------------------------------------------
+
+    def _require_attrs(self):
+        if self.attrs is None:
+            raise AssertionError(
+                self._message(
+                    "this frame carries no attribute plane: it was built from "
+                    "text alone. Capture it with Screen.frame() / "
+                    "TerminalSession.frame() to assert on colour."
+                )
+            )
+        return self.attrs
+
+    def _cell_row(self, row: int):
+        """One string per grid column, so column indices survive wide chars."""
+        if self.cells is not None:
+            return self.cells[row]
+        return list(self.raw_lines[row])
+
+    def attrs_at(self, row: int, col: int) -> CellAttrs:
+        """The attributes the cell at `(row, col)` was drawn with."""
+        plane = self._require_attrs()
+        if not 0 <= row < len(plane) or not 0 <= col < len(plane[row]):
+            raise AssertionError(
+                self._message(
+                    "no cell at row %d column %d in a %dx%d frame"
+                    % (row, col, self.rows, self.cols)
+                )
+            )
+        return plane[row][col]
+
+    def attr_runs(self, row: int, trim: bool = True):
+        """The contiguous runs of like-attributed cells on `row`.
+
+        Trailing padding is dropped unless `trim=False`, so the runs line up
+        with what `lines` shows. Only *default-attributed* blanks are dropped:
+        blanks carrying a background colour are part of what a viewer sees — a
+        highlighted row runs to the right margin — and are kept.
+        """
+        plane = self._require_attrs()
+        if not 0 <= row < len(plane):
+            raise AssertionError(
+                self._message("no row %d in a %dx%d frame" % (row, self.rows, self.cols))
+            )
+        attrs_row = plane[row]
+        cells = self._cell_row(row)
+        runs = []
+        start = 0
+        for col in range(1, len(attrs_row) + 1):
+            if col == len(attrs_row) or attrs_row[col] != attrs_row[start]:
+                runs.append(
+                    AttrRun(
+                        row, start, col, "".join(cells[start:col]), attrs_row[start]
+                    )
+                )
+                start = col
+        if trim and runs and runs[-1].attrs == DEFAULT_ATTRS:
+            last = runs.pop()
+            end = last.end
+            while end > last.start and cells[end - 1] == _BLANK:
+                end -= 1
+            if end > last.start:
+                runs.append(
+                    AttrRun(row, last.start, end, "".join(cells[last.start:end]),
+                            last.attrs)
+                )
+        return runs
+
+    def run_with(self, needle: str, row: int = None) -> AttrRun:
+        """The single run that `needle` was drawn in.
+
+        Fails loudly if the text is not there, or if it straddles two runs —
+        which is itself a finding: it means the substring was not drawn in one
+        style.
+        """
+        self._require_attrs()
+        if not needle:
+            raise ValueError("run_with() needs a non-empty substring")
+        if row is None:
+            row = self.find(needle)
+            if row is None:
+                raise AssertionError(self._message("no line contains %r" % needle))
+        if not 0 <= row < len(self.attrs):
+            raise AssertionError(
+                self._message("no row %d in a %dx%d frame" % (row, self.rows, self.cols))
+            )
+        cells = self._cell_row(row)
+        joined = "".join(cells)
+        position = joined.find(needle)
+        if position < 0:
+            raise AssertionError(
+                self._message("row %d does not contain %r" % (row, needle))
+            )
+        # a cell holds one character or, for the second half of a wide one,
+        # nothing at all — so this maps string offsets back to grid columns
+        columns = [col for col, cell in enumerate(cells) for _ in cell]
+        first = columns[position]
+        last = columns[position + len(needle) - 1]
+        runs = self.attr_runs(row, trim=False)
+        for run in runs:
+            if run.start <= first and last < run.end:
+                return run
+        spanned = [run for run in runs if run.start <= last and first < run.end]
+        raise AssertionError(
+            self._attr_message(
+                "%r on row %d is not drawn as one run — it spans %d: %s"
+                % (
+                    needle,
+                    row,
+                    len(spanned),
+                    ", ".join(
+                        "%r %s" % (run.text, run.attrs.describe()) for run in spanned
+                    ),
+                ),
+                row,
+            )
+        )
+
+    def attrs_for(self, needle: str, row: int = None) -> CellAttrs:
+        """The attributes `needle` was drawn with."""
+        return self.run_with(needle, row=row).attrs
+
+    def assert_attrs(self, needle: str, fg=_UNSET, bg=_UNSET, has=(), lacks=(),
+                     row: int = None):
+        """Assert how `needle` was drawn.
+
+        `fg`/`bg` take a parameter tuple or the bare int (`31` == `(31,)`), and
+        `None` means the terminal default. `has`/`lacks` take a flag name or a
+        list of them.
+        """
+        run = self.run_with(needle, row=row)
+        actual = run.attrs
+        problems = []
+        if fg is not _UNSET and actual.fg != _as_colour(fg):
+            problems.append("foreground is %r, expected %r" % (actual.fg, _as_colour(fg)))
+        if bg is not _UNSET and actual.bg != _as_colour(bg):
+            problems.append("background is %r, expected %r" % (actual.bg, _as_colour(bg)))
+        for flag in _as_flags(has):
+            if flag not in actual.flags:
+                problems.append("%s is not set" % flag)
+        for flag in _as_flags(lacks):
+            if flag in actual.flags:
+                problems.append("%s is set" % flag)
+        if problems:
+            raise AssertionError(
+                self._attr_message(
+                    "%r is drawn %s: %s"
+                    % (needle, actual.describe(), "; ".join(problems)),
+                    run.row,
+                )
+            )
+        return self
+
+    def assert_attrs_differ(self, one: str, other: str):
+        """Assert two pieces of text were not drawn the same way."""
+        first = self.run_with(one)
+        second = self.run_with(other)
+        if first.attrs == second.attrs:
+            raise AssertionError(
+                self._message(
+                    "%r and %r are both drawn %s — they should be "
+                    "distinguishable" % (one, other, first.attrs.describe())
+                )
+            )
+        return self
 
     # -- assertions ------------------------------------------------------
 
@@ -307,6 +743,19 @@ class Frame:
         )
         return "%s\n%s\n%s\n%s\n%s" % (reason, header, rule, numbered, rule)
 
+    def _attr_message(self, reason: str, row: int = None) -> str:
+        """`_message` plus how the row in question was drawn, run by run."""
+        base = self._message(reason)
+        if self.attrs is None or row is None:
+            return base
+        detail = ["how row %d was drawn:" % row]
+        for run in self.attr_runs(row, trim=False):
+            detail.append(
+                "  cols %3d-%-3d %-24s %s"
+                % (run.start, run.end - 1, repr(run.text), run.attrs.describe())
+            )
+        return base + "\n" + "\n".join(detail)
+
 
 # ---------------------------------------------------------------------------
 # Screen — the terminal emulator
@@ -332,7 +781,9 @@ class Screen:
     # -- state -----------------------------------------------------------
 
     def reset(self):
+        self._attrs = DEFAULT_ATTRS
         self._grid = [self._blank_row() for _ in range(self.rows)]
+        self._attr_grid = [self._blank_attr_row() for _ in range(self.rows)]
         self._wrapped = [False] * self.rows
         self.cursor_row = 0
         self.cursor_col = 0
@@ -356,18 +807,33 @@ class Screen:
     def _blank_row(self):
         return [_BLANK] * self.cols
 
+    def _blank_attrs(self) -> CellAttrs:
+        """What a cell blanked *right now* carries.
+
+        Back-colour erase, which is what `xterm-256color` advertises (`bce`):
+        an erased cell keeps the current background and loses everything else.
+        """
+        background = self._attrs.bg
+        return DEFAULT_ATTRS if background is None else CellAttrs(bg=background)
+
+    def _blank_attr_row(self):
+        return [self._blank_attrs()] * self.cols
+
     def resize(self, rows: int, cols: int):
         """Resize the grid, keeping the top-left content."""
         grid = [self._blank_row_of(cols) for _ in range(rows)]
+        attr_grid = [[DEFAULT_ATTRS] * cols for _ in range(rows)]
         wrapped = [False] * rows
         for r in range(min(rows, self.rows)):
             for c in range(min(cols, self.cols)):
                 grid[r][c] = self._grid[r][c]
+                attr_grid[r][c] = self._attr_grid[r][c]
             if cols >= self.cols:
                 wrapped[r] = self._wrapped[r]
         self.rows = rows
         self.cols = cols
         self._grid = grid
+        self._attr_grid = attr_grid
         self._wrapped = wrapped
         self.scroll_top = 0
         self.scroll_bottom = rows - 1
@@ -387,6 +853,14 @@ class Screen:
         """The visible screen, one padded string per row."""
         return ["".join(row) for row in self._grid]
 
+    def cells(self):
+        """The visible screen, one string per grid cell."""
+        return [row[:] for row in self._grid]
+
+    def attrs(self):
+        """How every cell was drawn, row by row."""
+        return [row[:] for row in self._attr_grid]
+
     def wrapped_rows(self):
         """Rows whose content continued onto the following row."""
         return [i for i, flag in enumerate(self._wrapped) if flag]
@@ -398,6 +872,8 @@ class Screen:
             cols=self.cols,
             wrapped=self.wrapped_rows(),
             label=label,
+            attrs=self.attrs(),
+            cells=self.cells(),
         )
 
     # -- input -----------------------------------------------------------
@@ -472,14 +948,19 @@ class Screen:
             else:
                 return
         row = self._grid[self.cursor_row]
+        attr_row = self._attr_grid[self.cursor_row]
         if self.insert_mode:
             shift = width
-            row[self.cursor_col:] = ([_BLANK] * shift + row[self.cursor_col:])[
-                : self.cols - self.cursor_col
-            ]
+            keep = self.cols - self.cursor_col
+            row[self.cursor_col:] = ([_BLANK] * shift + row[self.cursor_col:])[:keep]
+            attr_row[self.cursor_col:] = (
+                [self._blank_attrs()] * shift + attr_row[self.cursor_col:]
+            )[:keep]
         row[self.cursor_col] = ch
+        attr_row[self.cursor_col] = self._attrs
         if width == 2:
             row[self.cursor_col + 1] = _WIDE_PLACEHOLDER
+            attr_row[self.cursor_col + 1] = self._attrs
         self._last_char = ch
         end = self.cursor_col + width
         if end >= self.cols:
@@ -555,6 +1036,10 @@ class Screen:
             private = raw[0]
             raw = raw[1:]
         raw = raw.rstrip(" !\"#$%&'()*+,-./")
+        if final == "m" and not private:
+            # SGR: the one sequence that draws nothing and changes everything
+            self._attrs = _apply_sgr(self._attrs, raw)
+            return
         params = []
         for chunk in raw.split(";"):
             chunk = chunk.split(":")[0]
@@ -645,7 +1130,7 @@ class Screen:
             self._save_cursor()
         elif final == "u":
             self._restore_cursor()
-        # m (SGR), n, c, t and friends: consumed, nothing to draw
+        # n, c, t and friends: consumed, nothing to draw
 
     def _private_mode(self, params, on):
         for mode in params:
@@ -664,11 +1149,13 @@ class Screen:
                 return
             self._saved_screen = (
                 [row[:] for row in self._grid],
+                [row[:] for row in self._attr_grid],
                 self._wrapped[:],
                 self.cursor_row,
                 self.cursor_col,
             )
             self._grid = [self._blank_row() for _ in range(self.rows)]
+            self._attr_grid = [self._blank_attr_row() for _ in range(self.rows)]
             self._wrapped = [False] * self.rows
             self.in_alt_screen = True
         else:
@@ -677,12 +1164,18 @@ class Screen:
             self.in_alt_screen = False
             if self._saved_screen is None:
                 return
-            grid, wrapped, row, col = self._saved_screen
+            grid, attr_grid, wrapped, row, col = self._saved_screen
             self._saved_screen = None
             self._grid = [r[: self.cols] + [_BLANK] * (self.cols - len(r)) for r in grid]
+            self._attr_grid = [
+                r[: self.cols] + [DEFAULT_ATTRS] * (self.cols - len(r))
+                for r in attr_grid
+            ]
             while len(self._grid) < self.rows:
                 self._grid.append(self._blank_row())
+                self._attr_grid.append(self._blank_attr_row())
             self._grid = self._grid[: self.rows]
+            self._attr_grid = self._attr_grid[: self.rows]
             self._wrapped = (wrapped + [False] * self.rows)[: self.rows]
             if save_cursor:
                 self.cursor_row = self._clamp_row(row)
@@ -736,23 +1229,29 @@ class Screen:
     def _scroll_up(self, count):
         for _ in range(count):
             del self._grid[self.scroll_top]
+            del self._attr_grid[self.scroll_top]
             del self._wrapped[self.scroll_top]
             self._grid.insert(self.scroll_bottom, self._blank_row())
+            self._attr_grid.insert(self.scroll_bottom, self._blank_attr_row())
             self._wrapped.insert(self.scroll_bottom, False)
 
     def _scroll_down(self, count):
         for _ in range(count):
             del self._grid[self.scroll_bottom]
+            del self._attr_grid[self.scroll_bottom]
             del self._wrapped[self.scroll_bottom]
             self._grid.insert(self.scroll_top, self._blank_row())
+            self._attr_grid.insert(self.scroll_top, self._blank_attr_row())
             self._wrapped.insert(self.scroll_top, False)
 
     # -- erasing / editing -----------------------------------------------
 
     def _clear_row(self, row, start=0, end=None):
         end = self.cols if end is None else end
+        blank_attrs = self._blank_attrs()
         for col in range(start, end):
             self._grid[row][col] = _BLANK
+            self._attr_grid[row][col] = blank_attrs
         if start == 0 and end == self.cols:
             self._wrapped[row] = False
 
@@ -789,8 +1288,10 @@ class Screen:
             return
         for _ in range(count):
             del self._grid[self.scroll_bottom]
+            del self._attr_grid[self.scroll_bottom]
             del self._wrapped[self.scroll_bottom]
             self._grid.insert(self.cursor_row, self._blank_row())
+            self._attr_grid.insert(self.cursor_row, self._blank_attr_row())
             self._wrapped.insert(self.cursor_row, False)
         self.cursor_col = 0
         self._pending_wrap = False
@@ -800,23 +1301,32 @@ class Screen:
             return
         for _ in range(count):
             del self._grid[self.cursor_row]
+            del self._attr_grid[self.cursor_row]
             del self._wrapped[self.cursor_row]
             self._grid.insert(self.scroll_bottom, self._blank_row())
+            self._attr_grid.insert(self.scroll_bottom, self._blank_attr_row())
             self._wrapped.insert(self.scroll_bottom, False)
         self.cursor_col = 0
         self._pending_wrap = False
 
     def _delete_chars(self, count):
         row = self._grid[self.cursor_row]
+        attr_row = self._attr_grid[self.cursor_row]
         col = self.cursor_col
-        remainder = row[col + count:]
-        row[col:] = (remainder + [_BLANK] * self.cols)[: self.cols - col]
+        keep = self.cols - col
+        row[col:] = (row[col + count:] + [_BLANK] * self.cols)[:keep]
+        attr_row[col:] = (
+            attr_row[col + count:] + [self._blank_attrs()] * self.cols
+        )[:keep]
         self._pending_wrap = False
 
     def _insert_chars(self, count):
         row = self._grid[self.cursor_row]
+        attr_row = self._attr_grid[self.cursor_row]
         col = self.cursor_col
-        row[col:] = ([_BLANK] * count + row[col:])[: self.cols - col]
+        keep = self.cols - col
+        row[col:] = ([_BLANK] * count + row[col:])[:keep]
+        attr_row[col:] = ([self._blank_attrs()] * count + attr_row[col:])[:keep]
         self._pending_wrap = False
 
     def _erase_chars(self, count):
