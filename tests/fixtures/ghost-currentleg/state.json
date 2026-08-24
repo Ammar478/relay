@@ -1,0 +1,7 @@
+{
+  "relay": "ghost",
+  "phase": "running",
+  "currentStage": "S9",
+  "currentLeg": "a-leg-that-does-not-exist",
+  "checks": {}
+}

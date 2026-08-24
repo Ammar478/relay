@@ -1,0 +1,19 @@
+{
+  "relay": "stale-currentleg",
+  "stages": [
+    { "id": "S1", "name": "First stage", "legs": ["alpha", "open-and-green-mr"] },
+    { "id": "S2", "name": "Second stage", "legs": ["cutover-flip", "cutover-verify"] }
+  ],
+  "legs": [
+    { "id": "alpha", "stage": "S1", "kind": "impl", "goal": "Land alpha.",
+      "fulfills": ["ACC-X-001"], "status": "done" },
+    { "id": "open-and-green-mr", "stage": "S1", "kind": "impl", "goal": "Open the MR and get it green.",
+      "fulfills": ["ACC-X-002"], "dependsOn": ["alpha"], "status": "done" },
+    { "id": "cutover-flip", "stage": "S2", "kind": "impl", "goal": "Flip the cutover.",
+      "fulfills": ["ACC-Y-001"], "dependsOn": ["open-and-green-mr"],
+      "touches": ["src/cutover.py"], "boundaries": ["do not touch prod"],
+      "verification": ["pytest tests/cutover"], "status": "in progress" },
+    { "id": "cutover-verify", "stage": "S2", "kind": "judge", "goal": "Verify the cutover.",
+      "fulfills": [], "dependsOn": ["cutover-flip"], "status": "TODO" }
+  ]
+}

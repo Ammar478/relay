@@ -1,0 +1,16 @@
+{
+  "relay": "stale-currentleg",
+  "phase": "running",
+  "currentStage": "S1",
+  "currentLeg": "open-and-green-mr",
+  "checks": {
+    "ACC-X-001": { "status": "passed", "stage": "S1", "claimedBy": "alpha", "round": 1,
+                   "evidence": "pytest tests/alpha -q -> 12 passed" },
+    "ACC-X-002": { "status": "failed", "stage": "S1", "claimedBy": "open-and-green-mr", "round": 3,
+                   "reason": "pipeline red on the MR", "fixLeg": "fix-pipeline" },
+    "ACC-Y-001": { "status": "blocked", "stage": "S2", "claimedBy": "cutover-flip",
+                   "reason": "no staging environment to evidence against" },
+    "ACC-Y-002": { "status": "pending", "stage": "S2", "claimedBy": "cutover-verify" }
+  },
+  "rounds": { "S1": 3 }
+}

@@ -1,0 +1,260 @@
+{
+  "relay": "wave-2-postgres-cutover-dev",
+  "phase": "running",
+  "currentStage": "S3",
+  "currentLeg": "open-and-green-mr",
+  "checks": {
+    "ACC-MERGE-001": {
+      "status": "passed",
+      "stage": "S1",
+      "claimedBy": "reconcile-develop",
+      "round": 1,
+      "evidence": "rev-list HEAD..develop=0; symbols 2/3/2; five write methods True; PAT resolver True; 5 failed 677 passed (5 pre-existing psycopg) | JUDGED: merge is a provable pure auto-merge - merge-tree replay hash byte-identical to the commit tree; develop's drop-the-key redaction won over wave-2's blanking version",
+      "judged": true
+    },
+    "ACC-MERGE-002": {
+      "status": "passed",
+      "stage": "S1",
+      "claimedBy": "reconcile-security",
+      "round": 1,
+      "evidence": "rev-list=0 both parents; tests/security 474 passed; pytest.ini retains tests/security | JUDGED: behaviour judge, 46 routes x both mounts all 401 anon; entitled 200 / non-entitled 404 with no host,db,schema,PAT in body; chat decided by body agent_id; guest bound+opt-in enforced; 12 admin routes exactly 403 with positive control; /process 4/4 401; isAdmin string variants non-admin across all three surfaces; 223 bodies swept, zero PAT or traceback",
+      "judged": true
+    },
+    "ACC-MERGE-003": {
+      "status": "passed",
+      "stage": "S1",
+      "claimedBy": "reconcile-security",
+      "round": 1,
+      "evidence": "symbol probe True x6 incl. five write methods, PAT resolver, entitlements",
+      "judged": true
+    },
+    "ACC-WRITE-001": {
+      "status": "passed",
+      "stage": "S2",
+      "claimedBy": "agent-write-tests",
+      "round": 1,
+      "evidence": "158 tests pass in test_pg_agent_writes.py against a DB at 0003; coach-run mutations: provider normalisation removed 2 fail, unknown-field rejection removed 9 fail, upsert downgraded to DO NOTHING 116 fail, delete matched on slug 9 fail; git confirms no src change"
+    },
+    "ACC-WRITE-002": {
+      "status": "passed",
+      "stage": "S2",
+      "claimedBy": "agent-write-tests",
+      "round": 1,
+      "evidence": "158 tests pass in test_pg_agent_writes.py against a DB at 0003; coach-run mutations: provider normalisation removed 2 fail, unknown-field rejection removed 9 fail, upsert downgraded to DO NOTHING 116 fail, delete matched on slug 9 fail; git confirms no src change"
+    },
+    "ACC-WRITE-003": {
+      "status": "passed",
+      "stage": "S2",
+      "claimedBy": "agent-write-tests",
+      "round": 1,
+      "evidence": "158 tests pass in test_pg_agent_writes.py against a DB at 0003; coach-run mutations: provider normalisation removed 2 fail, unknown-field rejection removed 9 fail, upsert downgraded to DO NOTHING 116 fail, delete matched on slug 9 fail; git confirms no src change"
+    },
+    "ACC-WRITE-004": {
+      "status": "passed",
+      "stage": "S2",
+      "claimedBy": "agent-write-tests",
+      "round": 1,
+      "evidence": "158 tests pass in test_pg_agent_writes.py against a DB at 0003; coach-run mutations: provider normalisation removed 2 fail, unknown-field rejection removed 9 fail, upsert downgraded to DO NOTHING 116 fail, delete matched on slug 9 fail; git confirms no src change"
+    },
+    "ACC-WRITE-005": {
+      "status": "passed",
+      "stage": "S2",
+      "claimedBy": "agent-write-tests",
+      "round": 1,
+      "evidence": "158 tests pass in test_pg_agent_writes.py against a DB at 0003; coach-run mutations: provider normalisation removed 2 fail, unknown-field rejection removed 9 fail, upsert downgraded to DO NOTHING 116 fail, delete matched on slug 9 fail; git confirms no src change"
+    },
+    "ACC-WRITE-006": {
+      "status": "passed",
+      "stage": "S2",
+      "claimedBy": "agent-write-tests",
+      "round": 1,
+      "evidence": "158 tests pass in test_pg_agent_writes.py against a DB at 0003; coach-run mutations: provider normalisation removed 2 fail, unknown-field rejection removed 9 fail, upsert downgraded to DO NOTHING 116 fail, delete matched on slug 9 fail; git confirms no src change"
+    },
+    "ACC-WRITE-007": {
+      "status": "passed",
+      "stage": "S2",
+      "claimedBy": "agent-write-tests",
+      "round": 1,
+      "evidence": "158 tests pass in test_pg_agent_writes.py against a DB at 0003; coach-run mutations: provider normalisation removed 2 fail, unknown-field rejection removed 9 fail, upsert downgraded to DO NOTHING 116 fail, delete matched on slug 9 fail; git confirms no src change"
+    },
+    "ACC-WRITE-008": {
+      "status": "passed",
+      "stage": "S2",
+      "claimedBy": "agent-write-tests",
+      "round": 1,
+      "evidence": "158 tests pass in test_pg_agent_writes.py against a DB at 0003; coach-run mutations: provider normalisation removed 2 fail, unknown-field rejection removed 9 fail, upsert downgraded to DO NOTHING 116 fail, delete matched on slug 9 fail; git confirms no src change"
+    },
+    "ACC-WRITE-009": {
+      "status": "passed",
+      "stage": "S2",
+      "claimedBy": "pg-repository-correctness",
+      "round": 1,
+      "evidence": "pg-repository-correctness: 353 pg tests (was 304) against a DB confirmed at head 0003; 16 mutations all confirmed; natural-pair conflict targets verified load-bearing by mutation; undeletable-row closed with COALESCE on legacy_id; all nine dropped columns now selected, NULL omitted rather than returned as None"
+    },
+    "ACC-WRITE-010": {
+      "status": "passed",
+      "stage": "S2",
+      "claimedBy": "pg-repository-correctness",
+      "round": 1,
+      "evidence": "pg-repository-correctness: 353 pg tests (was 304) against a DB confirmed at head 0003; 16 mutations all confirmed; natural-pair conflict targets verified load-bearing by mutation; undeletable-row closed with COALESCE on legacy_id; all nine dropped columns now selected, NULL omitted rather than returned as None"
+    },
+    "ACC-WRITE-011": {
+      "status": "passed",
+      "stage": "S2",
+      "claimedBy": "pg-repository-correctness",
+      "round": 1,
+      "evidence": "pg-repository-correctness: 353 pg tests (was 304) against a DB confirmed at head 0003; 16 mutations all confirmed; natural-pair conflict targets verified load-bearing by mutation; undeletable-row closed with COALESCE on legacy_id; all nine dropped columns now selected, NULL omitted rather than returned as None"
+    },
+    "ACC-WRITE-012": {
+      "status": "passed",
+      "stage": "S2",
+      "claimedBy": "pg-repository-correctness",
+      "round": 1,
+      "evidence": "pg-repository-correctness: 353 pg tests (was 304) against a DB confirmed at head 0003; 16 mutations all confirmed; natural-pair conflict targets verified load-bearing by mutation; undeletable-row closed with COALESCE on legacy_id; all nine dropped columns now selected, NULL omitted rather than returned as None"
+    },
+    "ACC-WRITE-013": {
+      "status": "passed",
+      "stage": "S2",
+      "claimedBy": "agent-write-tests",
+      "round": 1,
+      "evidence": "158 tests pass in test_pg_agent_writes.py against a DB at 0003; coach-run mutations: provider normalisation removed 2 fail, unknown-field rejection removed 9 fail, upsert downgraded to DO NOTHING 116 fail, delete matched on slug 9 fail; git confirms no src change"
+    },
+    "ACC-CRED-001": {
+      "status": "passed",
+      "stage": "S2",
+      "claimedBy": "credential-parity",
+      "round": 1,
+      "evidence": "shared predicate src/utils/credential_value.py; both modules bind the SAME object (verified); masks rejected; tests/pg 304 passed; 1299 passed overall; security 474"
+    },
+    "ACC-CRED-002": {
+      "status": "passed",
+      "stage": "S2",
+      "claimedBy": "credential-parity",
+      "round": 1,
+      "evidence": "shared predicate src/utils/credential_value.py; both modules bind the SAME object (verified); masks rejected; tests/pg 304 passed; 1299 passed overall; security 474"
+    },
+    "ACC-CRED-003": {
+      "status": "passed",
+      "stage": "S2",
+      "claimedBy": "credential-parity",
+      "round": 1,
+      "evidence": "shared predicate src/utils/credential_value.py; both modules bind the SAME object (verified); masks rejected; tests/pg 304 passed; 1299 passed overall; security 474"
+    },
+    "ACC-CRED-004": {
+      "status": "passed",
+      "stage": "S2",
+      "claimedBy": "credential-parity",
+      "round": 2,
+      "evidence": "FAILED at round 1 by both judges independently: isinstance(pat,str) inverted the shared predicate so non-strings were str()'d into the vault, reachable via agentType Custom. Fixed at 73c022c; mutation restoring the isinstance form fails 8 tests; 411 pg tests pass"
+    },
+    "ACC-CRED-005": {
+      "status": "passed",
+      "stage": "S2",
+      "claimedBy": "credential-parity",
+      "round": 1,
+      "evidence": "shared predicate src/utils/credential_value.py; both modules bind the SAME object (verified); masks rejected; tests/pg 304 passed; 1299 passed overall; security 474"
+    },
+    "ACC-CRED-006": {
+      "status": "passed",
+      "stage": "S2",
+      "claimedBy": "credential-parity",
+      "round": 1,
+      "evidence": "shared predicate src/utils/credential_value.py; both modules bind the SAME object (verified); masks rejected; tests/pg 304 passed; 1299 passed overall; security 474"
+    },
+    "ACC-PARITY-001": {
+      "status": "passed",
+      "stage": "S2",
+      "claimedBy": "pg-repository-correctness",
+      "round": 1,
+      "evidence": "pg-repository-correctness: 353 pg tests (was 304) against a DB confirmed at head 0003; 16 mutations all confirmed; natural-pair conflict targets verified load-bearing by mutation; undeletable-row closed with COALESCE on legacy_id; all nine dropped columns now selected, NULL omitted rather than returned as None"
+    },
+    "ACC-PARITY-002": {
+      "status": "passed",
+      "stage": "S2",
+      "claimedBy": "pg-repository-correctness",
+      "round": 1,
+      "evidence": "pg-repository-correctness: 353 pg tests (was 304) against a DB confirmed at head 0003; 16 mutations all confirmed; natural-pair conflict targets verified load-bearing by mutation; undeletable-row closed with COALESCE on legacy_id; all nine dropped columns now selected, NULL omitted rather than returned as None"
+    },
+    "ACC-PARITY-003": {
+      "status": "passed",
+      "stage": "S2",
+      "claimedBy": "pg-repository-correctness",
+      "round": 1,
+      "evidence": "pg-repository-correctness: 353 pg tests (was 304) against a DB confirmed at head 0003; 16 mutations all confirmed; natural-pair conflict targets verified load-bearing by mutation; undeletable-row closed with COALESCE on legacy_id; all nine dropped columns now selected, NULL omitted rather than returned as None"
+    },
+    "ACC-PARITY-004": {
+      "status": "pending",
+      "stage": "S3",
+      "claimedBy": "data-parity-verify"
+    },
+    "ACC-IMAGE-001": {
+      "status": "pending",
+      "stage": "S3",
+      "claimedBy": "deploy-and-soak"
+    },
+    "ACC-IMAGE-002": {
+      "status": "pending",
+      "stage": "S3",
+      "claimedBy": "deploy-and-soak"
+    },
+    "ACC-IMAGE-003": {
+      "status": "pending",
+      "stage": "S3",
+      "claimedBy": "bump-db-migrate-pin"
+    },
+    "ACC-CUTOVER-001": {
+      "status": "pending",
+      "stage": "S4",
+      "claimedBy": "cutover-flip"
+    },
+    "ACC-CUTOVER-002": {
+      "status": "pending",
+      "stage": "S4",
+      "claimedBy": "cutover-flip"
+    },
+    "ACC-CUTOVER-003": {
+      "status": "pending",
+      "stage": "S4",
+      "claimedBy": "cutover-verify"
+    },
+    "ACC-CUTOVER-004": {
+      "status": "pending",
+      "stage": "S4",
+      "claimedBy": "cutover-verify"
+    },
+    "ACC-CUTOVER-005": {
+      "status": "pending",
+      "stage": "S4",
+      "claimedBy": "cutover-verify"
+    },
+    "ACC-CUTOVER-006": {
+      "status": "pending",
+      "stage": "S4",
+      "claimedBy": "cutover-verify"
+    },
+    "ACC-CUTOVER-007": {
+      "status": "pending",
+      "stage": "S4",
+      "claimedBy": "cutover-verify"
+    },
+    "ACC-CUTOVER-008": {
+      "status": "pending",
+      "stage": "S4",
+      "claimedBy": "cutover-verify"
+    },
+    "ACC-ROLLBACK-001": {
+      "status": "pending",
+      "stage": "S4",
+      "claimedBy": "rollback-procedure"
+    },
+    "ACC-ROLLBACK-002": {
+      "status": "pending",
+      "stage": "S4",
+      "claimedBy": "rollback-rehearsal"
+    }
+  },
+  "rounds": {
+    "S1": 1,
+    "S2": 2
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "relay": "no-dashboard",
+  "phase": "judging",
+  "currentStage": "S1",
+  "currentLeg": "judge-it",
+  "checks": { "ACC-B-001": { "status": "pass", "stage": "S1", "claimedBy": "build-it", "round": 1,
+                             "evidence": "make test -> 0" } }
+}
