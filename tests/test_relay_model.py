@@ -718,3 +718,335 @@ def test_module_does_not_import_curses():
     source = (REPO / "scripts" / "relay_model.py").read_text()
     assert "import curses" not in source
     assert "curses" not in sys.modules or True     # the module never pulls it in
+
+
+# --------------------------------------------------------------------------
+# ACC-DATA-001 — untrusted input: every malformed shape degrades
+#
+# `build()` runs once per repaint against a directory a coach, a runner and a
+# half-finished write are all editing underneath it. Every case below was
+# observed to raise before this section was written.
+# --------------------------------------------------------------------------
+
+def write_relay(root, name, legs=None, state=None, dashboard=None, raw=None):
+    """A relay directory built from whatever objects a test hands it.
+
+    `raw` writes bytes straight to a file, for the shapes `json.dumps` cannot
+    express: invalid UTF-8, a truncated object, an empty file.
+    """
+    target = Path(root) / name
+    target.mkdir(parents=True, exist_ok=True)
+    for filename, data in (("legs.json", legs), ("state.json", state),
+                           ("dashboard.json", dashboard)):
+        if data is not None:
+            (target / filename).write_text(json.dumps(data))
+    for filename, blob in (raw or {}).items():
+        (target / filename).write_bytes(blob)
+    return target
+
+
+RELAY_FILES = ["legs.json", "state.json", "dashboard.json"]
+
+# A relay file caught mid-write, byte for byte: a JSON object cut inside a
+# multi-byte character, so the file is neither valid UTF-8 nor valid JSON.
+TRUNCATED_MID_CHARACTER = '{"relay": "café'.encode()[:-1]
+
+MALFORMED_BYTES = {
+    "not utf-8 at all": b'{"relay": "caf\xe9"}',
+    "a latin-1 encoded file": '{"relay": "café"}'.encode("latin-1"),
+    "truncated inside a character": TRUNCATED_MID_CHARACTER,
+    "truncated json": b'{"relay": "x", "legs": [{"id": "a"',
+    "empty": b"",
+    "whitespace only": b"   \n",
+    "a nul byte": b'{"relay": "\x00"}',
+    "not json": b"not json at all",
+    "a json array": b'[1, 2, 3]',
+    "a json scalar": b'42',
+}
+
+# Values a leg `id` must never be. Each one crashed a different line.
+BAD_IDS = [None, 7, True, 1.5, ["x"], {"k": 1}, "", "   "]
+# Present, but not a string: a coach wrote something the field cannot hold, and
+# the model owes a warning. `None` is absence, not a wrong type, so it is kept
+# apart in `MISSING_OR_BAD`.
+BAD_STRINGS = [7, True, ["x"], {"k": 1}]
+MISSING_OR_BAD = [None] + BAD_STRINGS
+
+
+@pytest.mark.parametrize("label,blob", sorted(MALFORMED_BYTES.items()))
+@pytest.mark.parametrize("filename", RELAY_FILES)
+def test_malformed_file_bytes_are_a_warning_not_an_exception(
+        tmp_path, filename, label, blob):
+    target = write_relay(tmp_path, f"{filename}-{abs(hash(label))}",
+                         raw={filename: blob})
+    model = relay_model.build(target)
+    assert isinstance(model, dict)
+    assert model["sources"][filename.split(".")[0]] == "malformed"
+    assert any(filename in w for w in model["warnings"]), model["warnings"]
+
+
+def test_non_utf8_warning_says_what_was_wrong(tmp_path):
+    """A decode failure and a syntax failure are different repairs, so the
+    warning names which one happened."""
+    target = write_relay(tmp_path, "bytes", raw={"legs.json": b'{"relay": "caf\xe9"}'})
+    warning = " ".join(relay_model.build(target)["warnings"])
+    assert "legs.json" in warning and "UTF-8" in warning
+
+
+def test_every_relay_file_malformed_at_once_still_builds(tmp_path):
+    target = write_relay(tmp_path, "all-bad",
+                         raw={name: b'\xff\xfe truncated' for name in RELAY_FILES})
+    model = relay_model.build(target)
+    assert model["legs"] == [] and model["checks"] == []
+    assert set(model["sources"].values()) == {"malformed"}
+    assert len(model["warnings"]) >= 3
+
+
+@pytest.mark.parametrize("bad", BAD_IDS)
+def test_a_leg_id_of_the_wrong_type_never_raises(tmp_path, bad):
+    target = write_relay(tmp_path, f"leg-id-{type(bad).__name__}-{bad!r:.8}",
+                         legs={"legs": [{"id": bad, "status": "running"}]})
+    model = relay_model.build(target)
+    assert isinstance(model, dict)
+    assert len(model["legs"]) == 1
+    assert model["legs"][0]["id"] == ""          # unidentifiable, never "None"
+    assert any("id" in w for w in model["warnings"]), model["warnings"]
+
+
+def test_a_leg_with_no_id_key_at_all_never_raises(tmp_path):
+    target = write_relay(tmp_path, "no-id-key",
+                         legs={"legs": [{"status": "running", "goal": "g"}]})
+    model = relay_model.build(target)
+    assert model["legs"][0]["id"] == ""
+    assert model["legs"][0]["goal"] == "g"       # the rest of the row survives
+    assert any("id" in w for w in model["warnings"])
+
+
+@pytest.mark.parametrize("bad", BAD_STRINGS)
+def test_a_claimed_by_of_the_wrong_type_never_raises(tmp_path, bad):
+    target = write_relay(
+        tmp_path, f"claimed-{type(bad).__name__}",
+        legs={"legs": [{"id": "a", "status": "done"}]},
+        state={"checks": {"ACC-A-001": {"status": "passed", "claimedBy": bad}}})
+    model = relay_model.build(target)
+    assert isinstance(model, dict)
+    assert model["checks"][0]["claimedBy"] is None
+    assert any("claimedBy" in w for w in model["warnings"]), model["warnings"]
+
+
+@pytest.mark.parametrize("bad", MISSING_OR_BAD)
+def test_a_leg_stage_of_the_wrong_type_never_raises(tmp_path, bad):
+    target = write_relay(
+        tmp_path, f"stage-{type(bad).__name__}",
+        legs={"stages": [{"id": "S1", "name": "One", "legs": ["a"]}],
+              "legs": [{"id": "a", "stage": bad, "status": "running"}]})
+    model = relay_model.build(target)
+    assert isinstance(model, dict)
+    assert model["legs"][0]["stage"] is None
+
+
+@pytest.mark.parametrize("bad", MISSING_OR_BAD)
+def test_state_pointers_of_the_wrong_type_never_raise(tmp_path, bad):
+    target = write_relay(
+        tmp_path, f"pointers-{type(bad).__name__}",
+        legs={"legs": [{"id": "a", "status": "running"}]},
+        state={"currentLeg": bad, "currentStage": bad, "phase": bad})
+    model = relay_model.build(target)
+    assert isinstance(model, dict)
+    assert model["relay"]["currentLegDeclared"] in (None, str(bad))
+    assert model["relay"]["currentStage"] is None or isinstance(
+        model["relay"]["currentStage"]["id"], str)
+
+
+@pytest.mark.parametrize("bad", [5, "text", {"a": 1}, [1, 2], None])
+def test_legs_and_stages_of_the_wrong_type_never_raise(tmp_path, bad):
+    target = write_relay(tmp_path, f"shape-{type(bad).__name__}-{bad!r:.6}",
+                         legs={"stages": bad, "legs": bad})
+    model = relay_model.build(target)
+    assert isinstance(model, dict)
+    assert model["legs"] == [] and model["stages"] == []
+
+
+def test_dashboard_fields_of_the_wrong_type_never_raise(tmp_path):
+    target = write_relay(
+        tmp_path, "dash-shapes",
+        legs={"legs": [{"id": "a", "status": "running"}]},
+        dashboard={"title": ["a"], "path": {"p": 1}, "elapsed": ["1h"],
+                   "tokens": "many", "checkTitles": [1, 2], "log": "not a list",
+                   "attention": 7, "notes": {"level": "bad"}})
+    model = relay_model.build(target)
+    assert isinstance(model, dict)
+    assert isinstance(model["relay"]["path"], str)
+    assert model["relay"]["title"] in (None, "a") or isinstance(
+        model["relay"]["title"], str)
+
+
+def test_build_of_an_empty_path_is_refused(tmp_path):
+    """`build('')` used to build the current working directory, which is
+    whatever the view happened to be started from."""
+    with pytest.raises(relay_model.RelayNotFound):
+        relay_model.build("")
+    with pytest.raises(relay_model.RelayNotFound):
+        relay_model.build(None)
+    with pytest.raises(relay_model.RelayNotFound):
+        relay_model.build(7)
+
+
+def test_kind_of_survives_a_leg_that_is_not_a_dict():
+    assert relay_model.kind_of({"id": None}) in ("impl", "fix", "judge")
+    assert relay_model.kind_of({"id": ["x"]}) in ("impl", "fix", "judge")
+    assert relay_model.kind_of(None) == "impl"
+
+
+def test_fuzz_over_malformed_relay_directories(tmp_path):
+    """Every combination of a bad leg id, a bad claimedBy and a bad file body
+    builds. One assertion, many shapes: the point is that none of them raise.
+    """
+    built = 0
+    for i, bad_id in enumerate(BAD_IDS):
+        for j, bad_claim in enumerate(MISSING_OR_BAD):
+            target = write_relay(
+                tmp_path, f"fuzz-{i}-{j}",
+                legs={"relay": bad_claim,
+                      "stages": [{"id": bad_id, "name": bad_claim, "legs": bad_id}],
+                      "legs": [{"id": bad_id, "status": bad_claim,
+                                "stage": bad_id, "goal": bad_claim,
+                                "fulfills": bad_claim, "kind": bad_claim},
+                               {"id": "real", "status": "running"}]},
+                state={"currentLeg": bad_id, "currentStage": bad_id,
+                       "phase": bad_claim,
+                       "checks": {"ACC-A-001": {"status": bad_claim,
+                                                "claimedBy": bad_claim,
+                                                "round": bad_claim,
+                                                "fixLeg": bad_id}}},
+                dashboard={"title": bad_claim, "path": bad_claim,
+                           "tokens": bad_claim, "attention": bad_claim,
+                           "log": bad_claim, "elapsed": bad_claim})
+            model = relay_model.build(target)
+            assert isinstance(model, dict), (bad_id, bad_claim)
+            json.dumps(model)
+            assert_active_agrees(model, f"fuzz-{i}-{j}")
+            built += 1
+    assert built == len(BAD_IDS) * len(MISSING_OR_BAD)
+
+
+
+def test_fuzz_over_malformed_file_bodies(tmp_path):
+    """Every malformed body, in every relay file, in every combination of
+    which files are present."""
+    bodies = list(MALFORMED_BYTES.values())
+    for i, blob in enumerate(bodies):
+        for mask in range(1, 8):
+            raw = {name: blob for bit, name in enumerate(RELAY_FILES)
+                   if mask & (1 << bit)}
+            target = write_relay(tmp_path, f"bytes-{i}-{mask}", raw=raw)
+            model = relay_model.build(target)
+            assert isinstance(model, dict), (i, mask)
+            assert_active_agrees(model, f"bytes-{i}-{mask}")
+
+
+# --------------------------------------------------------------------------
+# ACC-DATA-003 — the invariant, asserted as the check words it
+# --------------------------------------------------------------------------
+
+def assert_active_agrees(model, label=""):
+    """`activeRunner.leg == activeLeg.id`, **or both are absent** — the whole
+    disjunction, which is what the check says and what a leg with an
+    unusable id used to break by satisfying neither half.
+    """
+    leg, runner = model["activeLeg"], model["activeRunner"]
+    assert (leg is None) == (runner is None), (label, leg, runner)
+    if leg is None:
+        return
+    assert runner["leg"] == leg["id"], (label, runner["leg"], leg["id"])
+    # Identity, not just equality of ids: with duplicate ids in legs.json two
+    # different legs answer to the same string, and the runner row must be the
+    # one built from *this* leg.
+    assert any(row is runner for row in model["runners"]), label
+    assert runner["status"] == "running", (label, runner["status"])
+    assert leg["isActive"] is True, label
+    assert leg["status"] == "running", (label, leg["status"])
+
+
+@pytest.mark.parametrize("name", ALL_FIXTURES)
+def test_active_leg_and_active_runner_agree_on_every_fixture(name, relay):
+    assert_active_agrees(relay_model.build(relay(name)), name)
+
+
+def test_duplicate_leg_ids_do_not_split_active_leg_from_active_runner(tmp_path):
+    """The original Mission Control defect, in its last remaining form: two
+    legs answer to one id, and the runner row was looked up by that id — so
+    the active leg was running while the active runner was the completed
+    namesake.
+    """
+    target = write_relay(
+        tmp_path, "dup",
+        legs={"legs": [{"id": "twin", "status": "done"},
+                       {"id": "twin", "status": "running"}]})
+    model = relay_model.build(target)
+    assert_active_agrees(model, "duplicate ids")
+    assert model["activeRunner"]["status"] == "running"
+    assert any("twin" in w for w in model["warnings"]), model["warnings"]
+
+
+def test_a_running_leg_that_cannot_be_identified_is_not_the_active_leg(tmp_path):
+    """Neither equal nor both-absent: activeLeg was present with no runner.
+
+    A leg with no usable id cannot be matched to a baton, a check or a commit,
+    so it is not a candidate for the active leg at all.
+    """
+    target = write_relay(tmp_path, "nameless",
+                         legs={"legs": [{"status": "running", "goal": "g"}]})
+    model = relay_model.build(target)
+    assert_active_agrees(model, "no id")
+    assert model["activeLeg"] is None
+    assert model["legCounts"]["running"] == 1     # it is still a running leg
+
+
+def test_a_named_running_leg_wins_over_a_nameless_one(tmp_path):
+    target = write_relay(
+        tmp_path, "nameless-then-named",
+        legs={"legs": [{"status": "running"}, {"id": "real", "status": "running"}]})
+    model = relay_model.build(target)
+    assert_active_agrees(model, "nameless then named")
+    assert model["activeLeg"]["id"] == "real"
+
+
+def test_two_running_legs_are_reported_and_warned_about(tmp_path):
+    """Both are reported — the model does not hide what legs.json says — but a
+    relay with two legs in flight is a coach error, and the pane should be able
+    to say so."""
+    target = write_relay(
+        tmp_path, "two-running",
+        legs={"legs": [{"id": "a", "status": "running"},
+                       {"id": "b", "status": "in progress"}]})
+    model = relay_model.build(target)
+    assert model["legCounts"]["running"] == 2
+    assert_active_agrees(model, "two running")
+    assert model["activeLeg"]["id"] == "a"        # first in plan order
+    assert any("a" in w and "b" in w for w in model["warnings"]), model["warnings"]
+
+
+def test_active_runner_is_the_same_object_as_its_runner_row(relay):
+    model = relay_model.build(relay("agent-service"))
+    assert any(row is model["activeRunner"] for row in model["runners"])
+
+
+@pytest.mark.parametrize("bad", MISSING_OR_BAD)
+def test_an_attention_item_of_the_wrong_shape_never_raises(tmp_path, bad):
+    """`level` indexes the sort table, so a list there is unhashable, not just
+    unknown. Found by the fuzz loop, not by hand."""
+    target = write_relay(
+        tmp_path, f"attention-{type(bad).__name__}",
+        legs={"legs": [{"id": "a", "status": "running"}]},
+        dashboard={"attention": [{"level": bad, "label": bad, "text": bad,
+                                  "action": bad},
+                                 {"level": "bad", "text": "real"}],
+                   "notes": [bad]})
+    model = relay_model.build(target)
+    assert isinstance(model, dict)
+    for item in model["attention"]:
+        assert item["level"] in ("bad", "warn", "note", "calm")
+        assert isinstance(item["label"], str) and isinstance(item["text"], str)
+        assert item["action"] is None or isinstance(item["action"], str)
+    assert any(item["text"] == "real" for item in model["attention"])

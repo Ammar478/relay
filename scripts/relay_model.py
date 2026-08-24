@@ -39,6 +39,23 @@ seconds, not `"15:08"`. Nothing here is truncated, coloured or padded — a view
 decides how absence looks. Baton prose is left on disk and fetched by
 `baton_text()`; the model carries its path, its line count and its commit.
 
+Every input is untrusted
+------------------------
+`build()` returns a dict for every directory it is given. A file that is not
+valid UTF-8, not valid JSON, empty, truncated mid-write, or a JSON array where
+an object belongs; a leg `id` that is null, a number or a list; a `claimedBy`
+that is an object; a `stages` that is a number - each of those is a `warnings`
+entry naming the field and what it held, and the model carries on with that
+value absent. Nothing on disk, and nothing constructible, makes `build()` raise
+(ACC-DATA-001). The one exception is the argument itself: a path that is not a
+directory, or is empty, raises `RelayNotFound`, because a view that asked for
+nothing must be told so rather than shown the working directory.
+
+Coercion happens once, at the top of this module, so no rule below it asks what
+type a field is. A leg whose id cannot be read is inert: it is counted and
+listed, but it can never be the active leg, because nothing on disk could be
+matched to it (ACC-DATA-003).
+
 The Progress Log is derived, not required
 -----------------------------------------
 `dashboard.json.log` is a coach's optional narration. When there is none the
@@ -88,6 +105,77 @@ PLACEHOLDERS = {"", "-", "--", "—", "–", "n/a", "na", "none", "null", "tbd",
 
 class RelayNotFound(Exception):
     """The path given to build() is not a directory."""
+
+
+# --------------------------------------------------------------------------
+# untrusted input — the one place a value is made safe to use
+# --------------------------------------------------------------------------
+#
+# Every relay file is written by hand, by a coach, by a runner, or by a process
+# that was interrupted mid-write, and `build()` runs once per repaint against
+# whatever is on disk at that instant. So no field is assumed to have the type
+# the template gives it: a leg `id` arrives as null, a `claimedBy` as a list, a
+# `stages` as a number. Rather than an isinstance check at each use, a value is
+# coerced once, here, on the way in - and where the coach wrote something the
+# field cannot hold, the coercion leaves a warning naming the field and the type
+# it held. The model then goes on with the value absent, which every downstream
+# rule already handles. Absence is what a malformed value degrades to; a
+# traceback is not (ACC-DATA-001).
+
+
+def _text(value):
+    """The usable string inside an untrusted value, else None.
+
+    None for anything that is not a string, for the empty string, and for the
+    placeholders a coach types where there is no value ("-", "n/a", "TBD"):
+    those are display, and the model carries absence as None.
+    """
+    if isinstance(value, str):
+        text = value.strip()
+        return text if text.lower() not in PLACEHOLDERS else None
+    return None
+
+
+def _text_or_warn(value, what, warnings):
+    """`_text`, and a warning when the value was there but was not a string.
+
+    A missing key and an explicit null are absence and pass quietly. A list
+    where an id belongs is a file a supervisor needs told about.
+    """
+    if value is not None and not isinstance(value, str):
+        warnings.append(f"{what} is a {type(value).__name__}, not a string; "
+                        "it is being ignored")
+        return None
+    return _text(value)
+
+
+def _scalar(value):
+    """A value a metric may carry: a number, or a string with something in it.
+
+    A list, an object or a bool is not a measurement (`True` is not a token
+    count), and 0 is (ACC-DATA-008).
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return value
+    return _text(value)
+
+
+def _whole(value):
+    """An honest integer, or None. `True` is not a round number, it is a bool."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _records(value):
+    """The dict members of a list of records, and nothing else.
+
+    A coach may write `legs` as a number, an object, or a list with a stray
+    string in it; each of those is no records rather than a TypeError.
+    """
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    return []
 
 
 # --------------------------------------------------------------------------
@@ -157,13 +245,19 @@ def normalise_phase(value):
 
 
 def kind_of(leg):
-    """impl | fix | judge — explicit `kind` wins, then the id, then the default."""
+    """impl | fix | judge — explicit `kind` wins, then the id, then the default.
+
+    Every input is untrusted: a leg that is not a record at all, or whose id is
+    a number, a list or null, is an `impl` leg rather than an exception.
+    """
+    if not isinstance(leg, dict):
+        return "impl"
     kind = leg.get("kind")
     if kind in ("impl", "fix", "judge"):
         return kind
     if leg.get("isFix") or leg.get("repairs"):
         return "fix"
-    lid = leg.get("id", "")
+    lid = _text(leg.get("id")) or ""
     if "judge" in lid:
         return "judge"
     if lid.startswith("fix-"):
@@ -176,22 +270,36 @@ def kind_of(leg):
 # --------------------------------------------------------------------------
 
 def _load(path):
-    """(data, state) where state is ok | missing | malformed.
+    """(data, state, why) where state is ok | missing | malformed.
 
     A relay file caught mid-write is malformed, not fatal: the model degrades to
     an empty panel and records a warning (ACC-LIVE-003 depends on this).
+
+    The bytes are decoded here rather than by `read_text`, because a write
+    interrupted inside a multi-byte character produces a file that is not valid
+    UTF-8 at all, and `read_text` raises that before any JSON parsing is
+    attempted. A dashboard watching a live relay meets exactly that file. `why`
+    names which repair the file needs, since "not valid UTF-8" and "not valid
+    JSON" are different problems for whoever wrote it.
     """
     try:
-        raw = path.read_text()
+        raw = path.read_bytes()
     except FileNotFoundError:
-        return {}, "missing"
-    except OSError:
-        return {}, "malformed"
+        return {}, "missing", None
+    except (OSError, ValueError):
+        return {}, "malformed", "it could not be read"
     try:
-        data = json.loads(raw)
-    except (ValueError, UnicodeDecodeError):
-        return {}, "malformed"
-    return (data, "ok") if isinstance(data, dict) else ({}, "malformed")
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return {}, "malformed", "it is not valid UTF-8"
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return {}, "malformed", "it is not valid JSON"
+    if not isinstance(data, dict):
+        return {}, "malformed", (
+            f"its top level is a {type(data).__name__}, not an object")
+    return data, "ok", None
 
 
 BATON_STATUS = {"success": "completed", "ok": "completed", "partial": "partial",
@@ -226,25 +334,19 @@ def _read_baton(path):
         return None
     m = STATUS_RE.search(text)
     sha = COMMIT_FIELD_RE.search(text) or SHA_RE.search(text)
+    try:
+        # A baton can be deleted between the listing and this stat: the relay
+        # is live and the model is only a reader.
+        mtime = path.stat().st_mtime
+    except OSError:
+        return None
     return {
         "status": BATON_STATUS.get(m.group(1).lower()) if m else None,
         "commit": sha.group(1)[:7] if sha else None,
         "lines": text.count("\n") + 1,
-        "mtime": path.stat().st_mtime,
+        "mtime": mtime,
         "path": str(path.resolve()),
     }
-
-
-def _meaningful(value):
-    """False for a coach's placeholder, True for a real value — including 0,
-    which is a measurement and not an absence (ACC-DATA-008)."""
-    if value is None:
-        return False
-    if isinstance(value, str):
-        return value.strip().lower() not in PLACEHOLDERS
-    if isinstance(value, (list, dict)):
-        return bool(value)
-    return True
 
 
 def _strlist(value):
@@ -263,17 +365,75 @@ def _strlist(value):
 # legs
 # --------------------------------------------------------------------------
 
+def _stage_records(legsfile, warnings):
+    """`legs.json.stages`, coerced: an id and a name that are strings or absent.
+
+    A stage id is used as a dictionary key by plan ordering and by the stage
+    name lookup, so a list or an object there is not merely wrong, it is
+    unhashable.
+    """
+    records = []
+    for i, stage in enumerate(_records(legsfile.get("stages"))):
+        records.append({
+            "id": _text_or_warn(stage.get("id"), f"legs.json: stage #{i} `id`",
+                                warnings),
+            "name": _text_or_warn(stage.get("name"),
+                                  f"legs.json: stage #{i} `name`", warnings),
+            "legs": _strlist(stage.get("legs")),
+        })
+    return records
+
+
+def _leg_records(legsfile, warnings):
+    """`legs.json.legs`, coerced: `id` and `stage` are strings or None.
+
+    RULE: a leg whose `id` is missing, empty, or not a string cannot be
+    identified. Its id becomes None here, and `build()` refuses to make it the
+    active leg (ACC-DATA-003): nothing on disk can be matched to it - not a
+    baton, not a check's `claimedBy`, not a commit - so an "active" leg of that
+    shape would name a runner that cannot exist. It stays in the leg list and
+    in the counts, because it is still a leg the coach planned, and the warning
+    says why it is inert.
+
+    Duplicate ids are warned about for the same reason: two legs answering to
+    one string is how the active leg and the active runner came to name
+    different legs in the first place.
+    """
+    records, seen = [], {}
+    for i, leg in enumerate(_records(legsfile.get("legs"))):
+        lid = _text(leg.get("id"))
+        if lid is None:
+            records.append(dict(leg, id=None, stage=_text(leg.get("stage"))))
+            warnings.append(
+                f"legs.json: leg #{i} has no usable `id` "
+                f"({type(leg.get('id')).__name__}); it cannot be identified, so "
+                "it is not a candidate for the active leg")
+            continue
+        seen[lid] = seen.get(lid, 0) + 1
+        records.append(dict(
+            leg, id=lid,
+            stage=_text_or_warn(leg.get("stage"),
+                                f"legs.json: leg '{lid}' `stage`", warnings)))
+
+    for lid, count in seen.items():
+        if count > 1:
+            warnings.append(
+                f"legs.json: leg id '{lid}' is used by {count} legs; ids must be "
+                "unique or a view cannot tell the legs apart")
+    return records
+
+
 def _plan_order(legs, stages, warnings):
     """Plan order: stages in the order `legs.json` declares them, and within a
     stage the order its `legs` list declares, then any leg of that stage the
     stage list forgot, then legs whose stage is unknown. Deterministic for a
     given file, and stable when a coach appends a leg mid-relay.
     """
-    stage_rank = {s.get("id"): i for i, s in enumerate(stages) if s.get("id")}
+    stage_rank = {s["id"]: i for i, s in enumerate(stages) if s["id"]}
     within = {}
     for stage in stages:
-        for pos, lid in enumerate(_strlist(stage.get("legs"))):
-            within.setdefault((stage.get("id"), lid), pos)
+        for pos, lid in enumerate(stage["legs"]):
+            within.setdefault((stage["id"], lid), pos)
 
     tail = len(legs) + 1
     decorated = []
@@ -289,23 +449,26 @@ def _plan_order(legs, stages, warnings):
 
     known = {leg.get("id") for leg in legs}
     for stage in stages:
-        for lid in _strlist(stage.get("legs")):
+        for lid in stage["legs"]:
             if lid not in known:
                 warnings.append(
-                    f"legs.json: stage {stage.get('id')} lists leg '{lid}', "
+                    f"legs.json: stage {stage['id']} lists leg '{lid}', "
                     "which has no leg entry")
     return [leg for _, leg in decorated]
 
 
 def _leg_rows(legsfile, warnings):
-    stages = [s for s in legsfile.get("stages", []) if isinstance(s, dict)]
-    legs = [l for l in legsfile.get("legs", []) if isinstance(l, dict)]
-    names = {s.get("id"): s.get("name") for s in stages}
+    stages = _stage_records(legsfile, warnings)
+    legs = _leg_records(legsfile, warnings)
+    names = {s["id"]: s["name"] for s in stages}
 
     rows = []
     for order, leg in enumerate(_plan_order(legs, stages, warnings)):
         raw = leg.get("status")
         rows.append({
+            # An unidentifiable leg carries the empty string, never "None": a
+            # view renders an empty cell, and `build()` reads the falsy id as
+            # "this leg cannot be the active one".
             "id": leg.get("id") or "",
             "stage": leg.get("stage"),
             "stageName": names.get(leg.get("stage")),
@@ -314,7 +477,7 @@ def _leg_rows(legsfile, warnings):
             "status": normalise_status(raw),
             "rawStatus": raw if isinstance(raw, str) and raw.strip() else None,
             "kind": kind_of(leg),
-            "goal": leg.get("goal") if _meaningful(leg.get("goal")) else None,
+            "goal": _text(leg.get("goal")),
             "fulfills": _strlist(leg.get("fulfills")),
             "repairs": _strlist(leg.get("repairs")),
             "dependsOn": _strlist(leg.get("dependsOn")),
@@ -326,8 +489,8 @@ def _leg_rows(legsfile, warnings):
             "isActive": False,
         })
 
-    stage_rows = [{"id": s.get("id"), "name": s.get("name"),
-                   "legIds": _strlist(s.get("legs"))} for s in stages]
+    stage_rows = [{"id": s["id"], "name": s["name"], "legIds": list(s["legs"])}
+                  for s in stages]
     return stage_rows, rows
 
 
@@ -343,18 +506,27 @@ def _read_batons(relay_dir):
     """
     bdir = relay_dir / "batons"
     batons = {}
-    if bdir.is_dir():
-        for path in sorted(bdir.glob("*.md")):
-            baton = _read_baton(path)
-            if baton is not None:
-                batons[path.stem] = baton
+    try:
+        paths = sorted(bdir.glob("*.md")) if bdir.is_dir() else []
+    except OSError:
+        return batons
+    for path in paths:
+        baton = _read_baton(path)
+        if baton is not None:
+            batons[path.stem] = baton
     return batons
 
 
-def _runner_rows(batons, leg_rows, active_id, now, warnings):
+def _runner_rows(batons, leg_rows, active_leg, now, warnings):
     """One row per leg a runner has worked: every completed leg, plus the
     running one. A baton fills the row in; without one the fields stay None
     rather than becoming an em-dash (ACC-DATA-007).
+
+    RULE: the active runner is the row built from the active leg *object*, not
+    the row whose `leg` string matches its id. Two legs in `legs.json` may
+    answer to one id - that is exactly how the Active Leg pane and the Active
+    Runner pane came to name different legs - and identity is the only match
+    that cannot be confused by it (ACC-DATA-003).
     """
     known = {leg["id"] for leg in leg_rows}
     for stem in sorted(batons):
@@ -375,7 +547,7 @@ def _runner_rows(batons, leg_rows, active_id, now, warnings):
 
     ordered = sorted(done, key=key) + sorted(running, key=lambda l: l["order"])
 
-    rows, prev_finished = [], None
+    rows, prev_finished, active_index = [], None, None
     for n, leg in enumerate(ordered, 1):
         baton = batons.get(leg["id"])
         finished = baton["mtime"] if baton else None
@@ -412,6 +584,8 @@ def _runner_rows(batons, leg_rows, active_id, now, warnings):
             "batonPath": baton["path"] if baton else None,
             "status": "running" if is_running else status,
         })
+        if leg is active_leg:
+            active_index = len(rows) - 1
         if finished is not None:
             prev_finished = finished
 
@@ -422,7 +596,7 @@ def _runner_rows(batons, leg_rows, active_id, now, warnings):
         "partial": sum(1 for r in rows if r["status"] == "partial"),
         "failed": sum(1 for r in rows if r["status"] == "failed"),
     }
-    active = next((r for r in rows if r["leg"] == active_id), None) if active_id else None
+    active = rows[active_index] if active_index is not None else None
     return rows, counts, active
 
 
@@ -442,22 +616,30 @@ def _check_rows(state, extras, warnings):
     rows = []
     for cid, check in raw.items():
         check = check if isinstance(check, dict) else {}
-        parts = str(cid).split("-")
+        cid = str(cid)
+        parts = cid.split("-")
         title = titles.get(cid) or check.get("title")
         rows.append({
             "id": cid,
             "area": parts[1] if len(parts) > 2 else "GENERAL",
-            "title": title if _meaningful(title) else None,
+            "title": _text(title),
             "status": normalise_check(check.get("status")),
             "rawStatus": check.get("status") if isinstance(check.get("status"), str) else None,
-            "stage": check.get("stage"),
-            "claimedBy": check.get("claimedBy"),
+            "stage": _text_or_warn(check.get("stage"),
+                                   f"state.json: check {cid} `stage`", warnings),
+            # `claimedBy` is a leg id and is looked up as a dictionary key by the
+            # progress log, so a list or an object there is unhashable, not just
+            # wrong.
+            "claimedBy": _text_or_warn(check.get("claimedBy"),
+                                       f"state.json: check {cid} `claimedBy`",
+                                       warnings),
             # round is absent, not 0, when the check has never been judged.
-            "round": check.get("round") if isinstance(check.get("round"), int) else None,
-            "evidence": check.get("evidence") if _meaningful(check.get("evidence")) else None,
-            "reason": check.get("reason") if _meaningful(check.get("reason")) else None,
-            "fixLeg": check.get("fixLeg") if _meaningful(check.get("fixLeg")) else None,
-            "judgedBy": check.get("judged") if _meaningful(check.get("judged")) else None,
+            "round": _whole(check.get("round")),
+            "evidence": _text(check.get("evidence")),
+            "reason": _text(check.get("reason")),
+            "fixLeg": _text_or_warn(check.get("fixLeg"),
+                                    f"state.json: check {cid} `fixLeg`", warnings),
+            "judgedBy": _text(check.get("judged")),
         })
 
     groups = {}
@@ -489,16 +671,17 @@ def _attention_item(value, default_label="NOTE", default_level="note"):
     """A coach writes attention as a dict, or as a string with an ALL-CAPS
     prefix, or as plain prose. All three become the same shape."""
     if isinstance(value, dict):
-        text = value.get("text") or value.get("m") or ""
-        label = value.get("label") or default_label
-        level = value.get("level") or default_level
+        # Coerced before use: `level` indexes a table, so a list or an object
+        # there is unhashable, and a label that is not a string would be
+        # rendered as its own repr.
+        level = _text(value.get("level"))
         return {
             "level": level if level in ATTENTION_ORDER else default_level,
-            "label": str(label),
-            "text": str(text),
-            "action": value.get("action") if _meaningful(value.get("action")) else None,
+            "label": _text(value.get("label")) or default_label,
+            "text": _text(value.get("text")) or _text(value.get("m")) or "",
+            "action": _text(value.get("action")),
         }
-    text = str(value).strip()
+    text = _text(value) or ""
     m = LABEL_RE.match(text)
     if m and default_label == "NOTE":
         label, body = m.group(1).strip(), m.group(2).strip()
@@ -823,22 +1006,33 @@ def build(relay_dir, now=None):
     it None (the default) and every now-derived field stays None, which keeps
     the model deterministic for tests and for frame capture.
 
-    Raises RelayNotFound when the path is not a directory. Everything else
-    degrades: a missing file is an empty panel, a malformed file is an empty
-    panel plus a warning.
+    Raises RelayNotFound when the path is not a directory, is empty, or is not
+    a path at all - `build("")` names no relay, and building the process's
+    working directory instead of saying so is how a view ends up drawing
+    someone else's relay. Everything else degrades: a missing file is an empty
+    panel, a malformed file is an empty panel plus a warning.
     """
-    relay_dir = pathlib.Path(relay_dir)
-    if not relay_dir.is_dir():
+    if relay_dir is None or (isinstance(relay_dir, str) and not relay_dir.strip()):
+        raise RelayNotFound("no relay directory given")
+    try:
+        relay_dir = pathlib.Path(relay_dir)
+        is_dir = relay_dir.is_dir()
+    except (TypeError, ValueError, OSError):
+        raise RelayNotFound(f"not a relay directory: {relay_dir!r}") from None
+    if not is_dir:
         raise RelayNotFound(f"no relay directory at {relay_dir}")
 
     warnings = []
-    legsfile, legs_src = _load(relay_dir / "legs.json")
-    state, state_src = _load(relay_dir / "state.json")
-    extras, dash_src = _load(relay_dir / "dashboard.json")
-    for name, src in (("legs.json", legs_src), ("state.json", state_src),
-                      ("dashboard.json", dash_src)):
+    legsfile, legs_src, legs_why = _load(relay_dir / "legs.json")
+    state, state_src, state_why = _load(relay_dir / "state.json")
+    extras, dash_src, dash_why = _load(relay_dir / "dashboard.json")
+    for name, src, why in (("legs.json", legs_src, legs_why),
+                           ("state.json", state_src, state_why),
+                           ("dashboard.json", dash_src, dash_why)):
         if src == "malformed":
-            warnings.append(f"{name} could not be parsed; it is being ignored")
+            warnings.append(
+                f"{name} could not be parsed: {why or 'it is malformed'}; "
+                "it is being ignored")
 
     stages, leg_rows = _leg_rows(legsfile, warnings)
     stage_names = {s["id"]: s["name"] for s in stages}
@@ -849,19 +1043,30 @@ def build(relay_dir, now=None):
 
     # RULE: the active leg is the first leg in plan order whose own status is
     # running. state.json.currentLeg is a bookmark, kept only for diagnostics.
-    declared = state.get("currentLeg") if _meaningful(state.get("currentLeg")) else None
+    declared = _text_or_warn(state.get("currentLeg"), "state.json: `currentLeg`",
+                             warnings)
     known_ids = {leg["id"] for leg in leg_rows}
     if declared and declared not in known_ids and legs_src == "ok":
         warnings.append(
             f"state.json: currentLeg '{declared}' has no leg entry in legs.json")
 
-    active_leg = next((leg for leg in leg_rows if leg["status"] == "running"), None)
+    # A leg with no usable id is not a candidate: nothing on disk can be matched
+    # to it, so it could only ever be an active leg with no runner - neither
+    # half of ACC-DATA-003's "equal, or both absent".
+    running = [leg for leg in leg_rows if leg["status"] == "running"]
+    if len(running) > 1:
+        warnings.append(
+            "legs.json: " + ", ".join(f"'{leg['id']}'" if leg["id"] else "an "
+                                      "unidentified leg" for leg in running) +
+            " are all marked running; a relay runs one leg at a time, and the "
+            "first in plan order is being shown as the active one")
+    active_leg = next((leg for leg in running if leg["id"]), None)
     if active_leg is not None:
         active_leg["isActive"] = True
 
     batons = _read_batons(relay_dir)
     runners, runner_counts, active_runner = _runner_rows(
-        batons, leg_rows, active_leg["id"] if active_leg else None, now, warnings)
+        batons, leg_rows, active_leg, now, warnings)
 
     checks, check_groups, check_counts = _check_rows(state, extras, warnings)
 
@@ -880,7 +1085,8 @@ def build(relay_dir, now=None):
         else:
             phase = "pending"
 
-    stage_id = state.get("currentStage") if _meaningful(state.get("currentStage")) else None
+    stage_id = _text_or_warn(state.get("currentStage"),
+                             "state.json: `currentStage`", warnings)
     current_stage = None
     if stage_id:
         current_stage = {"id": stage_id, "name": stage_names.get(stage_id)}
@@ -888,26 +1094,26 @@ def build(relay_dir, now=None):
             warnings.append(
                 f"state.json: currentStage '{stage_id}' is not a stage in legs.json")
 
-    name = legsfile.get("relay") or state.get("relay")
-    name = name if _meaningful(name) else None
-    title = extras.get("title") if _meaningful(extras.get("title")) else None
+    name = _text(legsfile.get("relay")) or _text(state.get("relay"))
+    title = _text_or_warn(extras.get("title"), "dashboard.json: `title`", warnings)
 
     # RULE: `path` is the project the relay supervises. A relay directory called
     # `.relay` sits inside its project, so the project is its parent; a
     # directory called anything else (a fixture, a copy) is its own path.
-    if _meaningful(extras.get("path")):
-        path = extras["path"]
-    else:
+    path = _text_or_warn(extras.get("path"), "dashboard.json: `path`", warnings)
+    if path is None:
         resolved = relay_dir.resolve()
         path = str(resolved.parent if resolved.name == ".relay" else resolved)
 
     # ACC-DATA-008: a metric with no source is a missing key, not a zero.
     metrics = {}
-    if _meaningful(extras.get("elapsed")):
-        metrics["elapsed"] = extras["elapsed"]
+    elapsed = _scalar(extras.get("elapsed"))
+    if elapsed is not None:
+        metrics["elapsed"] = elapsed
     tokens = extras.get("tokens")
     if isinstance(tokens, dict):
-        measured = {k: v for k, v in tokens.items() if _meaningful(v)}
+        measured = {str(k): _scalar(v) for k, v in tokens.items()
+                    if _scalar(v) is not None}
         if measured:
             metrics["tokens"] = measured
     elif tokens is not None:
