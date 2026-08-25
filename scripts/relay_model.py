@@ -51,6 +51,14 @@ value absent. Nothing on disk, and nothing constructible, makes `build()` raise
 directory, or is empty, raises `RelayNotFound`, because a view that asked for
 nothing must be told so rather than shown the working directory.
 
+So is the *shape* of every path. A relay file can be a FIFO, a socket, a device,
+a directory, a symlink to any of those or to nothing at all, a file this process
+may not open, or one too large for a repaint to afford. Each is a warning naming
+what was found, and `build()` returns - and none of them blocks, which matters
+more than not raising: a read stopped in the kernel freezes the view with no
+traceback to read. Every relay-file read goes through `_read_relay_file`, which
+opens nothing it has not confirmed is a regular file.
+
 Coercion happens once, at the top of this module, so no rule below it asks what
 type a field is. A leg whose id cannot be read is inert: it is counted and
 listed, but it can never be the active leg, because nothing on disk could be
@@ -81,6 +89,7 @@ import json
 import os
 import pathlib
 import re
+import stat
 import subprocess
 
 __all__ = [
@@ -270,28 +279,153 @@ def kind_of(leg):
 
 
 # --------------------------------------------------------------------------
-# reading
+# reading — the one door
 # --------------------------------------------------------------------------
+#
+# A relay directory is not a document, it is a path, and a path is whatever the
+# filesystem says it is. `.relay/batons/x.md` can be a FIFO, a unix socket, a
+# character device, a directory, a symlink to any of those, a symlink to
+# nothing, a symlink to itself, or a file this process may not open. None of
+# those is a hypothetical: a relay directory is edited by hand under a live
+# view, and every one of them was reachable here.
+#
+# What that costs is worse than an exception. `build()` runs once per repaint
+# inside a 2 s budget (ACC-LIVE-001), so a read that blocks does not produce a
+# traceback - it produces a frozen TUI with no output at all. Opening a FIFO
+# with no writer blocks in the kernel for ever; reading /dev/zero to EOF never
+# reaches one. The S1 gate captured both.
+#
+# RULE: every relay-file read in this module goes through `_read_relay_file`,
+# and it opens nothing it has not first confirmed is a regular file. A
+# `try/except` per call site was what this module had, and it grew a third read
+# that had neither the guard nor the test - one door is the thing a test can
+# hold the module to (`test_every_relay_file_read_goes_through_the_one_guarded_helper`).
+
+# The most a relay file may weigh before the model refuses to read it.
+#
+# A bound belongs here: this module reads linearly - 8 MB costs about a second,
+# measured - and one repaint reads three JSON files plus a baton per leg inside
+# 2 s. Unbounded, a coach who pastes a build log into a baton stalls the view.
+# The largest relay file this project has ever written is 45 KB, so 1 MiB is
+# more than twenty times the worst real case and still a fraction of a repaint.
+#
+# RULE: an oversized file is refused, never truncated. A half-read baton still
+# parses - it just reports the wrong line count and silently drops every commit
+# claim past the cut - and a plausible wrong answer costs more here than a
+# named absence does.
+MAX_RELAY_FILE_BYTES = 1024 * 1024
+
+# O_NONBLOCK is the whole guard against a pipe: with it the open returns at
+# once whether or not a writer exists, and `fstat` on the descriptor - not on
+# the path, which a rename could change underneath the check - says what was
+# really opened. O_NOCTTY keeps a terminal device from becoming this process's
+# controlling terminal on the way past.
+_OPEN_FLAGS = (os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+               | getattr(os, "O_NOCTTY", 0))
+
+_READ_CHUNK = 1 << 16
+
+_SHAPES = (
+    (stat.S_ISDIR, "a directory"),
+    (stat.S_ISFIFO, "a FIFO"),
+    (stat.S_ISSOCK, "a socket"),
+    (stat.S_ISCHR, "a character device"),
+    (stat.S_ISBLK, "a block device"),
+    (stat.S_ISLNK, "a symbolic link"),
+    (stat.S_ISREG, "a regular file"),
+)
+
+
+def _shape(mode):
+    """What a path turned out to be, in words a warning can carry."""
+    for is_kind, name in _SHAPES:
+        if is_kind(mode):
+            return name
+    return "of a kind this model cannot read"
+
+
+def _errno_reason(exc):
+    """Why the filesystem refused, in the words it used.
+
+    Carried into the warning rather than flattened to "it could not be read",
+    because a symlink loop, a permission bit and a socket are three different
+    repairs for whoever left the path there.
+    """
+    return (exc.strerror or type(exc).__name__).lower()
+
+
+def _read_relay_file(path):
+    """(raw, mtime, why) for a relay file, without ever blocking.
+
+    Three answers, and the caller can tell them apart:
+
+    * `(bytes, mtime, None)` - a regular file, read whole.
+    * `(None, None, None)`   - nothing is at that path.
+    * `(None, None, why)`    - something is at that path that a relay file may
+      not be, and `why` says what.
+
+    The mtime comes from the same `fstat` that cleared the descriptor, so the
+    time reported for a baton is the time of the bytes actually read rather
+    than of whatever the path pointed at a moment later.
+    """
+    try:
+        fd = os.open(path, _OPEN_FLAGS)
+    except FileNotFoundError:
+        return None, None, None
+    except OSError as exc:
+        return None, None, f"it could not be read ({_errno_reason(exc)})"
+    except (TypeError, ValueError):
+        return None, None, "it is not a usable path"
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return None, None, (
+                f"it is {_shape(st.st_mode)}, not a regular file")
+        if st.st_size > MAX_RELAY_FILE_BYTES:
+            return None, None, _too_big(st.st_size)
+        chunks, total = [], 0
+        while True:
+            try:
+                chunk = os.read(fd, _READ_CHUNK)
+            except OSError as exc:
+                return None, None, (
+                    f"it could not be read ({_errno_reason(exc)})")
+            if not chunk:
+                return b"".join(chunks), st.st_mtime, None
+            chunks.append(chunk)
+            total += len(chunk)
+            # The size above is a snapshot; a live relay is being written to.
+            # Bound the loop as well, so a file growing under the read cannot
+            # outrun it.
+            if total > MAX_RELAY_FILE_BYTES:
+                return None, None, _too_big(total)
+    finally:
+        os.close(fd)
+
+
+def _too_big(size):
+    return (f"it is over {size} bytes, past the {MAX_RELAY_FILE_BYTES}-byte "
+            "limit one repaint can afford")
+
 
 def _load(path):
     """(data, state, why) where state is ok | missing | malformed.
 
     A relay file caught mid-write is malformed, not fatal: the model degrades to
-    an empty panel and records a warning (ACC-LIVE-003 depends on this).
+    an empty panel and records a warning (ACC-LIVE-003 depends on this). So is a
+    relay file that is not a file at all - the shape is named in `why` and the
+    panel is empty either way, because there is no third thing a view can draw.
 
-    The bytes are decoded here rather than by `read_text`, because a write
-    interrupted inside a multi-byte character produces a file that is not valid
-    UTF-8 at all, and `read_text` raises that before any JSON parsing is
+    The bytes are decoded here rather than by pathlib's text reader, because a
+    write interrupted inside a multi-byte character produces a file that is not
+    valid UTF-8 at all, and a text read raises that before any JSON parsing is
     attempted. A dashboard watching a live relay meets exactly that file. `why`
     names which repair the file needs, since "not valid UTF-8" and "not valid
     JSON" are different problems for whoever wrote it.
     """
-    try:
-        raw = path.read_bytes()
-    except FileNotFoundError:
-        return {}, "missing", None
-    except (OSError, ValueError):
-        return {}, "malformed", "it could not be read"
+    raw, _mtime, why = _read_relay_file(path)
+    if raw is None:
+        return ({}, "missing", None) if why is None else ({}, "malformed", why)
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
@@ -300,6 +434,12 @@ def _load(path):
         data = json.loads(text)
     except ValueError:
         return {}, "malformed", "it is not valid JSON"
+    except RecursionError:
+        # The JSON scanner recurses once per level and guards itself with a
+        # RecursionError, which is a RuntimeError and not the ValueError above.
+        # A relay file nesting twenty thousand arrays deep is 40 KB of text and
+        # took `build()` down with it.
+        return {}, "malformed", "it is nested too deeply to parse"
     if not isinstance(data, dict):
         return {}, "malformed", (
             f"its top level is a {type(data).__name__}, not an object")
@@ -359,21 +499,27 @@ def commit_claims(text):
 
 
 def baton_text(path):
-    """The full prose of a baton, or None when it is not there.
+    """The full prose of a baton, or None when there is no baton to read.
 
     Kept out of `build()` on purpose: it is long, it is prose (em-dashes and
     all), and only a detail view wants it. Reading it here rather than in the
-    view keeps every relay-file read inside this module (ACC-DATA-001).
+    view keeps every relay-file read inside this module (ACC-DATA-001), and
+    inside the one guard - this is public, a detail view calls it on whatever
+    path a row carries, and it owes the same "never blocks" `build()` does.
     """
-    try:
-        return pathlib.Path(path).read_text(errors="replace")
-    except (FileNotFoundError, IsADirectoryError, OSError):
-        return None
+    raw, _mtime, _why = _read_relay_file(path)
+    return None if raw is None else raw.decode("utf-8", "replace")
 
 
 def _read_baton(path):
-    """What a baton reliably carries: when it landed, how long it is, the
-    commits it claims, and a status if the runner wrote one.
+    """(baton, why): what a baton reliably carries - when it landed, how long
+    it is, the commits it claims, and a status if the runner wrote one - or
+    `(None, why)` when the path is not a baton this model can read.
+
+    `why` is None when there is simply nothing there. A path that holds
+    something a baton may not be is a warning the caller raises, because a
+    runner row silently missing its commit is the kind of absence this model
+    exists to name rather than to show.
 
     `commit` starts as the first claim and is settled against the relay's own
     repository by `_settle_commits` - a claim the repository cannot confirm is
@@ -381,25 +527,39 @@ def _read_baton(path):
     to confirm it against and the baton's own word is all the evidence there
     is, so the first claim stands.
     """
-    text = baton_text(path)
-    if text is None:
-        return None
+    raw, mtime, why = _read_relay_file(path)
+    if raw is None:
+        return None, why
+    text = raw.decode("utf-8", "replace")
     m = STATUS_RE.search(text)
     claims = commit_claims(text)
     try:
-        # A baton can be deleted between the listing and this stat: the relay
-        # is live and the model is only a reader.
-        mtime = path.stat().st_mtime
+        resolved = str(path.resolve())
     except OSError:
-        return None
+        resolved = str(path)
     return {
         "status": BATON_STATUS.get(m.group(1).lower()) if m else None,
         "claims": claims,
         "commit": claims[0] if claims else None,
         "lines": text.count("\n") + 1,
         "mtime": mtime,
-        "path": str(path.resolve()),
-    }
+        "path": resolved,
+    }, None
+
+
+def _render(value):
+    """A value that is not a string, rendered as one - or named, when it cannot be.
+
+    `json.dumps` and `repr` both recurse once per level of nesting, and a relay
+    file is untrusted: a list nested twelve thousand deep parses and then blows
+    the stack on the way back out, with `build()`'s own frames already on it.
+    That is a RecursionError escaping `build()`, which ACC-DATA-001 forbids as
+    plainly as it forbids any other.
+    """
+    try:
+        return json.dumps(value, sort_keys=True)
+    except (RecursionError, TypeError, ValueError):
+        return f"an unreadable {type(value).__name__}"
 
 
 def _strlist(value):
@@ -409,9 +569,11 @@ def _strlist(value):
     if isinstance(value, str):
         return [value] if value.strip() else []
     if isinstance(value, list):
-        return [v if isinstance(v, str) else json.dumps(v, sort_keys=True)
-                for v in value]
-    return [str(value)]
+        return [v if isinstance(v, str) else _render(v) for v in value]
+    try:
+        return [str(value)]
+    except RecursionError:
+        return [f"an unreadable {type(value).__name__}"]
 
 
 # --------------------------------------------------------------------------
@@ -551,22 +713,50 @@ def _leg_rows(legsfile, warnings):
 # runners
 # --------------------------------------------------------------------------
 
-def _read_batons(relay_dir):
+def _read_batons(relay_dir, warnings):
     """{leg id: baton} for every baton on disk, read once per build.
 
     Two panels want them - the runner rows and the derived progress log - and
     the batons directory is read exactly once for both.
+
+    `batons` is a path like any other, so it too can be a FIFO, a socket, a
+    regular file, a symlink to nothing, or a directory this process may not
+    list. Each of those means the same thing to a view - no runner carries a
+    baton - and each is a different repair, so each is named.
     """
     bdir = relay_dir / "batons"
     batons = {}
     try:
-        paths = sorted(bdir.glob("*.md")) if bdir.is_dir() else []
-    except OSError:
+        st = os.stat(bdir)
+    except FileNotFoundError:
+        return batons                  # a relay that has run no legs yet
+    except OSError as exc:
+        warnings.append(f"the batons directory could not be read "
+                        f"({_errno_reason(exc)}); no runner row carries a baton")
         return batons
-    for path in paths:
-        baton = _read_baton(path)
-        if baton is not None:
-            batons[path.stem] = baton
+    if not stat.S_ISDIR(st.st_mode):
+        warnings.append(f"batons is {_shape(st.st_mode)}, not a directory; "
+                        "no runner row carries a baton")
+        return batons
+    try:
+        # `os.scandir` rather than a glob, so a directory that cannot be listed
+        # is an error this function sees rather than an empty result it cannot
+        # tell from a relay whose runners have written nothing.
+        with os.scandir(bdir) as entries:
+            names = sorted(e.name for e in entries if e.name.endswith(".md"))
+    except OSError as exc:
+        warnings.append(f"the batons directory could not be listed "
+                        f"({_errno_reason(exc)}); no runner row carries a baton")
+        return batons
+    for name in names:
+        path = bdir / name
+        baton, why = _read_baton(path)
+        if baton is None:
+            if why is not None:
+                warnings.append(f"batons/{name} could not be read: {why}; "
+                                "its runner row carries no baton")
+            continue
+        batons[path.stem] = baton
     return batons
 
 
@@ -1334,7 +1524,7 @@ def build(relay_dir, now=None):
         resolved = relay_dir.resolve()
         path = str(resolved.parent if resolved.name == ".relay" else resolved)
 
-    batons = _read_batons(relay_dir)
+    batons = _read_batons(relay_dir, warnings)
     _settle_commits(relay_dir, path, batons)
     runners, runner_counts, active_runner = _runner_rows(
         batons, leg_rows, active_leg, now, warnings)

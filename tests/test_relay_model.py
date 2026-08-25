@@ -11,10 +11,13 @@ a copy in `tmp_path` with the recorded mtimes stamped back on (see `relay()`).
 """
 
 import json
+import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -66,8 +69,6 @@ def relay(tmp_path):
             for stem, mtime in AGENT_SERVICE_BATON_MTIMES.items():
                 path = dst / "batons" / f"{stem}.md"
                 if path.exists():
-                    import os
-
                     os.utime(path, (mtime, mtime))
         return dst
 
@@ -116,29 +117,97 @@ def test_build_importable_and_callable_from_a_clean_interpreter(relay):
     assert out.stdout.split()[0] == "dict"
 
 
-def test_relay_model_is_the_only_reader_of_relay_files():
-    """No module outside relay_model.py opens a relay file.
+#: The two modules allowed to read a relay file directly. `render_dashboard.py`
+#: is the standing exception: ACC-HTML-005 retires it, and the leg that earns
+#: that check deletes it from here. Anything else is a second source of truth.
+RELAY_READERS_ALLOWED = ("scripts/relay_model.py", "scripts/render_dashboard.py")
 
-    `scripts/render_dashboard.py` is the one standing exception: ACC-HTML-001
-    ports it onto this model and must delete it from this list. Anything else
-    appearing here is a new source of truth and a regression of ACC-DATA-001.
+#: A name only a relay file has.
+RELAY_FILE_NAMES = re.compile(r"legs\.json|state\.json|dashboard\.json|batons")
+
+#: Every way this project has actually opened one.
+RELAY_READS = re.compile(
+    r"json\.load\(|\.read_text\(|\.read_bytes\(|\bopen\(|\.glob\(|scandir\(")
+
+
+def sweep_for_relay_readers(root):
+    """({file: text} inspected, {file: evidence} offending) under `root`.
+
+    Whole files, not single lines. `render_dashboard.py` reads every relay file
+    through a two-line idiom - a `load(path)` helper on one line and
+    `load(mdir / "legs.json")` on another - and a per-line detector cannot see
+    that shape at all, which means it could not see a second reader written the
+    same way either. Its own allow-listing was hiding that: the line detector
+    scored zero hits on the one file it was written to excuse.
+
+    `.relay/` is out of scope. It is the live relay's own working directory,
+    gitignored, and not source this repository ships.
     """
-    allowed = {"scripts/relay_model.py", "scripts/render_dashboard.py"}
-    reader = re.compile(r"json\.load|\.read_text\(|\bopen\(")
-    names = re.compile(r"legs\.json|state\.json|dashboard\.json|batons")
+    swept, offenders = {}, {}
+    for path in sorted(root.glob("**/*.py")):
+        if {".git", ".relay", "fixtures"} & set(path.parts):
+            continue
+        rel = path.relative_to(root).as_posix()
+        if rel in RELAY_READERS_ALLOWED or rel.startswith("tests/"):
+            continue
+        text = path.read_text(errors="replace")
+        swept[rel] = text
+        lines = text.splitlines()
+        named = [l.strip() for l in lines if RELAY_FILE_NAMES.search(l)]
+        reads = [l.strip() for l in lines if RELAY_READS.search(l)]
+        if named and reads:
+            offenders[rel] = (named + reads)[:4]
+    return swept, offenders
 
-    offenders = set()
-    for path in sorted(REPO.glob("**/*.py")):
-        if ".git" in path.parts or "fixtures" in path.parts:
-            continue
-        rel = path.relative_to(REPO).as_posix()
-        if rel in allowed or rel.startswith("tests/"):
-            continue
-        text = path.read_text()
-        for line in text.splitlines():
-            if reader.search(line) and names.search(line):
-                offenders.add(f"{rel}: {line.strip()}")
-    assert offenders == set(), offenders
+
+def test_relay_model_is_the_only_reader_of_relay_files():
+    """No module outside relay_model.py opens a relay file (ACC-DATA-001)."""
+    _swept, offenders = sweep_for_relay_readers(REPO)
+    assert offenders == {}, offenders
+
+
+def test_every_allowed_relay_reader_still_exists():
+    """A rename is how an allow-list quietly becomes an exemption for nothing,
+    and the sweep that follows it becomes an exemption for everything."""
+    missing = [rel for rel in RELAY_READERS_ALLOWED if not (REPO / rel).is_file()]
+    assert missing == [], missing
+
+
+@pytest.mark.parametrize("shape,body", [
+    ("one line", "import json, pathlib\n"
+                 "def read(relay):\n"
+                 "    return json.load(open(pathlib.Path(relay) / 'legs.json'))\n"),
+    ("a helper and a call site", "import json\n"
+                                 "def load(path):\n"
+                                 "    return json.load(path.open())\n"
+                                 "def read(relay):\n"
+                                 "    return load(relay / 'state.json')\n"),
+    ("a batons walk", "def batons(relay):\n"
+                      "    return sorted((relay / 'batons').glob('*.md'))\n"),
+])
+def test_the_only_reader_sweep_can_see_a_new_reader(shape, body):
+    """The sweep above was blind for its whole life, and passing proved nothing.
+
+    On a fresh clone every `.py` file in this repository is `relay_model.py`,
+    `render_dashboard.py`, or a test - and the loop skipped all three kinds. It
+    inspected zero files and asserted `set() == set()`. A third reader could
+    have landed in `scripts/` and it would still have been green.
+
+    So a reader is planted where a real one would land and the sweep is
+    required to name it. That fails if the walk stops reaching files, if the
+    skip rules widen, or if the detector stops recognising how this project
+    reads a relay file - the three ways it went blind, and the only ways left.
+    """
+    canary = REPO / "scripts" / "_relay_reader_canary.py"
+    rel = "scripts/_relay_reader_canary.py"
+    assert not canary.exists(), f"{canary} was left behind by an earlier run"
+    canary.write_text(body)
+    try:
+        swept, offenders = sweep_for_relay_readers(REPO)
+        assert rel in swept, (shape, sorted(swept))
+        assert rel in offenders, (shape, sorted(offenders))
+    finally:
+        canary.unlink()
 
 
 # --------------------------------------------------------------------------
@@ -1203,6 +1272,506 @@ def test_fuzz_over_malformed_file_bodies(tmp_path):
             model = relay_model.build(target)
             assert isinstance(model, dict), (i, mask)
             assert_active_agrees(model, f"bytes-{i}-{mask}")
+
+
+# --------------------------------------------------------------------------
+# ACC-DATA-001 — untrusted input: every filesystem *shape* degrades
+#
+# The section above tests what a relay file *contains*. This one tests what it
+# *is*. A relay directory is edited under a live TUI by hand, and a path there
+# can be a FIFO, a socket, a device, a directory, a symlink to any of those, or
+# something the process may not open at all.
+#
+# A hang fails ACC-DATA-001 harder than an exception does. `build()` is called
+# once per repaint inside a 2 s budget (ACC-LIVE-001), so a blocked read is a
+# frozen TUI with no traceback: the S1 gate captured `baton_text` stopped
+# inside `open()` on a FIFO with no writer, and 20 s and 60 s probes both never
+# returned. Every case below opens a path that is not a regular file.
+# --------------------------------------------------------------------------
+
+#: Long enough that a slow-but-finite read still passes, short enough that a
+#: real block is caught in one test run rather than at the CI timeout.
+BUILD_DEADLINE = 15.0
+
+DEV_ZERO = Path("/dev/zero")
+
+
+def within(deadline, func, *args, **kwargs):
+    """`func(*args)`, or a failure naming the call that never came back.
+
+    A read blocked in the kernel cannot be interrupted from Python — no signal,
+    no timeout argument, nothing to cancel — so the call runs on a daemon
+    thread and the test outlives it. Without this the suite itself wedges on
+    the first FIFO, which is exactly why the defect stayed invisible: a hanging
+    test never reports.
+    """
+    box = {}
+
+    def run():
+        try:
+            box["value"] = func(*args, **kwargs)
+        except BaseException as exc:            # re-raised on the test's thread
+            box["error"] = exc
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(deadline)
+    assert not thread.is_alive(), (
+        f"{func.__name__}{args} did not return within {deadline}s — it blocked")
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
+
+
+def build_in_time(target, **kwargs):
+    return within(BUILD_DEADLINE, relay_model.build, target, **kwargs)
+
+
+def slug(kind):
+    return kind.replace(" ", "-")
+
+
+def bind_socket(path):
+    """A bound unix domain socket left on disk at `path`.
+
+    Bound from inside its own directory: an AF_UNIX address is capped at about
+    a hundred bytes on macOS and a pytest `tmp_path` is longer than that. The
+    socket file survives the close — it is unlinked, never closed, away.
+    """
+    here = os.getcwd()
+    os.chdir(path.parent)
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.bind(path.name)
+        finally:
+            sock.close()
+    finally:
+        os.chdir(here)
+
+
+@pytest.fixture
+def shape(tmp_path):
+    """Make one filesystem shape at a path, and undo it when the test ends.
+
+    Teardown is load-bearing. A chmod-000 directory cannot be cleaned up by
+    pytest's own tmp_path teardown, and a FIFO left with an open writer keeps a
+    descriptor alive for the rest of the session — either one makes the second
+    `pytest tests/` run of the day fail where the first passed.
+    """
+    writers, modes = [], []
+
+    def _make(path, kind):
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if kind == "fifo":
+            os.mkfifo(path)
+        elif kind == "fifo with a writer":
+            os.mkfifo(path)
+            # O_RDWR, not O_WRONLY: opening a pipe for writing blocks until a
+            # reader arrives, which is the hang under test wearing the other
+            # hat. A pipe with a live writer and bytes in it is the case a
+            # size-bounded read still gets stuck on.
+            writers.append(os.open(path, os.O_RDWR | os.O_NONBLOCK))
+            os.write(writers[-1], b'{"legs": [')
+        elif kind == "socket":
+            bind_socket(path)
+        elif kind == "character device":
+            # The trap: /dev/zero has a size of 0 and never reaches EOF, so a
+            # read bounded by st_size returns nothing and a read to EOF returns
+            # never. A symlink is how one reaches a relay directory.
+            path.symlink_to(DEV_ZERO)
+        elif kind == "directory":
+            path.mkdir()
+        elif kind == "regular file":
+            path.write_text("this is not a directory")
+        elif kind == "symlink loop":
+            other = path.with_name(path.name + ".loop")
+            path.symlink_to(other)
+            other.symlink_to(path)
+        elif kind == "dangling symlink":
+            path.symlink_to(path.with_name(path.name + ".gone"))
+        elif kind == "unreadable":
+            path.write_text('{"legs": []}')
+            modes.append((path, path.stat().st_mode))
+            path.chmod(0)
+        elif kind == "oversized":
+            path.write_bytes(b"x" * (relay_model.MAX_RELAY_FILE_BYTES + 1))
+        elif kind == "no execute permission":
+            path.mkdir()
+            (path / "x.md").write_text("**Commit:** abcdef1\n")
+            modes.append((path, path.stat().st_mode))
+            path.chmod(0)
+        else:
+            raise AssertionError(f"unknown shape {kind!r}")
+        return path
+
+    yield _make
+
+    for fd in writers:
+        os.close(fd)
+    for path, mode in modes:
+        try:
+            path.chmod(mode)
+        except OSError:
+            pass
+
+
+#: Every shape a *file* in a relay directory can take instead of a file.
+FILE_SHAPES = [
+    "fifo",
+    "fifo with a writer",
+    "socket",
+    "character device",
+    "directory",
+    "symlink loop",
+    "dangling symlink",
+    "unreadable",
+    "oversized",
+]
+
+#: Of those, the ones where something really is at the path. A dangling symlink
+#: is absence wearing a name, and absence is not a warning.
+PRESENT_SHAPES = [k for k in FILE_SHAPES if k != "dangling symlink"]
+
+#: Every shape the `batons/` directory can take instead of a directory.
+BATONS_SHAPES = [
+    "fifo",
+    "socket",
+    "character device",
+    "regular file",
+    "symlink loop",
+    "dangling symlink",
+    "no execute permission",
+]
+
+#: Every shape the relay directory itself can take. It is the one argument
+#: `build()` refuses rather than degrades (RelayNotFound), and it must refuse
+#: promptly: a hang here is the same frozen repaint by another door.
+RELAY_DIR_SHAPES = ["fifo", "socket", "character device", "regular file",
+                    "symlink loop", "dangling symlink"]
+
+def skip_unusable(kind):
+    if kind == "character device" and not DEV_ZERO.exists():
+        pytest.skip("no /dev/zero on this platform")
+    if kind in ("unreadable", "no execute permission") and (
+            hasattr(os, "geteuid") and os.geteuid() == 0):
+        pytest.skip("root ignores permission bits")
+
+
+@pytest.mark.parametrize("kind", FILE_SHAPES)
+@pytest.mark.parametrize("filename", RELAY_FILES)
+def test_a_relay_json_file_of_any_shape_builds_without_blocking(
+        tmp_path, shape, filename, kind):
+    """`legs.json` is a FIFO, a socket, /dev/zero, a directory..."""
+    skip_unusable(kind)
+    target = tmp_path / f"{filename}-{slug(kind)}"
+    target.mkdir()
+    shape(target / filename, kind)
+
+    model = build_in_time(target)
+
+    assert isinstance(model, dict)
+    assert model["legs"] == [] and model["checks"] == []
+    source = model["sources"][filename.split(".")[0]]
+    if kind in PRESENT_SHAPES:
+        assert source == "malformed", (kind, source)
+        assert any(filename in w for w in model["warnings"]), model["warnings"]
+    else:
+        assert source == "missing", (kind, source)
+
+
+#: What the warning must say about each shape. "it is a FIFO" and "it is not
+#: valid JSON" are different repairs for whoever left it there, and a warning
+#: that does not distinguish them costs the reader the whole diagnosis.
+SHAPE_SAYS = {
+    "fifo": "FIFO",
+    "fifo with a writer": "FIFO",
+    # A socket is refused by `open()` itself - EOPNOTSUPP on macOS, ENXIO on
+    # Linux - so it never reaches the shape check. BATONS_SAYS is where
+    # S_ISSOCK is actually exercised, because `os.stat` does answer for one.
+    "socket": "could not be read",
+    "character device": "character device",
+    "directory": "directory",
+    "symlink loop": "could not be read",
+    "unreadable": "could not be read",
+    "oversized": "bytes",
+}
+
+
+@pytest.mark.parametrize("kind", PRESENT_SHAPES)
+def test_a_relay_json_file_that_is_not_a_file_says_what_it_was(
+        tmp_path, shape, kind):
+    skip_unusable(kind)
+    target = tmp_path / f"why-{slug(kind)}"
+    target.mkdir()
+    shape(target / "legs.json", kind)
+
+    warning = " ".join(build_in_time(target)["warnings"])
+
+    assert "legs.json" in warning, warning
+    assert SHAPE_SAYS[kind] in warning, (kind, warning)
+
+
+def test_two_paths_that_fail_differently_do_not_share_one_warning(tmp_path, shape):
+    """A permission bit and a symlink loop are different repairs.
+
+    Most of the shapes above are refused by `open()` rather than named by the
+    shape check, so the errno *is* the diagnosis. A warning that flattens every
+    one of them to "it could not be read" costs the reader the whole of it.
+    """
+    skip_unusable("unreadable")
+    said = {}
+    for kind in ("unreadable", "symlink loop"):
+        target = tmp_path / f"errno-{slug(kind)}"
+        target.mkdir()
+        shape(target / "legs.json", kind)
+        said[kind] = " ".join(w for w in build_in_time(target)["warnings"]
+                              if "legs.json" in w)
+
+    assert all(said.values()), said
+    assert len(set(said.values())) == 2, said
+
+
+@pytest.mark.parametrize("kind", FILE_SHAPES)
+def test_every_relay_json_file_at_once_of_one_shape_still_builds(
+        tmp_path, shape, kind):
+    skip_unusable(kind)
+    target = tmp_path / f"all-{slug(kind)}"
+    target.mkdir()
+    for filename in RELAY_FILES:
+        shape(target / filename, kind)
+
+    model = build_in_time(target)
+
+    assert isinstance(model, dict)
+    json.dumps(model)
+    assert_active_agrees(model, kind)
+
+
+@pytest.mark.parametrize("kind", FILE_SHAPES)
+def test_a_baton_of_any_shape_builds_without_blocking(tmp_path, shape, kind):
+    """The captured hang, as a test. `batons/x.md` is a FIFO with no writer and
+    `build()` stopped inside `open()` in the kernel, for ever."""
+    skip_unusable(kind)
+    target = write_relay(tmp_path, f"baton-{slug(kind)}",
+                         legs={"legs": [{"id": "x", "status": "done"}]})
+    shape(target / "batons" / "x.md", kind)
+
+    model = build_in_time(target)
+
+    assert isinstance(model, dict)
+    assert [row["leg"] for row in model["runners"]] == ["x"]
+    row = model["runners"][0]
+    assert row["batonLines"] is None and row["commit"] is None
+    assert row["finished"] is None
+    if kind in PRESENT_SHAPES:
+        assert any("batons/x.md" in w for w in model["warnings"]), model["warnings"]
+
+
+@pytest.mark.parametrize("kind", FILE_SHAPES)
+def test_baton_text_of_any_shape_is_none_and_never_blocks(tmp_path, shape, kind):
+    """`baton_text()` is public and a detail view calls it on demand, so it
+    carries the same guarantee `build()` does."""
+    skip_unusable(kind)
+    path = shape(tmp_path / "batons" / f"{slug(kind)}.md", kind)
+    assert within(BUILD_DEADLINE, relay_model.baton_text, path) is None
+    assert within(BUILD_DEADLINE, relay_model.baton_text, str(path)) is None
+
+
+#: What the warning must say when `batons/` is not a directory. Naming the
+#: shape is the whole value of stating the path before listing it: `scandir`
+#: fails on every one of these too, with one flat "not a directory" that tells
+#: the reader nothing about what to delete.
+BATONS_SAYS = {
+    "fifo": "a FIFO",
+    "socket": "a socket",
+    "character device": "a character device",
+    "regular file": "a regular file",
+    "symlink loop": "could not be read",
+    "no execute permission": "could not be listed",
+}
+
+
+@pytest.mark.parametrize("kind", BATONS_SHAPES)
+def test_a_batons_directory_of_any_shape_builds_without_blocking(
+        tmp_path, shape, kind):
+    skip_unusable(kind)
+    target = write_relay(tmp_path, f"bdir-{slug(kind)}",
+                         legs={"legs": [{"id": "x", "status": "done"}]})
+    shape(target / "batons", kind)
+
+    model = build_in_time(target)
+
+    assert isinstance(model, dict)
+    assert [row["leg"] for row in model["runners"]] == ["x"]
+    assert model["runners"][0]["batonLines"] is None
+    warning = " ".join(w for w in model["warnings"] if "batons" in w)
+    if kind == "dangling symlink":
+        assert warning == "", warning       # absence, not a wrong shape
+    else:
+        assert BATONS_SAYS[kind] in warning, (kind, model["warnings"])
+
+
+@pytest.mark.parametrize("kind", RELAY_DIR_SHAPES)
+def test_a_relay_directory_of_any_shape_is_refused_rather_than_awaited(
+        tmp_path, shape, kind):
+    """`build()` refuses a path that is not a directory — the one documented
+    exception to "returns a dict". It must refuse *promptly*: a `RelayNotFound`
+    that arrives after a blocked open is still a frozen repaint."""
+    skip_unusable(kind)
+    path = shape(tmp_path / f"relay-{slug(kind)}", kind)
+    with pytest.raises(relay_model.RelayNotFound):
+        build_in_time(path)
+
+
+# --------------------------------------------------------------------------
+# the read bound
+# --------------------------------------------------------------------------
+
+def test_a_relay_file_over_the_read_bound_is_refused_not_truncated(tmp_path):
+    """A bound belongs here: this module reads linearly and `build()` runs once
+    per repaint inside 2 s (ACC-LIVE-001), so an unbounded read is a budget a
+    coach can blow by pasting a log into a baton.
+
+    Refused, never truncated. A half-read baton still parses — it just reports
+    the wrong line count and silently drops every commit claim past the cut —
+    and a plausible wrong answer costs more here than a named absence.
+    """
+    target = write_relay(tmp_path, "oversize",
+                         legs={"legs": [{"id": "x", "status": "done"}]})
+    baton = target / "batons" / "x.md"
+    baton.parent.mkdir()
+    over = relay_model.MAX_RELAY_FILE_BYTES + 1
+    baton.write_bytes(b"**Commit:** abcdef1\n" + b"x" * over)
+
+    model = build_in_time(target)
+
+    assert model["runners"][0]["batonLines"] is None
+    assert model["runners"][0]["commit"] is None       # not a truncated read
+    assert any("batons/x.md" in w and str(over + 20) in w
+               for w in model["warnings"]), model["warnings"]
+    assert relay_model.baton_text(baton) is None
+
+
+def test_a_baton_just_under_the_read_bound_is_still_read(tmp_path):
+    """The bound refuses what a repaint cannot afford, and nothing else. Every
+    baton this project has written is under 45 KB."""
+    target = write_relay(tmp_path, "big-but-fine",
+                         legs={"legs": [{"id": "x", "status": "done"}]})
+    baton = target / "batons" / "x.md"
+    baton.parent.mkdir()
+    body = "**Commit:** abcdef1\n" + "prose\n" * 1000
+    body += "-" * (relay_model.MAX_RELAY_FILE_BYTES - len(body) - 1)
+    baton.write_text(body)
+
+    model = build_in_time(target)
+
+    assert model["runners"][0]["batonLines"] == body.count("\n") + 1
+    assert relay_model.baton_text(baton) == body
+
+
+def test_the_read_bound_leaves_room_for_the_largest_relay_file_on_disk():
+    """A bound tight enough to refuse a real file is a bug, not a guard."""
+    largest = max(p.stat().st_size
+                  for p in (FIXTURES / "agent-service").glob("**/*")
+                  if p.is_file())
+    assert largest * 8 < relay_model.MAX_RELAY_FILE_BYTES, largest
+
+
+# --------------------------------------------------------------------------
+# every relay-file read goes through one door
+# --------------------------------------------------------------------------
+
+def test_every_relay_file_read_goes_through_the_one_guarded_helper():
+    """The guard only guards while it is the only way in.
+
+    The alternative — a `try/except` at each call site — is what the module had,
+    and it grew a third read that had neither. One helper is the thing a test
+    can hold the module to, so this test holds it: no unguarded reader appears
+    anywhere in `relay_model.py`.
+    """
+    source = (REPO / "scripts" / "relay_model.py").read_text()
+    unguarded = re.compile(
+        r"\.read_text\(|\.read_bytes\(|(?<!os\.)(?<!\w)open\(|\.glob\(|\.iterdir\(")
+    offenders = [f"{n}: {line.strip()}"
+                 for n, line in enumerate(source.splitlines(), 1)
+                 if unguarded.search(line)]
+    assert offenders == [], offenders
+
+
+# --------------------------------------------------------------------------
+# deeply nested JSON — the RecursionError the S1 gate could not reproduce
+#
+# The coach probed depth 400 and depth 3000 by hand and both degraded with a
+# warning, so the claim was left open. Both probes were simply too shallow:
+# CPython's JSON scanner has its own recursion guard and raises RecursionError,
+# which is a RuntimeError and not the ValueError `_load` was catching. At depth
+# 20000 it escaped `build()` outright. The claim was right.
+# --------------------------------------------------------------------------
+
+#: Shallow enough to parse, deep enough to blow the scanner, and either side of
+#: the boundary — which moves with the interpreter and with how much stack
+#: `build()` has already spent, so no single depth would settle it.
+NEST_DEPTHS = [400, 3000, 12000, 40000]
+
+
+@pytest.mark.parametrize("depth", NEST_DEPTHS)
+@pytest.mark.parametrize("filename", RELAY_FILES)
+def test_json_nested_deeper_than_the_scanner_degrades(tmp_path, filename, depth):
+    body = ('{"legs": ' + "[" * depth + "]" * depth + "}").encode()
+    target = write_relay(tmp_path, f"nest-{filename}-{depth}", raw={filename: body})
+
+    model = build_in_time(target)
+
+    assert isinstance(model, dict)
+    json.dumps(model)
+
+
+def test_a_leg_field_too_deep_to_render_is_named_rather_than_raised():
+    """The second recursion, and the only route to it.
+
+    `json.dumps` recurses too, and the model calls it on any non-string a coach
+    puts in a string list. Reaching that through a relay file is a needle: a
+    structure the scanner accepts but the renderer cannot render exists only in
+    the narrow band where `build()`'s own frames have eaten the difference, and
+    the band moves with the interpreter, the platform and the thread's stack.
+
+    So the nesting is built by a loop rather than parsed, and handed straight to
+    the coercion that renders it. That is the same value a `skills` list would
+    carry, without depending on where two recursion limits happen to fall.
+    """
+    nest = []
+    for _ in range(60_000):
+        nest = [nest]
+
+    deep = {}
+    for _ in range(60_000):
+        deep = {"a": deep}
+
+    # Both halves of the coercion: a member of a list, which is rendered as
+    # JSON, and a bare value that is neither string nor list, which is
+    # rendered by `str`. Both recurse; a coach can write either.
+    for rendered in (relay_model._strlist([nest]), relay_model._strlist(deep)):
+        assert isinstance(rendered, list) and len(rendered) == 1
+        assert isinstance(rendered[0], str) and rendered[0]
+
+
+@pytest.mark.parametrize("depth", NEST_DEPTHS)
+def test_a_deeply_nested_leg_field_degrades_rather_than_recursing(tmp_path, depth):
+    """The second recursion, one layer down: a `skills` list the scanner
+    accepts and `json.dumps` then blows the stack rendering, with `build()`'s
+    own frames already on it."""
+    nest = "[" * depth + "]" * depth
+    body = ('{"legs": [{"id": "a", "status": "running", "skills": ['
+            + nest + ']}]}').encode()
+    target = write_relay(tmp_path, f"nest-skills-{depth}", raw={"legs.json": body})
+
+    model = build_in_time(target)
+
+    assert isinstance(model, dict)
+    json.dumps(model)
+    assert model["legs"] == [] or model["legs"][0]["id"] == "a"
 
 
 # --------------------------------------------------------------------------
