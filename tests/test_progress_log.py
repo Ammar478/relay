@@ -13,6 +13,7 @@ fixture imported from `test_relay_model` does; do not write a second one.
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -938,6 +939,9 @@ def test_a_baton_whose_leg_has_no_runner_row_still_attributes_its_commit(tmp_pat
     _git(project, "add", "-A", when=NOW - 9000)
     _git(project, "commit", "-q", "-m", "before: the project existed first",
          when=NOW - 9000)
+    # On a branch of its own, which is where a relay runs and what opens the
+    # window early enough to hold a commit made before its own baton.
+    _git(project, "checkout", "-q", "-b", "feat/the-run")
     _git(project, "commit", "-q", "--allow-empty", "-m", "alpha: the leg's work",
          when=NOW - 4100)
     _land(relay_dir, "alpha", NOW - 4000, _short_sha(project))
@@ -950,3 +954,379 @@ def test_a_baton_whose_leg_has_no_runner_row_still_attributes_its_commit(tmp_pat
     entry = commit_named(model, "alpha: the leg's work")
     assert entry is not None, [e["m"] for e in entries_of(model, "commit")]
     assert entry["leg"] == "alpha"
+
+
+# --------------------------------------------------------------------------
+# the real baton corpus (ACC-DATA-009)
+#
+# Every log test above this line runs against batons this file wrote, in the
+# one form the template prescribes, at event counts an order of magnitude
+# below the bounds that bite. The real corpus is nothing like that: of the ten
+# batons in `tests/fixtures/agent-service`, exactly ONE writes the sha the way
+# `**Commit:** <sha>` prescribes, three write it as a bare `Commit `<sha>``
+# heading, two as `Merge commit: `<sha>``, one as `Committed as `<sha>`` two
+# hundred lines down, and three claim no commit at all. The same batons quote
+# OTHER shas in prose - a branch point, a parent, a parallel runner's work -
+# and a sha appearing in a baton is not a claim that the leg produced it.
+#
+# These tests graft the frozen corpus onto a repository whose commits are the
+# shas those batons name. A 7-character sha prefix cannot be forged into a
+# real repository, so the graft goes the other way: the repository's own shas
+# are substituted into copies of the batons, one for one, leaving every baton's
+# prose, structure and line numbers exactly as its runner wrote them.
+# --------------------------------------------------------------------------
+
+# What each corpus baton claims as its OWN work, read by hand from the batons
+# and cross-checked against `behaviour-judge-S1`'s independent reading of them.
+CORPUS_OWN = {
+    "reconcile-develop": "c3319e2",
+    "reconcile-security": "b9183c3",
+    "create-path-credential-guard": "8036f9f",
+    "process-entitlement": "42a735f",
+    "pg-repository-correctness": "4f0b17c",
+    "thread-id-ownership": "7d031a3",
+    "s2-test-quality": "55732a4",
+}
+
+# Shas the same batons only MENTION. Each of these is a real commit in the
+# grafted repository and each sits in a baton next to words that are not a
+# claim: the branch `reconcile-develop` forked FROM, the PARENT of the commit
+# `create-path-credential-guard` made, the sha `pg-repository-correctness`
+# recorded as its own STARTING point. A log that credits one of these to the
+# leg whose baton mentions it is reporting the repository, not the run.
+CORPUS_QUOTED = ("7f8690c", "2d6c125", "378d178", "ac8b835")
+
+# Batons that name no commit anywhere. Three of ten: honest absence is the
+# common case in the real corpus, and it must stay absence.
+CORPUS_SILENT = ("chat-session-ownership", "credential-parity", "mask-shape-coverage")
+
+_EARLIEST_BATON = min(AGENT_SERVICE_BATON_MTIMES.values())
+_MT = AGENT_SERVICE_BATON_MTIMES
+
+# (token, when, subject). Every leg's own commit is OLDER than its own baton,
+# because a runner commits and then writes its baton. `7f8690c` is older than
+# the relay's earliest event by hours: it is the branch's starting point and
+# no part of this run.
+CORPUS_COMMITS = [
+    ("7f8690c", _EARLIEST_BATON - 12000,
+     "Merge branch 'feature/sub-1b-agent-write-methods'"),
+    ("c3319e2", _MT["reconcile-develop"] - 221,
+     "merge: land develop credential-preservation fix onto wave-2 cutover"),
+    ("b9183c3", _MT["reconcile-security"] - 54,
+     "merge: land agents-router authentication onto wave-2 cutover"),
+    ("2d6c125", _MT["create-path-credential-guard"] - 900,
+     "chore(deps): project traffic that is nobody's leg"),
+    ("8036f9f", _MT["create-path-credential-guard"] - 43,
+     "fix(credentials): refuse to create an agent with a masked PAT"),
+    ("42a735f", _MT["process-entitlement"] - 63,
+     "fix(process): require entitlement to the agent being addressed"),
+    ("ac8b835", _MT["chat-session-ownership"] - 1500,
+     "feat(chat): stamp the caller onto the session"),
+    ("378d178", _MT["pg-repository-correctness"] - 1200,
+     "test(pg): a starting point, not a landing"),
+    ("4f0b17c", _MT["pg-repository-correctness"] - 198,
+     "fix(db): return the whole agent row, and store the slug"),
+    ("7d031a3", _MT["thread-id-ownership"] - 100,
+     "fix(threads): refuse a thread the caller does not own"),
+    ("55732a4", _MT["s2-test-quality"] - 70,
+     "test: make six certifying tests capable of failing"),
+]
+
+
+@pytest.fixture
+def corpus_relay(tmp_path, relay):
+    """The frozen agent-service batons, on a repository holding their commits.
+
+    Returns `(relay_dir, sha_of)`, where `sha_of[token]` is the real short sha
+    that stands in for the corpus sha `token`.
+    """
+    source = relay("agent-service")            # mtimes already stamped
+    project = tmp_path / "grafted"
+    relay_dir = project / ".relay"
+    shutil.copytree(source, relay_dir)
+
+    _git(project, "init", "-q", "-b", "main")
+    (project / "README").write_text("the project existed before the relay\n")
+    _git(project, "add", "README", when=_EARLIEST_BATON - 20000)
+    _git(project, "commit", "-q", "-m", "chore: the project existed first",
+         when=_EARLIEST_BATON - 20000)
+    _git(project, "checkout", "-q", "-b", "feat/wave2-cutover-reconciled")
+
+    sha_of = {}
+    for token, when, subject in sorted(CORPUS_COMMITS, key=lambda c: c[1]):
+        _git(project, "commit", "-q", "--allow-empty", "-m", subject, when=when)
+        sha_of[token] = _git(project, "rev-parse", "--short=7", "HEAD").stdout.strip()
+
+    for path in sorted((relay_dir / "batons").glob("*.md")):
+        text = original = path.read_text()
+        for token, real in sha_of.items():
+            text = text.replace(token, real)
+        if text != original:
+            path.write_text(text)
+        when = AGENT_SERVICE_BATON_MTIMES[path.stem]
+        os.utime(path, (when, when))
+    return relay_dir, sha_of
+
+
+def test_the_corpus_fixture_still_names_the_shas_these_tests_read():
+    """The premise of every test below. The fixture has been refreshed once
+    already; if it is refreshed again and a baton's wording changes, this fails
+    here rather than as a silent false pass downstream."""
+    batons = FIXTURES / "agent-service" / "batons"
+    for leg, sha in CORPUS_OWN.items():
+        assert sha in (batons / f"{leg}.md").read_text(), (leg, sha)
+    for leg in CORPUS_SILENT:
+        text = (batons / f"{leg}.md").read_text()
+        loose = set(re.findall(r"`([0-9a-f]{7,40})`", text))
+        assert loose <= set(CORPUS_QUOTED), (leg, loose)
+    quoted = " ".join(p.read_text() for p in sorted(batons.glob("*.md")))
+    for sha in CORPUS_QUOTED:
+        assert sha in quoted, sha
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_every_corpus_baton_that_claims_a_commit_is_credited_with_it(corpus_relay):
+    """ACC-DATA-009, against the corpus the check's evidence names: for each
+    baton that claims a commit, the log entry carries the leg whose baton
+    claims it. Fails today for three legs."""
+    relay_dir, sha_of = corpus_relay
+    model = relay_model.build(relay_dir, now=NOW)
+    commits = {e["commit"]: e for e in entries_of(model, "commit")}
+    missing, miscredited = [], []
+    for leg, token in CORPUS_OWN.items():
+        sha = sha_of[token]
+        if sha not in commits:
+            missing.append((leg, token))
+        elif commits[sha]["leg"] != leg:
+            miscredited.append((leg, token, commits[sha]["leg"]))
+    assert not missing, missing
+    assert not miscredited, miscredited
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_every_corpus_landing_carries_its_own_commit(corpus_relay):
+    """The same claim on the other entry: a leg's landing names the sha that
+    leg produced, not the first sha-shaped token its prose happens to hold."""
+    relay_dir, sha_of = corpus_relay
+    model = relay_model.build(relay_dir, now=NOW)
+    landings = {e["leg"]: e for e in entries_of(model, "baton")}
+    named = {leg: landings[leg]["commit"] for leg in CORPUS_OWN if leg in landings}
+    assert named == {leg: sha_of[token] for leg, token in CORPUS_OWN.items()
+                     if leg in landings}
+    rows = {r["leg"]: r for r in model["runners"]}
+    for leg, token in CORPUS_OWN.items():
+        if leg in rows:
+            assert rows[leg]["commit"] == sha_of[token], leg
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_sha_the_corpus_only_mentions_is_credited_to_no_leg(corpus_relay):
+    """A branch point, a parent and another runner's starting point. All three
+    resolve in this repository and all three sit in a baton; none is a claim."""
+    relay_dir, sha_of = corpus_relay
+    model = relay_model.build(relay_dir, now=NOW)
+    quoted = {sha_of[token] for token in CORPUS_QUOTED}
+    credited = [(e["commit"], e["leg"]) for e in model["log"]
+                if e["commit"] in quoted and e["leg"]]
+    assert credited == [], credited
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_corpus_baton_that_claims_nothing_names_nothing(corpus_relay):
+    """Honest absence beats a wrong credit: three of the ten batons say
+    nothing about a commit, and the model does not guess one for them."""
+    relay_dir, _ = corpus_relay
+    model = relay_model.build(relay_dir, now=NOW)
+    landings = {e["leg"]: e for e in entries_of(model, "baton")}
+    for leg in CORPUS_SILENT:
+        assert landings[leg]["commit"] is None, (leg, landings[leg]["commit"])
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_no_commit_from_before_the_relay_began_survives(corpus_relay):
+    """ACC-DATA-009's first sentence. `7f8690c` is dated hours before the
+    relay's earliest event and no baton claims it; it is not this run's work
+    however loudly `reconcile-develop.md` mentions it."""
+    relay_dir, sha_of = corpus_relay
+    model = relay_model.build(relay_dir, now=NOW)
+    assert sha_of["7f8690c"] not in {e["commit"] for e in model["log"]}
+    earliest = min(e["t"] for e in relay_events(model))
+    early = [(e["commit"], e["m"]) for e in entries_of(model, "commit")
+             if e["t"] < earliest and not e["leg"]]
+    assert early == [], early
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_the_first_legs_commit_survives_though_it_predates_the_first_event(
+        corpus_relay):
+    """The case the exemption was introduced for, kept without the exemption:
+    `reconcile-develop` committed before it wrote the baton that is the relay's
+    earliest recorded event, and its commit is on the run's own branch."""
+    relay_dir, sha_of = corpus_relay
+    model = relay_model.build(relay_dir, now=NOW)
+    entry = [e for e in entries_of(model, "commit")
+             if e["commit"] == sha_of["c3319e2"]]
+    assert entry, [e["m"] for e in entries_of(model, "commit")]
+    assert entry[0]["leg"] == "reconcile-develop"
+    assert entry[0]["t"] < min(e["t"] for e in relay_events(model))
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_the_corpus_log_does_not_bury_the_run(corpus_relay):
+    """The counting clause still holds on the real corpus."""
+    relay_dir, _ = corpus_relay
+    model = relay_model.build(relay_dir, now=NOW)
+    assert len(entries_of(model, "commit")) <= len(relay_events(model))
+    assert len(model["log"]) <= relay_model.LOG_MAX_ENTRIES
+
+
+# --------------------------------------------------------------------------
+# a sha is credited only when the relay's OWN repository has it (ACC-DATA-009)
+# --------------------------------------------------------------------------
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_claimed_sha_the_repository_does_not_have_is_not_credited(tmp_path):
+    """A judge's baton quotes another relay's shas while reporting on it; a
+    runner mistypes one. Neither names a commit of this repository, and a
+    commit this repository does not have cannot be this leg's work."""
+    project = tmp_path / "unresolvable"
+    relay_dir = project / ".relay"
+    (relay_dir / "batons").mkdir(parents=True)
+    (relay_dir / "legs.json").write_text(json.dumps({
+        "relay": "unresolvable",
+        "stages": [{"id": "S1", "legs": ["alpha", "beta"]}],
+        "legs": [{"id": "alpha", "stage": "S1", "status": "done"},
+                 {"id": "beta", "stage": "S1", "status": "done"}],
+    }))
+    _git(project, "init", "-q", "-b", "main")
+    _git(project, "add", "-A", when=NOW - 9000)
+    _git(project, "commit", "-q", "-m", "chore: the project existed first",
+         when=NOW - 9000)
+    _git(project, "checkout", "-q", "-b", "feat/the-run")
+    _land(relay_dir, "alpha", NOW - 5000)
+    _git(project, "commit", "-q", "--allow-empty", "-m", "beta: the leg's work",
+         when=NOW - 4100)
+    _land(relay_dir, "beta", NOW - 4000, "deadbee")
+
+    model = relay_model.build(relay_dir, now=NOW)
+    assert "deadbee" not in {e["commit"] for e in model["log"]}
+    rows = {r["leg"]: r for r in model["runners"]}
+    assert rows["beta"]["commit"] is None
+    # The leg's real commit is still in the log; it is simply unattributed,
+    # which is all the evidence on disk supports.
+    entry = commit_named(model, "beta: the leg's work")
+    assert entry is not None and entry["leg"] is None
+
+
+def test_this_repos_own_relay_credits_only_shas_this_repo_has():
+    """The defect as it was reproduced: this repository's own log credited
+    `code-judge-S1` with `4f0b17c` and `behaviour-judge-S1` with `8036f9f`,
+    both agent-service shas those judges quoted while reporting on another
+    relay, neither a valid object here. Run in place, because a copy of a
+    relay is outside the repository whose commits it names."""
+    own = REPO / ".relay"
+    if not HAS_GIT or not (own / "batons").is_dir():
+        pytest.skip(".relay is git-ignored and absent from a fresh clone")
+    model = relay_model.build(own, now=NOW)
+    named = sorted({e["commit"] for e in model["log"] if e["commit"]})
+    assert named, "this relay's batons name commits"
+    unresolvable = [sha for sha in named
+                    if subprocess.run(["git", "-C", str(REPO), "cat-file", "-t", sha],
+                                      capture_output=True, text=True).returncode != 0]
+    assert unresolvable == [], unresolvable
+    assert "a43fbd8" in {e["commit"] for e in entries_of(model, "commit")}
+
+
+# --------------------------------------------------------------------------
+# pre-relay history on the relay's own branch (ACC-DATA-009)
+# --------------------------------------------------------------------------
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_pre_relay_commits_on_the_relays_own_branch_are_not_in_the_log(tmp_path):
+    """The branch point is not always the relay's beginning: a run can be
+    supervised on a branch that already existed, and everything the branch
+    carried before the run started is the project's history, not this run's."""
+    project = tmp_path / "older-branch"
+    relay_dir = project / ".relay"
+    (relay_dir / "batons").mkdir(parents=True)
+    (relay_dir / "legs.json").write_text(json.dumps({
+        "relay": "older-branch",
+        "stages": [{"id": "S1", "legs": ["alpha"]}],
+        "legs": [{"id": "alpha", "stage": "S1", "status": "done"}],
+    }))
+    _git(project, "init", "-q", "-b", "main")
+    _git(project, "add", "-A", when=NOW - 90000)
+    _git(project, "commit", "-q", "-m", "chore: on main", when=NOW - 90000)
+    _git(project, "checkout", "-q", "-b", "feat/long-lived")
+    for n in range(3):
+        _git(project, "commit", "-q", "--allow-empty",
+             "-m", f"before: branch work {n} that predates the relay",
+             when=NOW - 80000 + n)
+    _git(project, "commit", "-q", "--allow-empty", "-m", "alpha: the leg's work",
+         when=NOW - 4100)
+    _land(relay_dir, "alpha", NOW - 4000, _short_sha(project))
+
+    model = relay_model.build(relay_dir, now=NOW)
+    assert commit_named(model, "alpha: the leg's work") is not None
+    assert not [e["m"] for e in entries_of(model, "commit") if "before:" in e["m"]]
+
+
+# --------------------------------------------------------------------------
+# the budget never discards an attributed commit (ACC-DATA-009)
+# --------------------------------------------------------------------------
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_the_budget_never_discards_an_attributed_commit(tmp_path):
+    """`min(len(events), LOG_MAX_ENTRIES - len(events))` inverts above 150
+    relay events: at 250 events it buys 50 commits, and the sixty legs that
+    landed one lose the ten that landed first. Attribution is not a budget
+    line - a commit a baton claims is the run's own work, and only the
+    unattributed remainder is bought with what is left."""
+    project = tmp_path / "long-run"
+    relay_dir = project / ".relay"
+    (relay_dir / "batons").mkdir(parents=True)
+    legs = [{"id": f"leg-{i:03d}", "stage": "S1", "status": "done"}
+            for i in range(250)]
+    (relay_dir / "legs.json").write_text(json.dumps(
+        {"relay": "long-run",
+         "stages": [{"id": "S1", "legs": [leg["id"] for leg in legs]}],
+         "legs": legs}))
+
+    _git(project, "init", "-q", "-b", "main")
+    _git(project, "add", "-A", when=NOW - 9000)
+    _git(project, "commit", "-q", "-m", "chore: the project existed first",
+         when=NOW - 9000)
+    _git(project, "checkout", "-q", "-b", "feat/the-long-run")
+    # One `git` process per commit is the cost here, not Python.
+    script = ('set -e; i=0; while [ $i -lt 60 ]; do '
+              'GIT_AUTHOR_DATE="$((BASE+i*10)) +0000" '
+              'GIT_COMMITTER_DATE="$((BASE+i*10)) +0000" '
+              'git commit -q --allow-empty -m "leg work $i"; i=$((i+1)); done')
+    env = dict(os.environ)
+    env.update({"BASE": str(int(NOW - 2600)),
+                "GIT_AUTHOR_NAME": "Relay Test", "GIT_AUTHOR_EMAIL": "t@example.com",
+                "GIT_COMMITTER_NAME": "Relay Test",
+                "GIT_COMMITTER_EMAIL": "t@example.com"})
+    out = subprocess.run(["sh", "-c", script], cwd=project, env=env,
+                         capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+
+    # 250 batons; the newest 60 of them claim the 60 commits above, each five
+    # seconds after the commit it claims.
+    claimed = {}
+    for i, leg in enumerate(legs):
+        n = i - (len(legs) - 60)
+        sha = _short_sha(project, f"HEAD~{59 - n}") if n >= 0 else None
+        if sha:
+            claimed[leg["id"]] = sha
+        _land(relay_dir, leg["id"], NOW - 5000 + i * 10, sha)
+
+    model = relay_model.build(relay_dir, now=NOW)
+    commits = entries_of(model, "commit")
+    events = relay_events(model)
+    credited = {e["commit"]: e["leg"] for e in commits if e["leg"]}
+    assert len(events) > 150, len(events)
+    assert credited == {sha: leg for leg, sha in claimed.items()}, \
+        sorted(set(claimed.values()) - set(credited))
+    assert len(commits) <= len(events), (len(commits), len(events))
+    assert len(model["log"]) <= relay_model.LOG_MAX_ENTRIES

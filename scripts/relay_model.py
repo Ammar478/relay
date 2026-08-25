@@ -308,19 +308,54 @@ def _load(path):
 
 BATON_STATUS = {"success": "completed", "ok": "completed", "partial": "partial",
                 "failed": "failed", "failure": "failed"}
-# A baton written to the template carries `**Commit:** <sha>` as a field; that
-# wins. Otherwise take the first commit-shaped reference in the prose, which is
-# a guess the view must not dress up as certainty.
+_SHA = r"(?<![0-9a-f])([0-9a-f]{7,40})(?![0-9a-f])"
+
+# A sha appearing in a baton is NOT a claim that the leg produced it
+# (ACC-DATA-009). Batons quote other shas constantly and for good reasons: the
+# branch point a merge forked from, the parent of the commit being reported, a
+# parallel runner's work that landed underneath, another relay's history a
+# judge is reporting on. Scraping the first commit-shaped token out of the
+# prose credited `reconcile-develop` with the branch point it forked FROM
+# instead of the merge it made, `thread-id-ownership` with a parallel runner's
+# commit instead of its own, and two judges of this relay with agent-service
+# shas that are not objects in this repository at all.
 #
-# Markdown bold can close on either side of the colon - `**Commit:** sha` and
-# `**Commit**: sha` are the same field, and runners of this relay have written
-# both. Reading only one of them costs the leg its commit, and a commit no
-# baton is read as naming is a commit the log cannot attribute (ACC-DATA-009).
-COMMIT_FIELD_RE = re.compile(
-    r"^\W*(?:\*\*)?commit(?:\*\*)?\s*:\s*(?:\*\*)?\s*`?([0-9a-f]{7,40})`?",
-    re.I | re.M)
-SHA_RE = re.compile(r"(?:commit|sha)[^`\n]*`([0-9a-f]{7,40})`", re.I)
+# So only these three forms are read as a leg claiming a commit as its own
+# work. Each is a statement whose subject is the commit; a sha that merely
+# appears next to the word is not one.
+#
+# 1. THE FIELD the baton template prescribes, `**Commit:** <sha>`, at the head
+#    of a line. Markdown bold closes on either side of the colon and runners
+#    have written both, the colon itself is often dropped (`Commit `<sha>` on
+#    <branch>`), and a merge is reported as `Merge commit: <sha>`. A clause
+#    boundary counts as a line head, because a runner writes
+#    `Branch `x`, commit `<sha>` (parent `<y>`)` and means the first of them.
+# 2. `committed as <sha>` - the runner in the first person, wherever it sits.
+#    Bare `committed <sha>` is NOT this form: `the parallel runner committed
+#    <sha> while I was working` is the sentence it would misread.
+# 3. `git commit` reported in the Commands-run table with the sha it produced,
+#    on the same line. That is the runner's own invocation and its result.
+COMMIT_CLAIM_RES = (
+    re.compile(r"(?:^|(?<=[.;])\s|(?<=,)\s)\W*(?:\*\*)?(?:merge\s+|final\s+)?"
+               r"commit(?:\*\*)?\s*:?\s*(?:\*\*)?\s*`?" + _SHA,
+               re.I | re.M),
+    re.compile(r"committed(?:\*\*)?\s+as\s*(?:\*\*)?\s*`?" + _SHA, re.I),
+    re.compile(r"git\s+commit\b[^\n]{0,60}?`?" + _SHA, re.I),
+)
 STATUS_RE = re.compile(r"^\W*(?:\*\*)?status(?:\*\*)?\s*:\s*(\w+)", re.I | re.M)
+
+
+def commit_claims(text):
+    """Every sha `text` claims as its own work, in the order it claims them.
+
+    Seven characters each, the width `git log --format=%h` gives a repository
+    this size, so a claim and a commit compare as equals rather than by prefix.
+    """
+    seen = {}
+    for pattern in COMMIT_CLAIM_RES:
+        for match in pattern.finditer(text):
+            seen.setdefault(match.group(1)[:7], match.start())
+    return sorted(seen, key=seen.get)
 
 
 def baton_text(path):
@@ -337,13 +372,20 @@ def baton_text(path):
 
 
 def _read_baton(path):
-    """What a baton reliably carries: when it landed, how long it is, the commit
-    it names, and a status if the runner wrote one."""
+    """What a baton reliably carries: when it landed, how long it is, the
+    commits it claims, and a status if the runner wrote one.
+
+    `commit` starts as the first claim and is settled against the relay's own
+    repository by `_settle_commits` - a claim the repository cannot confirm is
+    not this leg's work (ACC-DATA-009). Outside a repository there is nothing
+    to confirm it against and the baton's own word is all the evidence there
+    is, so the first claim stands.
+    """
     text = baton_text(path)
     if text is None:
         return None
     m = STATUS_RE.search(text)
-    sha = COMMIT_FIELD_RE.search(text) or SHA_RE.search(text)
+    claims = commit_claims(text)
     try:
         # A baton can be deleted between the listing and this stat: the relay
         # is live and the model is only a reader.
@@ -352,7 +394,8 @@ def _read_baton(path):
         return None
     return {
         "status": BATON_STATUS.get(m.group(1).lower()) if m else None,
-        "commit": sha.group(1)[:7] if sha else None,
+        "claims": claims,
+        "commit": claims[0] if claims else None,
         "lines": text.count("\n") + 1,
         "mtime": mtime,
         "path": str(path.resolve()),
@@ -853,7 +896,7 @@ def _in_a_repo(path, project):
     return False
 
 
-def _git(relay_dir, *args):
+def _git(relay_dir, *args, stdin=None):
     """`git -C <relay_dir> <args>` stdout, or None when git could not answer.
 
     Never raises: git may be absent, the directory may not be a repository, the
@@ -875,11 +918,57 @@ def _git(relay_dir, *args):
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     try:
         out = subprocess.run(["git", "-C", str(relay_dir), *args],
-                             capture_output=True, text=True,
+                             input=stdin, capture_output=True, text=True,
                              timeout=GIT_TIMEOUT, env=env)
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
     return out.stdout if out.returncode == 0 else None
+
+
+def _resolve_shas(relay_dir, project, shas):
+    """Which of `shas` name a commit in the relay's own repository.
+
+    Returns None when the question cannot be asked at all - the relay is not
+    in a repository of its own, or git could not answer - so a caller can tell
+    "this repository does not have it" from "nothing here can check". The two
+    are different answers and only the first falsifies a baton's claim.
+
+    ONE git process for every sha in the relay, not one per sha: `cat-file
+    --batch-check` takes the whole list on stdin and answers in input order,
+    inside the same `GIT_TIMEOUT` as every other read here. A short sha that is
+    ambiguous in this repository answers `ambiguous` and is treated as
+    unresolved, which is the honest reading of it.
+    """
+    order = sorted(shas)
+    if not order or not _in_a_repo(relay_dir, project):
+        return None
+    out = _git(relay_dir, "cat-file", "--batch-check=%(objectname) %(objecttype)",
+               stdin="\n".join(order) + "\n")
+    if out is None:
+        return None
+    lines = out.splitlines()
+    if len(lines) != len(order):
+        return None            # not the answer that was asked for; do not guess
+    return {sha for sha, line in zip(order, lines)
+            if line.rsplit(" ", 1)[-1:] == ["commit"]}
+
+
+def _settle_commits(relay_dir, project, batons):
+    """Settle every baton's claimed commit against the relay's own repository.
+
+    A leg is credited with a commit only when its baton claims the sha as its
+    own work AND the sha is a commit in the repository the relay supervises
+    (ACC-DATA-009). Both halves are load-bearing: this relay's own judges wrote
+    reports quoting another relay's shas in claim-shaped sentences, and those
+    shas are not objects here.
+    """
+    resolved = _resolve_shas(
+        relay_dir, project, {sha for b in batons.values() for sha in b["claims"]})
+    if resolved is None:
+        return
+    for baton in batons.values():
+        baton["commit"] = next((sha for sha in baton["claims"] if sha in resolved),
+                               None)
 
 
 def _git_log(relay_dir, exclude=()):
@@ -917,44 +1006,48 @@ def _default_branch_refs(relay_dir):
 
 
 def _relay_commits(relay_dir, project, own):
-    """(commits, since) for this run, newest first (ACC-DATA-009).
+    """(commits, since, branched) for this run, newest first (ACC-DATA-009).
 
     A project's history is far longer and far busier than the relay that
     supervises one slice of it, so a window decides which commits are the run's
-    at all. It opens in one of three places, in this order:
+    at all. Two bounds make it, and both are returned for the caller to apply:
 
-    1. THE BRANCH POINT, when the relay runs on a branch of its own. Everything
-       the branch adds on top of the default branch is the run's work by
-       construction, and this is the only bound that can hold the first leg's
-       commit: a runner commits *before* it writes its baton, so the first
-       leg's commit is older than the earliest event the relay ever recorded.
-       Bounding by that event drops it - measured in this repository, by 46.7
-       seconds - which is exactly what "every commit attributable to a leg
-       appears" forbids. The walk itself is the window here, so `since` is None.
-    2. THE EARLIEST EVENT the relay recorded, returned as `since`, when there is
-       no branch to bound by: the relay runs on the default branch itself, or
-       the repository has no default branch under any of the names git gives
-       one. Commits older than the relay's first landing are the project's
-       history, not this run's - unless a baton names one, which is why `since`
-       is returned for the caller to apply rather than applied here.
-    3. NOWHERE, when the relay has recorded no event at all. A brand-new relay
-       has no window and nothing to count against, and the outer `--max-count`
-       walk is the only bound left. Showing a fresh relay its recent commits is
-       better than showing it nothing.
+    * `commits` is already bounded by TOPOLOGY. When the relay runs on a branch
+      of its own, the walk excludes everything reachable from the default
+      branch, so what comes back is what this branch adds on top of its branch
+      point. `branched` says so. A commit from before the branch point is not
+      this run's work however loudly a baton talks about it, so no claim can
+      reach back past this bound.
+    * `since` is the relay's EARLIEST RECORDED EVENT, or None when it has
+      recorded none. It is the second bound and the caller applies it: a
+      project's history from before the relay started is not part of this run
+      (ACC-DATA-009), whether it sits on the branch or before it.
+
+    The one commit that legitimately predates `since` is a leg's own: a runner
+    commits *before* it writes its baton, so the first leg's commit is older
+    than the earliest event the relay ever recorded - measured in this
+    repository, by 46.7 seconds. That is why `branched` is reported rather than
+    folded into `since` here: inside a branch of the run's own, a commit a
+    baton claims is admitted at the branch point, and nowhere else is.
+
+    A relay that has recorded no event at all has neither bound. It has no
+    window and nothing to count against, and the outer `--max-count` walk is
+    all that is left; showing a fresh relay its recent commits is better than
+    showing it nothing.
 
     Two git invocations in the common case, both bounded by `GIT_TIMEOUT`: the
     ref probe walks nothing, and a walk that comes back empty means HEAD is the
-    default branch, which is case 2.
+    default branch, which is the unbranched case.
     """
     if not _in_a_repo(relay_dir, project):
-        return [], None
+        return [], None, False
+    since = min(entry["t"] for entry in own) if own else None
     defaults = _default_branch_refs(relay_dir)
     if defaults:
         branch = _git_log(relay_dir, exclude=defaults)
         if branch:
-            return branch, None
-    commits = _git_log(relay_dir)
-    return commits, (min(entry["t"] for entry in own) if own else None)
+            return branch, since, True
+    return _git_log(relay_dir), since, False
 
 
 def _commit_entries(relay_dir, project, batons, own, budget, now):
@@ -969,14 +1062,23 @@ def _commit_entries(relay_dir, project, batons, own, budget, now):
     first removes exactly them and keeps the project's unrelated traffic: the
     live agent-service relay carried 12 commit entries under that rule, none of
     them attributable to a leg, which satisfies a count bound while inverting
-    what the log is for. So attribution is spent first - every commit a baton
-    names is kept - and only what is left over goes to the newest unattributed
-    commits inside the window.
+    what the log is for.
 
-    A commit a baton names is the run's own by construction, so no time bound is
-    applied to it: it is kept even where it is older than the relay's earliest
-    event, which is where a first leg's commit sits whenever there is no branch
-    point to open the window at instead.
+    RULE: an attributed commit is not a budget line. Every commit a baton
+    claims is kept, and `budget` buys only the newest of what is left over.
+    The budget used to be `min(events, MAX - events)` spent on attribution
+    first, which above 150 relay events starts discarding attributed commits
+    oldest-first and re-inverts the property at scale.
+
+    RULE: the time bound applies to attributed commits too, with exactly one
+    exception - a commit a baton claims, inside a branch the run owns, is
+    admitted at the branch point. That is where a first leg's commit sits: a
+    runner commits before it writes its baton, so its commit is older than the
+    relay's earliest event. Exempting attributed commits from the bound
+    *entirely*, which is what the previous fix did, let a merge dated a day
+    before the relay began back into the live relay's log on the strength of a
+    baton that only mentioned it. Where there is no branch of the run's own
+    there is no branch point either, and the earliest event bounds everything.
 
     Only commits are budgeted. A baton, a handoff or a check transition is
     never dropped to make room: they are the events a supervisor came to the
@@ -984,7 +1086,7 @@ def _commit_entries(relay_dir, project, batons, own, budget, now):
     window nor anything to budget against, so the walk comes through as it
     came: see `_relay_commits`.
     """
-    commits, since = _relay_commits(relay_dir, project, own)
+    commits, since, branched = _relay_commits(relay_dir, project, own)
     commits = sorted(commits, key=lambda c: -c[0])
     # Attribution comes from the batons rather than from the runner rows, for
     # the same reason the landings above do: a baton is what happened, and a
@@ -993,13 +1095,25 @@ def _commit_entries(relay_dir, project, batons, own, budget, now):
     #
     # `_read_baton` cuts what the baton says and `_git_log` cuts git's own `%h`
     # to the same seven characters, so this is an equality, not a prefix search.
-    by_commit = {b["commit"]: leg for leg, b in batons.items() if b["commit"]}
+    #
+    # Two batons claiming one sha is a contradiction on disk, not a choice for
+    # the model: the leg that landed first is credited, so the log says the
+    # same thing on every build.
+    by_commit = {}
+    for leg, baton in sorted(batons.items(), key=lambda kv: (kv[1]["mtime"], kv[0])):
+        if baton["commit"]:
+            by_commit.setdefault(baton["commit"], leg)
     if own:
-        attributed = [c for c in commits if by_commit.get(c[1])]
-        rest = [c for c in commits if not by_commit.get(c[1])
-                and (since is None or c[0] >= since)]
-        kept = attributed[:budget]
-        kept += rest[:max(0, budget - len(kept))]
+        def in_window(commit, claimed):
+            if since is None:
+                return True
+            return commit[0] >= since or (claimed and branched)
+
+        attributed = [c for c in commits
+                      if by_commit.get(c[1]) and in_window(c, True)]
+        rest = [c for c in commits
+                if not by_commit.get(c[1]) and in_window(c, False)]
+        kept = attributed + rest[:max(0, budget - len(attributed))]
         # `git log` already yields newest first; sorting states the intent and
         # is stable, so equal commit times keep git's own order and the merge
         # stays deterministic across builds.
@@ -1075,17 +1189,43 @@ def _derived_log(relay_dir, project, runners, batons, checks, now):
     # 2. commits, last: `entries` is now the relay's own record of itself, and
     # it is what bounds them (ACC-DATA-009).
     #
-    # The budget is settled here rather than inside `_commit_entries`, because
-    # the outer `LOG_MAX_ENTRIES` truncation would otherwise undo it: with 250
-    # events and 210 commits, a budget of "as many commits as events" merges to
-    # 460 entries, and keeping the newest 300 of those leaves 200 commits above
-    # 100 events - the bound inverted by the safety net meant to be the loosest
-    # thing in the module. Events are never dropped for a commit, so they are
-    # counted first and the commits get what room is left.
-    events = sorted(entries, key=lambda e: -e["t"])[:LOG_MAX_ENTRIES]
-    budget = min(len(events), LOG_MAX_ENTRIES - len(events))
-    entries = events + _commit_entries(
-        relay_dir, project, batons, entries, budget, now)
+    # The budget is how many UNATTRIBUTED commits may sit beside the relay's
+    # own record of itself, and it is the relay's own event count: a log where
+    # the project's traffic outnumbers the run's events buries the run
+    # (ACC-DATA-009). Attributed commits are not bought with it - see
+    # `_commit_entries` - so what is left after them is what it buys.
+    #
+    # It is deliberately NOT `min(events, LOG_MAX_ENTRIES - events)` any more.
+    # That form made the outer entry bound decide the attribution question,
+    # and above 150 events it decided it backwards. The entry bound is applied
+    # once, at the end, to the merged log: it is the loosest bound in the
+    # module and it stays the last word rather than a second opinion on which
+    # commits belong.
+    events = sorted(entries, key=lambda e: -e["t"])
+    commits = _commit_entries(
+        relay_dir, project, batons, events, len(events), now)
+
+    # The outer entry bound, applied once and last. It decides how much of the
+    # log fits in a pane, and it must not decide which commits belong: that is
+    # settled above. So it is spent in the order the pane is worth reading in.
+    #
+    # 1. Attributed commits: the run's own work, and never dropped to make room
+    #    for anything else. They are bounded by half the entry bound, and only
+    #    by it - past 150 of them the log cannot hold both a run's landings and
+    #    its commits, and squeezing the landings out to keep commits would
+    #    invert the count bound rather than honour it.
+    # 2. The relay's own events, newest first, in whatever room is left.
+    # 3. Unattributed commits, with what remains, and never more of them than
+    #    there are events to bury - unless the relay has recorded no event at
+    #    all, which has nothing to bury and nothing to count against
+    #    (ACC-DATA-009).
+    attributed = [e for e in commits if e["leg"]][:LOG_MAX_ENTRIES // 2]
+    room = LOG_MAX_ENTRIES - len(attributed)
+    kept = events[:room]
+    spare = room - len(kept)
+    if events:
+        spare = min(spare, max(0, len(kept) - len(attributed)))
+    entries = kept + attributed + [e for e in commits if not e["leg"]][:spare]
 
     entries.sort(key=lambda e: (-e["t"], LOG_KIND_ORDER[e["kind"]], e["m"]))
     return entries[:LOG_MAX_ENTRIES]
@@ -1180,7 +1320,22 @@ def build(relay_dir, now=None):
     if active_leg is not None:
         active_leg["isActive"] = True
 
+    # RULE: `path` is the project the relay supervises. A relay directory called
+    # `.relay` sits inside its project, so the project is its parent; a
+    # directory called anything else (a fixture, a copy) is its own path.
+    #
+    # Derived before the batons are read, because it is also the bound on where
+    # a commit may be read from, and a baton's claimed commit is settled
+    # against that repository before either the runner rows or the log quotes
+    # it. Two panes naming different commits for one leg is the class of defect
+    # this module exists to remove.
+    path = _text_or_warn(extras.get("path"), "dashboard.json: `path`", warnings)
+    if path is None:
+        resolved = relay_dir.resolve()
+        path = str(resolved.parent if resolved.name == ".relay" else resolved)
+
     batons = _read_batons(relay_dir)
+    _settle_commits(relay_dir, path, batons)
     runners, runner_counts, active_runner = _runner_rows(
         batons, leg_rows, active_leg, now, warnings)
 
@@ -1212,14 +1367,6 @@ def build(relay_dir, now=None):
 
     name = _text(legsfile.get("relay")) or _text(state.get("relay"))
     title = _text_or_warn(extras.get("title"), "dashboard.json: `title`", warnings)
-
-    # RULE: `path` is the project the relay supervises. A relay directory called
-    # `.relay` sits inside its project, so the project is its parent; a
-    # directory called anything else (a fixture, a copy) is its own path.
-    path = _text_or_warn(extras.get("path"), "dashboard.json: `path`", warnings)
-    if path is None:
-        resolved = relay_dir.resolve()
-        path = str(resolved.parent if resolved.name == ".relay" else resolved)
 
     # ACC-DATA-008: a metric with no source is a missing key, not a zero.
     metrics = {}

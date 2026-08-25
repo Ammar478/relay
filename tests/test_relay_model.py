@@ -352,16 +352,29 @@ def test_unavailable_runner_fields_are_none_not_invented(relay):
     rows = {r["leg"]: r for r in model["runners"]}
 
     # A completed leg with no baton on disk: nothing is known but the leg.
-    no_baton = rows["merge-and-tag"] if "merge-and-tag" in rows else None
-    assert no_baton is None or (
-        no_baton["commit"] is None and no_baton["batonLines"] is None
-        and no_baton["start"] is None and no_baton["duration"] is None)
+    # This named `merge-and-tag`, which is not a leg of this fixture, so the
+    # clause asserted nothing at all - `no_baton is None` was the branch that
+    # ran. The rows are derived from the fixture instead, which is what the
+    # fixtures skill says to do and what makes the assertion bite.
+    no_baton = [r for r in model["runners"]
+                if r["batonPath"] is None and r["status"] != "running"]
+    assert no_baton, "the fixture has completed legs whose runner left no baton"
+    for row in no_baton:
+        assert row["commit"] is None, row["leg"]
+        assert row["batonLines"] is None and row["start"] is None
+        assert row["duration"] is None and row["finished"] is None
 
     # A leg with a baton: the fields the baton actually carries are filled in.
     landed = rows["reconcile-develop"]
     assert landed["batonLines"] > 0
-    # No `**Commit:**` field in this baton, so the first commit its prose names.
-    assert landed["commit"] == "7f8690c"
+    # No `**Commit:**` field in this baton. Line 7 reports the merge this leg
+    # MADE; line 5 mentions the commit the branch was forked FROM, two lines
+    # earlier. This assertion pinned the second of those as correct until
+    # `log-attribution-truth`: a sha in a baton is not a claim that the leg
+    # produced it, and crediting the branch point cost the log the one commit
+    # this leg actually landed (ACC-DATA-009).
+    assert landed["commit"] == "c3319e2"
+    assert "7f8690c" in relay_model.baton_text(landed["batonPath"])
     assert landed["finished"] == pytest.approx(1787565177.0)
     assert landed["start"] is None          # first runner: no previous handoff
     assert landed["duration"] is None
