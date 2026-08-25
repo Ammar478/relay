@@ -243,6 +243,94 @@ finally:
     termios.tcsetattr(fd, termios.TCSADRAIN, old)
 '''
 
+# A program whose *writing* is deliberately out of step with its reading. Every
+# mode below writes something that a "some byte arrived, so that must be the
+# answer" capture mistakes for the repaint it is waiting for:
+#
+#   before-read  an earlier repaint, still going out when the key lands. It is
+#                written before the key is read, so it cannot be the answer to
+#                it; the real answer comes `delay` later.
+#   regions      a screen painted region by region, the first region (carrying
+#                the text a caller would wait for) going out before the key is
+#                read and the rest of it after.
+#   title        a repaint under a heading that never changes, so text a caller
+#                names with `expect=` is already on screen before the keystroke.
+#
+# The first two synchronise on TIOCOUTQ — the count of this program's output the
+# terminal has not taken yet — rather than on a sleep: "the harness has seen
+# every byte of the noise" is then a fact, not a race, and so is "the key was
+# read after it".
+DEMO_NOISY = r'''
+import fcntl
+import os
+import select
+import struct
+import sys
+import termios
+import time
+import tty
+
+mode = sys.argv[1]
+delay = float(sys.argv[2])
+
+fd = sys.stdin.fileno()
+old = termios.tcgetattr(fd)
+tty.setraw(fd)
+
+
+def flushed():
+    """Wait until the terminal has taken everything written so far."""
+    sys.stdout.flush()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            queued = struct.unpack(
+                "i", fcntl.ioctl(1, termios.TIOCOUTQ, b"\0" * 4))[0]
+        except Exception:
+            time.sleep(0.01)
+            return
+        if queued == 0:
+            return
+        time.sleep(0.0002)
+
+
+try:
+    if mode == "title":
+        sys.stdout.write("\x1b[2J\x1b[1;1HTITLE pane\x1b[3;1HBODY one")
+        flushed()
+        os.read(fd, 64)
+        time.sleep(delay)
+        sys.stdout.write("\x1b[3;1HBODY two")
+        sys.stdout.flush()
+    else:
+        sys.stdout.write("\x1b[2J\x1b[HREADY")
+        flushed()
+        # The key is here, and is deliberately left unread while the program
+        # writes. select() reports it without taking it out of the queue.
+        select.select([fd], [], [], 5)
+        if mode == "before-read":
+            sys.stdout.write("".join("\x1b[3;1HOLD-PAINT" for _ in range(60)))
+        else:
+            sys.stdout.write("\x1b[2J\x1b[1;1HPANE header")
+        flushed()
+        data = os.read(fd, 64)
+        if mode == "before-read":
+            time.sleep(delay)
+            sys.stdout.write(
+                "\x1b[2J\x1b[HAFTER-KEY " + repr(data.decode("utf-8", "replace")))
+            sys.stdout.flush()
+        else:
+            time.sleep(delay)
+            sys.stdout.write("\x1b[3;1HBODY middle")
+            sys.stdout.flush()
+            time.sleep(delay)
+            sys.stdout.write("\x1b[5;1HFOOT bottom")
+            sys.stdout.flush()
+    os.read(fd, 1)
+finally:
+    termios.tcsetattr(fd, termios.TCSADRAIN, old)
+'''
+
 # Writes to the primary screen, then hands it to curses — which takes the
 # alternate screen (`smcup` is `\E[?1049h` on xterm-256color) and gives it back
 # on the way out. This is the ACC-ROBUST-003 / ACC-NAV-005 path: the app is
@@ -301,6 +389,11 @@ def menu(program):
 @pytest.fixture
 def slow(program):
     return program("slow", DEMO_SLOW)
+
+
+@pytest.fixture
+def noisy(program):
+    return program("noisy", DEMO_NOISY)
 
 
 def session(path, *args, **kwargs):
@@ -928,8 +1021,71 @@ def test_run_frames_takes_the_text_a_step_should_reach(slow):
     assert frames[1].line_with("AFTER-KEY") == "AFTER-KEY 'x'"
 
 
+def test_a_write_that_precedes_the_read_is_not_taken_for_the_answer(noisy):
+    """Delivery is not the answer: what a program writes *before* it reads the
+    keys cannot be its response to them.
+
+    The program flushes an earlier repaint while the key is still queued, and
+    only then reads it — TIOCOUTQ makes that order a fact rather than a race.
+    A barrier that ends its wait on "a byte arrived in the same slice as the
+    read" takes that flush for the answer, collapses the response window and
+    hands back the pre-keystroke screen.
+    """
+    with session(noisy, "before-read", "0.4", rows=10, cols=60) as term:
+        term.wait_for("READY")
+        frame = term.send("x")
+        assert frame.contains("AFTER-KEY"), (
+            "send() took the program's own earlier output for the answer and "
+            "returned the pre-keystroke frame"
+        )
+        assert not frame.contains("OLD-PAINT")
+
+
+def test_expect_returns_a_frame_the_program_had_finished_writing(noisy):
+    """The needle triggers the capture; it is not the capture.
+
+    The program paints its screen region by region, and the region carrying the
+    text the caller waits for goes out first. A capture taken the instant that
+    text lands passes on the needle and shows the previous screen everywhere
+    else.
+    """
+    with session(noisy, "regions", "0.04", rows=10, cols=60) as term:
+        term.wait_for("READY")
+        frame = term.send("x", expect="PANE header")
+        assert frame.contains("BODY middle"), (
+            "expect= returned a half-painted screen:\n%s" % frame.text
+        )
+        assert frame.contains("FOOT bottom"), (
+            "expect= returned a half-painted screen:\n%s" % frame.text
+        )
+
+
+def test_expect_does_not_return_the_pre_keystroke_screen(noisy):
+    """Text that is already on screen must not end the wait on its own.
+
+    A pane heading survives the repaint under it, so `expect=` naming it is
+    satisfied before the program has drawn anything at all. The frame returned
+    still has to be the one drawn after the keystroke.
+    """
+    with session(noisy, "title", "0.05", rows=10, cols=60) as term:
+        term.wait_for("TITLE pane")
+        frame = term.send("x", expect="TITLE pane")
+        assert frame.contains("BODY two"), (
+            "expect= returned the pre-keystroke screen:\n%s" % frame.text
+        )
+        assert not frame.contains("BODY one")
+
+
 def test_synchronising_does_not_slow_a_program_that_answers_at_once(menu):
-    """The wait is positive, not a sleep: a prompt app pays only its own latency."""
+    """The wait is positive, not a sleep: a prompt app pays only its own latency.
+
+    It also pins the other half of that: the delivery barrier must leave the
+    program's answer in the pty for the response wait to find. A barrier that
+    swallows the repaint while waiting turns every keystroke into the full
+    `redraw` window — 12 keys took 9.6s when it did, and 3.9-6.5s when it only
+    does so when the timing falls that way. The measured cost of a keystroke
+    here is ~0.08s (the `idle` settle), so 12 of them run in about 1.0s.
+    """
     import time as _time
 
     with session(menu, rows=24, cols=80) as term:
@@ -939,7 +1095,7 @@ def test_synchronising_does_not_slow_a_program_that_answers_at_once(menu):
             term.send("<Down>")
             term.send("<Up>")
         elapsed = _time.monotonic() - started
-    assert elapsed < 6.0, "12 synchronised keystrokes took %.1fs" % elapsed
+    assert elapsed < 2.5, "12 synchronised keystrokes took %.1fs" % elapsed
 
 
 def test_resize_then_quit_restores_the_primary_screen(program):

@@ -71,18 +71,43 @@ there; it waits, on two positive signals:
   frame can no longer predate the keystroke it is meant to show. A program that
   is alive and still has not read within `timeout` fails the call — a wedged
   TUI is a finding, not a frame.
-* **The answer.** `send(keys, expect="...")` waits for text the repaint must
-  show; it is the sound form and the one to reach for, because it fails loudly
-  with the frame instead of returning a stale one. Without `expect`, the wait
-  ends at the first byte the program writes and the repaint settling after it,
-  bounded by `redraw` (0.75s) for a keystroke that draws nothing at all.
 
-The remaining failure mode, stated plainly: a keystroke whose repaint *starts*
-later than `redraw`, with no `expect` given, still yields the pre-repaint frame.
-That is a bounded wait, not a guess — name the text with `expect=` (or raise
-`redraw=`) whenever a transition may be slower than that. `resize()` has no
-delivery barrier to use, because a signal leaves nothing in the input queue:
-`expect=` is the only sound signal there.
+  Delivery says nothing about the answer, and the barrier claims nothing about
+  it. What it does claim is the other direction, which *is* provable: output
+  readable while the keys are still queued was written before the program took
+  them, so it can never be a response to them. The barrier consumes exactly
+  that output — which also keeps a program that is slow to read from blocking
+  on a full output buffer — and leaves the pty alone the moment the queue is
+  empty, so the repaint is still there for the response wait.
+* **The answer.** Then the program's answer is waited for: the first byte it
+  writes after delivery, and the repaint settling after that, bounded by
+  `redraw` (0.75s) so a keystroke that legitimately draws nothing stays cheap.
+  `send(keys, expect="...")` names text the repaint must show and is the sound
+  form — it fails loudly with the frame instead of returning a stale one, and
+  the frame it returns is one the program had *finished* writing: the needle
+  triggers the capture rather than being it, and the wait runs on until the
+  program has been quiet for `paint` (0.2s). Without that, a program painting a
+  screen region by region hands back a frame that passes on the needle and
+  shows the previous screen everywhere else, and text that survives a repaint
+  (a pane heading) ends the wait before the program has drawn anything at all.
+
+Two residual failure modes, stated plainly:
+
+* A keystroke whose repaint *starts* later than `redraw`, with no `expect`
+  given, still yields the pre-repaint frame — a terminal cannot tell "still
+  thinking" from "decided to draw nothing". That is a bounded wait, not a
+  guess: name the text with `expect=` (or raise `redraw=`) whenever a
+  transition may be slower than that.
+* A program that writes on its own timetable — a clock, a progress tick, a
+  repaint it began in the instant before it read the keys — can have that write
+  taken for the answer. Only writes the harness observes while the keys are
+  still queued are provably not the answer; one that lands microseconds after
+  the read is indistinguishable from a response to it, and no observation a
+  terminal can make closes that gap. `expect=` is the answer here too: it waits
+  for text, not for bytes.
+
+`resize()` has no delivery barrier to use, because a signal leaves nothing in
+the input queue: `expect=` is the only sound signal there.
 
 What the screen emulator does
 -----------------------------
@@ -1491,6 +1516,11 @@ def _set_winsize(fd, rows, cols):
 # says so rather than guessing.
 _FIONREAD = getattr(termios, "FIONREAD", None)
 
+# How long the delivery barrier waits between looks at that queue. It bounds
+# how late the barrier notices the keys were taken, and so how much of the
+# program's answer it can swallow before the response wait gets a chance at it.
+_DELIVERY_POLL = 0.002
+
 
 class TerminalSession:
     """A program running under a pty of a fixed size, with a screen attached.
@@ -1510,6 +1540,7 @@ class TerminalSession:
         idle: float = 0.08,
         timeout: float = 5.0,
         redraw: float = 0.75,
+        paint: float = 0.2,
         escdelay: str = "25",
     ):
         self.argv = list(argv)
@@ -1520,6 +1551,11 @@ class TerminalSession:
         self.idle = idle
         self.timeout = timeout
         self.redraw = redraw
+        # How long a program has to have stopped writing before a frame counts
+        # as a screen it finished: a pause shorter than this is part of the
+        # same repaint. Longer than `idle` on purpose — `idle` says a burst has
+        # settled, `paint` says the screen is done.
+        self.paint = paint
         self.screen = Screen(rows, cols)
         self.pid = None
         self.master_fd = None
@@ -1705,11 +1741,12 @@ class TerminalSession:
            is how the program reading them becomes an observation rather than an
            assumption — see `_await_delivery`;
         2. the program's answer is waited for. `expect` names text the repaint
-           must show and is the sound form — the wait ends when it appears and
-           fails loudly with the frame if it never does. Without `expect` the
-           wait ends at the first byte the program writes and the repaint
-           settling after it, bounded by `redraw` for a keystroke that draws
-           nothing at all.
+           must show and is the sound form — the wait ends when it appears *and*
+           the program has stopped writing, so the frame is a whole screen and
+           not a half-painted one, and it fails loudly with the frame if the
+           text never appears. Without `expect` the wait ends at the first byte
+           the program writes and the repaint settling after it, bounded by
+           `redraw` for a keystroke that draws nothing at all.
 
         `settle` overrides that bound for one call; `timeout` bounds both the
         delivery barrier and `expect`.
@@ -1727,13 +1764,11 @@ class TerminalSession:
         if isinstance(data, str):
             data = data.encode("utf-8")
         os.write(self.master_fd, data)
-        answered = self._await_delivery(data, timeout=timeout)
+        self._await_delivery(data, timeout=timeout)
         if expect is not None:
             return self.wait_for(expect, timeout=timeout, regex=regex)
         window = self.redraw if settle is None else settle
-        # A prompt program repaints in the same breath as it reads: the barrier
-        # has already picked that repaint up, and only the settling is left.
-        self._await_response(self.idle if answered else window)
+        self._await_response(window)
         return self.frame()
 
     def _input_pending(self):
@@ -1754,7 +1789,7 @@ class TerminalSession:
         except (OSError, ValueError):
             return None
 
-    def _await_delivery(self, sent, timeout: float = None) -> bool:
+    def _await_delivery(self, sent, timeout: float = None) -> None:
         """Wait until the program has taken `sent` out of the pty input queue.
 
         This is the one positive signal a terminal can read without the
@@ -1763,21 +1798,27 @@ class TerminalSession:
         and still has not read after `timeout` raises: a TUI that has stopped
         reading its input is a finding, not a frame.
 
-        Returns whether the program answered in the same breath as it read —
-        the waiting has to keep draining the pty (a full buffer would block the
-        program in the middle of its repaint), so a prompt repaint is picked up
-        here rather than by the caller's response wait.
+        Delivery says nothing about the answer, and this barrier deliberately
+        reports nothing about it. What it does do is clear the pty of output
+        that *cannot* be the answer: everything readable while the keys are
+        still queued was written before the program took them. Consuming it
+        here keeps a program that is slow to read from blocking on a full
+        output buffer, and keeps the response wait from mistaking it for the
+        repaint. The instant the queue is empty the pty is left alone, so
+        whatever the program writes next is still there for `_await_response`
+        to find — which is what keeps a prompt program cheap without a flag
+        guessing at causality.
         """
         timeout = self.timeout if timeout is None else timeout
         deadline = time.monotonic() + timeout
-        answered = False
         while True:
             pending = self._input_pending()
             if not pending:
-                return answered
+                return
             if not self.is_running:
-                return answered
-            if time.monotonic() >= deadline:
+                return
+            now = time.monotonic()
+            if now >= deadline:
                 raise AssertionError(
                     self.frame()._message(
                         "the program has not read the %d byte(s) sent to it (%r) "
@@ -1785,9 +1826,40 @@ class TerminalSession:
                         % (pending, sent, timeout)
                     )
                 )
-            # Only the last slice can hold the answer: while bytes were still
-            # queued the program had not read the keys yet.
-            answered = self._drain(settle=0.005, idle=0.005, timeout=0.05)
+            self._consume_while_queued(min(_DELIVERY_POLL, deadline - now))
+
+    def _consume_while_queued(self, budget: float) -> bool:
+        """Read output that the program wrote before it read the keys.
+
+        The queue is checked again immediately before the read, because the
+        program may have taken the keys while this call sat in `select`: bytes
+        that become readable once the queue is empty are left in the pty rather
+        than swallowed, since they may be the answer and the response wait is
+        where that is decided.
+
+        The ordering is what makes the exclusion sound rather than a guess. If
+        the input queue is non-empty at the moment output becomes readable, the
+        program has not taken the keys yet, so that output was written before
+        the read and cannot be a response to it.
+        """
+        if self.master_fd is None:
+            return False
+        try:
+            ready, _, _ = select.select([self.master_fd], [], [], max(budget, 0.0))
+        except (OSError, ValueError, TypeError):
+            return False
+        if not ready or not self._input_pending():
+            return False
+        try:
+            data = os.read(self.master_fd, 65536)
+        except BlockingIOError:
+            return False
+        except OSError:
+            return False
+        if not data:
+            return False
+        self.screen.feed(data)
+        return True
 
     def _await_response(self, window: float) -> bool:
         """Wait for the program's answer to something it has just been sent.
@@ -1810,10 +1882,34 @@ class TerminalSession:
             if time.monotonic() >= deadline:
                 return False
 
-    def wait_for(self, needle: str, timeout: float = None, regex: bool = False) -> Frame:
-        """Wait until the screen shows `needle`; return that frame.
+    def _await_paint_end(self, window: float = None) -> Frame:
+        """Read until the program stops writing; return the finished frame.
 
-        Fails with the last frame in the message if it never appears.
+        The same bounded positive wait as `_await_response`, run to the *end* of
+        a repaint instead of the start of it: read until the program has been
+        quiet for `paint`, which is what "it has finished the screen" reduces to
+        for a terminal. A pause shorter than that counts as part of the same
+        screen; `redraw` caps the whole wait, so a program that never stops
+        writing cannot hang the capture — it only makes the frame the last
+        thing this could see, which is the best a terminal can do for a screen
+        that never settles.
+        """
+        self._drain(settle=self.paint, idle=self.paint,
+                    timeout=self.redraw if window is None else window)
+        return self.frame()
+
+    def wait_for(self, needle: str, timeout: float = None, regex: bool = False) -> Frame:
+        """Wait until the screen shows `needle`; return the frame it finished.
+
+        The needle triggers the capture; it is not the capture. A program paints
+        a screen in pieces, so the instant the needle's own cells land the rest
+        of the screen may still be the previous frame — and text that survives
+        the repaint (a pane heading) is on screen before the program has drawn
+        anything at all. So once the needle is there the wait continues until
+        the program has stopped writing, and the frame returned is the one it
+        finished. See `_await_paint_end`.
+
+        Fails with the last frame in the message if the needle never appears.
         """
         timeout = self.timeout if timeout is None else timeout
         deadline = time.monotonic() + timeout
@@ -1822,7 +1918,7 @@ class TerminalSession:
             frame = self.frame()
             found = frame.search(needle) is not None if rx else frame.contains(needle)
             if found:
-                return frame
+                return self._await_paint_end()
             if time.monotonic() >= deadline:
                 raise AssertionError(
                     frame._message(
