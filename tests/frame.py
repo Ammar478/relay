@@ -117,9 +117,25 @@ that the sequences mutate, so the captured text is what a human would see:
 cursor addressing (CUP/HVP, CUU/CUD/CUF/CUB, CHA/VPA, CNL/CPL), erases (ED, EL,
 ECH), insert/delete of lines and characters (IL/DL, ICH/DCH, IRM), scroll
 regions (DECSTBM) and scrolling (IND, RI, NEL, SU/SD), repeat (REP), tab stops,
-the alternate screen (`?1049`), autowrap (`?7`), save/restore cursor and UTF-8
-decoding across read boundaries. Escape bytes never reach the text: frames carry
-what a human would see, never the sequences that put it there.
+the alternate screen (`?1049`), autowrap (`?7`), save/restore cursor, the
+alternate character set and UTF-8 decoding across read boundaries. Escape bytes
+never reach the text: frames carry what a human would see, never the sequences
+that put it there.
+
+That includes the box drawing. `curses.border()` on `xterm-256color` does not
+send `┌` and `│`; it sends `ESC ( 0`, then the letters `l q k x m j`, then
+`ESC ( B`. The emulator keeps G0-G3 and the DEC Special Graphics table (SO/SI
+included), so a border arrives as a border. An emulator that dropped the
+designation would report `lqqqk` — and then `assert_contains("│")` could never
+pass, `assert_not_contains` would trip over the injected runs, and every frame
+written to `.relay/evidence/` would be a wrong artefact.
+
+No sequence can wedge the emulator either. A count is clamped to the screen
+wherever one is looped or allocated over — a scroll of 200 million and a scroll
+of 24 leave the same screen — because `feed()` runs inside a drain that checks
+its deadline only *between* reads, so one twelve-byte sequence would otherwise
+hang the harness with no exception and no timeout. A hung judge is
+indistinguishable from a slow one.
 
 Known limits, on purpose: no scrollback (only the visible screen), no origin
 mode (`?6`), and no reply to cursor-position queries.
@@ -138,6 +154,13 @@ normalised, because a judge asserts "this was drawn with SGR 32 and bold", not
     frame.attrs_for("FAILED")       # that run's CellAttrs
     frame.assert_attrs("FAILED", fg=31, has="bold")
     frame.assert_attrs_differ("FAILED", "PASSED")
+
+None of those can pass vacuously. `assert_attrs` refuses a call with nothing to
+assert and a flag name that is not a flag (`lacks="bolt"` used to pass on any
+styling at all), and `run_with` refuses a needle that was drawn two different
+ways in two places rather than answering for the first one it finds — name a
+`row` to say which copy is meant. Frames compare on text *and* attributes, so
+`after != before` still sees a status that went from green to red.
 
 `CellAttrs.fg` / `.bg` are parameter tuples — `(32,)`, `(38, 5, 214)`,
 `(38, 2, r, g, b)` — or `None` for the terminal default. `.flags` is a frozenset
@@ -183,10 +206,23 @@ Catching content that is too wide
 
 A real terminal wraps an over-long line onto the next row, so no row is ever
 wider than the terminal — a naive "is any line > cols" check can never fail. The
-emulator therefore records which rows *continued* onto the next one.
-`Frame.overlong_lines()` returns `(row, width)` for each such logical line and
+emulator therefore records, as it draws, what ran past the right margin on each
+row: the width at which the row *continued* onto the next one, and the cells
+destroyed at the margin when autowrap was off. `Frame.overlong_lines()` returns
+`(row, width)` per logical line from those records — never recomputed from the
+current size, so a resize can neither drop a violation nor inflate a width into
+a number that was never on the screen.
+
 `Frame.assert_within_width()` fails with the offending rows and the whole frame
-in the message. A line that exactly fills the width is not a violation.
+in the message. A line that exactly fills the width is not a violation, but it
+is not a pass either: ncurses clips at the window edge and cursor-addresses
+every row rather than letting the terminal wrap, so on a curses screen there is
+nothing to read and the helper would be incapable of failing. It therefore
+refuses to certify a frame with a row at the last column — nothing a terminal
+can observe tells an exact fit from content truncated to fit — and the caller
+says which it is with `assert_within_width(allow_full_width=True)`. Also note
+that `contains` / `assert_not_contains` see a needle the terminal broke across
+two rows; a line-by-line search does not.
 """
 
 from __future__ import annotations
@@ -210,6 +246,7 @@ __all__ = [
     "AttrRun",
     "CellAttrs",
     "Frame",
+    "RowOverflow",
     "Screen",
     "TerminalSession",
     "display_width",
@@ -220,6 +257,48 @@ __all__ = [
 DEFAULT_ROWS = 24
 DEFAULT_COLS = 80
 DEFAULT_TERM = "xterm-256color"
+
+# The DEC Special Graphics set: what `ESC ( 0` turns the ASCII range 0x5F-0x7E
+# into until `ESC ( B` turns it back. ncurses draws every box, rule and arrow
+# through this set — `curses.border()` on xterm-256color sends the letters
+# `l q k x m j` between the two designations — so an emulator that drops the
+# designation renders "lqqqk" where the terminal shows "┌───┐", and every
+# assertion about a pane border in every frame it captures is wrong.
+_DEC_SPECIAL_GRAPHICS = {
+    "_": " ", "`": "◆", "a": "▒", "b": "␉", "c": "␌", "d": "␍", "e": "␊",
+    "f": "°", "g": "±", "h": "␤", "i": "␋", "j": "┘", "k": "┐", "l": "┌",
+    "m": "└", "n": "┼", "o": "⎺", "p": "⎻", "q": "─", "r": "⎼", "s": "⎽",
+    "t": "├", "u": "┤", "v": "┴", "w": "┬", "x": "│", "y": "≤", "z": "≥",
+    "{": "π", "|": "≠", "}": "£", "~": "·",
+}
+
+# Which slot `ESC (`, `ESC )`, `ESC *`, `ESC +` (94-character sets) and
+# `ESC -`, `ESC .`, `ESC /` (96-character sets) designate into.
+_CHARSET_SLOTS = {
+    "(": "G0", ")": "G1", "*": "G2", "+": "G3",
+    "-": "G1", ".": "G2", "/": "G3",
+}
+
+# A CSI parameter is clamped on the way in for one reason only: CPython
+# refuses to build an int from more than 4300 digits, so a long enough digit
+# run raises inside `feed()` instead of drawing anything. The cap is still far
+# larger than any grid, so it decides nothing on its own — every routine that
+# loops or allocates over a count clamps it to the screen as well.
+_MAX_PARAM = 9_999_999
+_MAX_PARAM_DIGITS = 7
+
+
+def _param(text):
+    """One CSI parameter as a number, or None when it is not one.
+
+    Seven digits or fewer is at most `_MAX_PARAM`, so the length guard is the
+    whole cap: nothing else here decides anything.
+    """
+    if not text.isdigit():
+        return None
+    if len(text) > _MAX_PARAM_DIGITS:
+        return _MAX_PARAM
+    return int(text)
 
 
 # ---------------------------------------------------------------------------
@@ -326,6 +405,23 @@ class CellAttrs(NamedTuple):
 DEFAULT_ATTRS = CellAttrs()
 
 
+class RowOverflow(NamedTuple):
+    """What ran past the right margin on one row, and how.
+
+    `continued` is the width at which the row wrapped onto the next one, kept
+    as a width rather than a flag so that a later resize cannot rescale it
+    into a number that was never on the screen. `lost` counts the cells
+    destroyed at the right margin because autowrap was off: content the
+    program drew and the screen never showed.
+    """
+
+    continued: int = 0
+    lost: int = 0
+
+
+_NO_OVERFLOW = RowOverflow()
+
+
 class AttrRun(NamedTuple):
     """A stretch of one row drawn with identical attributes.
 
@@ -409,9 +505,7 @@ def _apply_sgr(attrs: CellAttrs, raw: str) -> CellAttrs:
     """
     tokens = []
     for chunk in raw.split(";"):
-        tokens.append(
-            tuple(int(part) if part.isdigit() else None for part in chunk.split(":"))
-        )
+        tokens.append(tuple(_param(part) for part in chunk.split(":")))
     fg, bg = attrs.fg, attrs.bg
     flags = set(attrs.flags)
     other = set(attrs.other)
@@ -466,8 +560,28 @@ def _as_colour(value):
     return tuple(value)
 
 
-def _as_flags(value):
-    return (value,) if isinstance(value, str) else tuple(value)
+_KNOWN_FLAGS = frozenset(_SGR_ON.values())
+
+
+def _as_flags(value, where="assert_attrs()"):
+    """Normalise `has`/`lacks` and refuse a name that is not a flag.
+
+    A misspelt name used to be checked against a set that could never contain
+    it, so `lacks="bolt"` passed on any styling whatever — an assertion that
+    cannot fail is a check that reports success.
+    """
+    names = (value,) if isinstance(value, str) else tuple(value)
+    unknown = [name for name in names if name not in _KNOWN_FLAGS]
+    if unknown:
+        raise ValueError(
+            "%s: %s is not an attribute flag. The flags are: %s"
+            % (
+                where,
+                ", ".join(repr(name) for name in unknown),
+                ", ".join(sorted(_KNOWN_FLAGS)),
+            )
+        )
+    return names
 
 
 _UNSET = object()
@@ -489,13 +603,23 @@ class Frame:
     """
 
     def __init__(self, lines, rows=None, cols=None, wrapped=(), label=None,
-                 attrs=None, cells=None):
+                 attrs=None, cells=None, overflow=None):
         self.lines = [line.rstrip() for line in lines]
         self.rows = rows if rows is not None else len(self.lines)
         self.cols = cols if cols is not None else max(
             [display_width(line) for line in self.lines] or [0]
         )
-        self.wrapped = frozenset(wrapped)
+        if overflow is not None:
+            self.overflow = list(overflow)
+            self.wrapped = frozenset(
+                row for row, record in enumerate(self.overflow) if record.continued
+            )
+        else:
+            self.wrapped = frozenset(wrapped)
+            self.overflow = [
+                RowOverflow(self.cols if row in self.wrapped else 0)
+                for row in range(len(self.lines))
+            ]
         self.label = label
         # Taken as given: Screen.frame() hands over fresh copies.
         self.attrs = attrs
@@ -526,8 +650,15 @@ class Frame:
         return "<Frame %dx%d%s>" % (self.rows, self.cols, label)
 
     def __eq__(self, other):
+        """Text *and* attributes.
+
+        `after != before` is how "the screen changed" is asserted, and a
+        colour-only change — a status that went from green to red without
+        moving a character — is exactly the change a text-only comparison
+        reports as no change at all.
+        """
         if isinstance(other, Frame):
-            return self.lines == other.lines
+            return self.lines == other.lines and self.attrs == other.attrs
         return NotImplemented
 
     # -- searching -------------------------------------------------------
@@ -543,8 +674,37 @@ class Frame:
         """Indices of every line containing `needle`."""
         return [i for i, line in enumerate(self.lines) if needle in line]
 
+    def logical_lines(self):
+        """`(row, text)` per logical line, wrapped runs joined back together.
+
+        A row the terminal broke onto the next carries the rest of its text on
+        that next row, so a search line by line cannot see a needle that
+        straddles the break. Rows that merely sit next to each other are never
+        joined: joining those would invent text nobody wrote.
+        """
+        joined = []
+        raw = self.raw_lines
+        row = 0
+        while row < len(self.lines):
+            start = row
+            text = ""
+            while row in self.wrapped and row < len(self.lines) - 1:
+                text += raw[row]
+                row += 1
+            joined.append((start, text + self.lines[row]))
+            row += 1
+        return joined
+
+    def _logical_find(self, needle: str):
+        """The row a logical occurrence of `needle` starts on, or None."""
+        for start, text in self.logical_lines():
+            if needle in text:
+                return start
+        return None
+
     def contains(self, needle: str) -> bool:
-        return self.find(needle) is not None
+        """Whether the text is on the screen, wrapped onto two rows or not."""
+        return self._logical_find(needle) is not None
 
     def line_with(self, needle: str) -> str:
         """The first line containing `needle`. Fails loudly if there is none."""
@@ -632,34 +792,86 @@ class Frame:
     def run_with(self, needle: str, row: int = None) -> AttrRun:
         """The single run that `needle` was drawn in.
 
-        Fails loudly if the text is not there, or if it straddles two runs —
-        which is itself a finding: it means the substring was not drawn in one
-        style.
+        Fails loudly if the text is not there; if it straddles two runs —
+        itself a finding, since it means the substring was not drawn in one
+        style; or if it appears more than once and the copies were *not* drawn
+        alike, because then there is no single answer to give. Looking only at
+        the first copy is how a green STATUS on one row certified a red one on
+        another. Name a `row` to say which copy is meant; copies that agree
+        need no naming.
         """
         self._require_attrs()
         if not needle:
             raise ValueError("run_with() needs a non-empty substring")
-        if row is None:
-            row = self.find(needle)
-            if row is None:
+        if row is not None:
+            if not 0 <= row < len(self.attrs):
+                raise AssertionError(
+                    self._message(
+                        "no row %d in a %dx%d frame" % (row, self.rows, self.cols)
+                    )
+                )
+            candidates = [row]
+        else:
+            candidates = self.find_all(needle)
+            if not candidates:
+                if self._logical_find(needle) is not None:
+                    raise AssertionError(
+                        self._message(
+                            "%r is on the screen but the terminal wrapped it "
+                            "across two rows, so it was not drawn as one run"
+                            % needle
+                        )
+                    )
                 raise AssertionError(self._message("no line contains %r" % needle))
-        if not 0 <= row < len(self.attrs):
+        runs = []
+        for index in candidates:
+            runs.extend(self._runs_with(index, needle))
+        if not runs:
             raise AssertionError(
-                self._message("no row %d in a %dx%d frame" % (row, self.rows, self.cols))
+                self._message("row %d does not contain %r" % (candidates[0], needle))
             )
+        if len({run.attrs for run in runs}) > 1:
+            raise AssertionError(
+                self._attr_message(
+                    "%r is drawn %d different ways and no row was named: %s"
+                    % (
+                        needle,
+                        len({run.attrs for run in runs}),
+                        "; ".join(
+                            "row %d col %d %s"
+                            % (run.row, run.start, run.attrs.describe())
+                            for run in runs
+                        ),
+                    ),
+                    runs[0].row,
+                )
+            )
+        return runs[0]
+
+    def _runs_with(self, row: int, needle: str):
+        """The run each occurrence of `needle` on `row` was drawn in."""
         cells = self._cell_row(row)
         joined = "".join(cells)
-        position = joined.find(needle)
-        if position < 0:
-            raise AssertionError(
-                self._message("row %d does not contain %r" % (row, needle))
-            )
         # a cell holds one character or, for the second half of a wide one,
         # nothing at all — so this maps string offsets back to grid columns
         columns = [col for col, cell in enumerate(cells) for _ in cell]
-        first = columns[position]
-        last = columns[position + len(needle) - 1]
         runs = self.attr_runs(row, trim=False)
+        found = []
+        position = joined.find(needle)
+        while position >= 0:
+            found.append(
+                self._run_covering(
+                    row,
+                    columns[position],
+                    columns[position + len(needle) - 1],
+                    needle,
+                    runs,
+                )
+            )
+            position = joined.find(needle, position + 1)
+        return found
+
+    def _run_covering(self, row: int, first: int, last: int, needle: str, runs):
         for run in runs:
             if run.start <= first and last < run.end:
                 return run
@@ -689,8 +901,17 @@ class Frame:
 
         `fg`/`bg` take a parameter tuple or the bare int (`31` == `(31,)`), and
         `None` means the terminal default. `has`/`lacks` take a flag name or a
-        list of them.
+        list of them. At least one of the four is required — without one this
+        passed on any styling at all — and a name that is not a flag is
+        refused rather than quietly never matched.
         """
+        if fg is _UNSET and bg is _UNSET and not has and not lacks:
+            raise ValueError(
+                "assert_attrs(%r) has nothing to assert: give at least one of "
+                "fg, bg, has, lacks, or it passes on any styling at all" % needle
+            )
+        wanted = _as_flags(has, "assert_attrs(has=)")
+        unwanted = _as_flags(lacks, "assert_attrs(lacks=)")
         run = self.run_with(needle, row=row)
         actual = run.attrs
         problems = []
@@ -698,10 +919,10 @@ class Frame:
             problems.append("foreground is %r, expected %r" % (actual.fg, _as_colour(fg)))
         if bg is not _UNSET and actual.bg != _as_colour(bg):
             problems.append("background is %r, expected %r" % (actual.bg, _as_colour(bg)))
-        for flag in _as_flags(has):
+        for flag in wanted:
             if flag not in actual.flags:
                 problems.append("%s is not set" % flag)
-        for flag in _as_flags(lacks):
+        for flag in unwanted:
             if flag in actual.flags:
                 problems.append("%s is set" % flag)
         if problems:
@@ -737,7 +958,12 @@ class Frame:
         return self
 
     def assert_not_contains(self, needle: str, message: str = None):
-        index = self.find(needle)
+        """Fail if the text is on the screen — including across a wrap.
+
+        A line-by-line search cannot see a needle the terminal broke over two
+        rows, so on a narrow screen showing FAILED this used to pass.
+        """
+        index = self._logical_find(needle)
         if index is not None:
             raise AssertionError(
                 self._message(
@@ -747,31 +973,79 @@ class Frame:
             )
         return self
 
+    def _overflow_at(self, row: int) -> RowOverflow:
+        if 0 <= row < len(self.overflow):
+            return self.overflow[row]
+        return _NO_OVERFLOW
+
     def overlong_lines(self):
         """`(row, width)` for every logical line wider than the terminal.
 
-        A row that wrapped onto the next row is reported with the total width of
-        the whole wrapped run. A row that exactly fills the width is not a
-        violation.
+        Two things put a row here, and the emulator records both as they
+        happen rather than inferring them from the screen afterwards:
+
+        * the row wrapped onto the next one — the width reported is the sum of
+          the widths those rows were *drawn* at, never a width recomputed from
+          the current size, which is how a resize used to report 360 cells of
+          content that were only ever 200;
+        * cells were destroyed at the right margin because autowrap was off —
+          the width reported is what the program drew, including what the
+          screen never showed.
+
+        A row that exactly fills the width is not a violation; see
+        `assert_within_width` for what a terminal cannot tell about those.
         """
         violations = []
         row = 0
         while row < len(self.lines):
-            if row in self.wrapped:
+            record = self._overflow_at(row)
+            if record.continued:
                 start = row
-                while row in self.wrapped and row < len(self.lines) - 1:
+                width = 0
+                while self._overflow_at(row).continued and row < len(self.lines) - 1:
+                    width += self._overflow_at(row).continued
                     row += 1
-                width = (row - start) * self.cols + display_width(self.lines[row])
+                width += display_width(self.lines[row]) + self._overflow_at(row).lost
                 violations.append((start, width))
             else:
-                width = display_width(self.lines[row])
+                width = display_width(self.lines[row]) + record.lost
                 if width > self.cols:
                     violations.append((row, width))
             row += 1
         return violations
 
-    def assert_within_width(self):
-        """Fail if any line is wider than the terminal."""
+    def full_width_rows(self):
+        """Rows whose content reaches the last column.
+
+        Nothing a terminal can observe tells one of these from a row some
+        program truncated to make it fit: both arrive as `cols` cells of text
+        and a cursor address for the next row.
+        """
+        rows = []
+        for row, line in enumerate(self.lines):
+            if row in self.wrapped:
+                continue
+            if self.cells is not None and self.cols and row < len(self.cells):
+                occupied = self.cells[row][self.cols - 1] != _BLANK
+            else:
+                occupied = display_width(line) >= self.cols
+            if occupied:
+                rows.append(row)
+        return rows
+
+    def assert_within_width(self, allow_full_width: bool = False):
+        """Fail if any line is wider than the terminal.
+
+        A row that reaches the last column is *refused*, not passed. ncurses
+        clips at the window edge and cursor-addresses every row rather than
+        letting the terminal wrap, so on a curses screen there are no wrap
+        flags to read and this helper would otherwise be incapable of failing
+        — a check that always reports success. What the terminal can say is
+        which rows run to the margin; whether that is an exact fit or content
+        cut off to make it fit is the caller's to state, with
+        `allow_full_width=True` (and then the pass means "nothing wrapped and
+        nothing was destroyed at the margin", which is all it ever meant).
+        """
         violations = self.overlong_lines()
         if violations:
             detail = ", ".join(
@@ -783,6 +1057,23 @@ class Frame:
                     % (self.cols, detail)
                 )
             )
+        if not allow_full_width:
+            full = self.full_width_rows()
+            if full:
+                raise AssertionError(
+                    self._message(
+                        "cannot certify this frame: %s of %d run to the last "
+                        "column, and a terminal cannot tell content that "
+                        "fitted exactly from content truncated to fit — "
+                        "ncurses clips at the window edge instead of wrapping. "
+                        "Assert on what those rows should say, or pass "
+                        "allow_full_width=True if a full-width row is intended."
+                        % (
+                            ", ".join("row %d" % row for row in full),
+                            self.cols,
+                        )
+                    )
+                )
         return self
 
     # -- evidence --------------------------------------------------------
@@ -846,7 +1137,7 @@ class Screen:
         self._attrs = DEFAULT_ATTRS
         self._grid = [self._blank_row() for _ in range(self.rows)]
         self._attr_grid = [self._blank_attr_row() for _ in range(self.rows)]
-        self._wrapped = [False] * self.rows
+        self._overflow = [_NO_OVERFLOW] * self.rows
         self.cursor_row = 0
         self.cursor_col = 0
         self._pending_wrap = False
@@ -862,6 +1153,12 @@ class Screen:
         self._saved_screen = None
         self._last_char = " "
         self._tabs = set(range(8, self.cols, 8))
+        # G0..G3 hold the designated character sets; GL says which one the
+        # printable range is currently taken from. "B" is ASCII, "0" is DEC
+        # Special Graphics. SO/SI switch GL, ESC ( ) * + designate.
+        self._charsets = {"G0": "B", "G1": "B", "G2": "B", "G3": "B"}
+        self._gl = "G0"
+        self._charset_slot = None
         self._state = "ground"
         self._csi = ""
         self._string_esc = False
@@ -885,18 +1182,22 @@ class Screen:
         """Resize the grid, keeping the top-left content."""
         grid = [self._blank_row_of(cols) for _ in range(rows)]
         attr_grid = [[DEFAULT_ATTRS] * cols for _ in range(rows)]
-        wrapped = [False] * rows
+        # A row that overflowed still overflowed: the record says at which
+        # width, so keeping it is neither a rescale nor a loss. Dropping it
+        # when narrowing manufactured a clean bill of health for a screen that
+        # had one, and keeping a bare flag while widening reported a width
+        # that was never on the screen.
+        overflow = [_NO_OVERFLOW] * rows
         for r in range(min(rows, self.rows)):
             for c in range(min(cols, self.cols)):
                 grid[r][c] = self._grid[r][c]
                 attr_grid[r][c] = self._attr_grid[r][c]
-            if cols >= self.cols:
-                wrapped[r] = self._wrapped[r]
+            overflow[r] = self._overflow[r]
         self.rows = rows
         self.cols = cols
         self._grid = grid
         self._attr_grid = attr_grid
-        self._wrapped = wrapped
+        self._overflow = overflow
         self.scroll_top = 0
         self.scroll_bottom = rows - 1
         self.cursor_row = min(self.cursor_row, rows - 1)
@@ -924,12 +1225,12 @@ class Screen:
 
     @classmethod
     def _fit_saved_screen(cls, saved, rows, cols):
-        """A saved (grid, attrs, wrapped, cursor) tuple reshaped to a new size."""
-        grid, attr_grid, wrapped, row, col = saved
+        """A saved (grid, attrs, overflow, cursor) tuple reshaped to a size."""
+        grid, attr_grid, overflow, row, col = saved
         return (
             cls._fit_plane(grid, rows, cols, _BLANK),
             cls._fit_plane(attr_grid, rows, cols, DEFAULT_ATTRS),
-            (list(wrapped) + [False] * rows)[:rows],
+            (list(overflow) + [_NO_OVERFLOW] * rows)[:rows],
             min(row, rows - 1),
             min(col, cols - 1),
         )
@@ -950,7 +1251,11 @@ class Screen:
 
     def wrapped_rows(self):
         """Rows whose content continued onto the following row."""
-        return [i for i, flag in enumerate(self._wrapped) if flag]
+        return [i for i, record in enumerate(self._overflow) if record.continued]
+
+    def overflow(self):
+        """What ran past the right margin, row by row."""
+        return self._overflow[:]
 
     def frame(self, label: str = None) -> Frame:
         return Frame(
@@ -961,6 +1266,7 @@ class Screen:
             label=label,
             attrs=self.attrs(),
             cells=self.cells(),
+            overflow=self.overflow(),
         )
 
     # -- input -----------------------------------------------------------
@@ -983,7 +1289,7 @@ class Screen:
         elif state == "string":
             self._string_char(ch)
         elif state == "charset":
-            self._state = "ground"
+            self._charset(ch)
 
     # -- ground ----------------------------------------------------------
 
@@ -1004,7 +1310,11 @@ class Screen:
                 self.cursor_col -= 1
         elif code == 0x09:
             self._tab()
-        elif code in (0x07, 0x00, 0x0E, 0x0F):
+        elif code == 0x0E:
+            self._gl = "G1"          # shift out
+        elif code == 0x0F:
+            self._gl = "G0"          # shift in
+        elif code in (0x07, 0x00):
             pass
         elif code < 0x20:
             pass
@@ -1016,24 +1326,45 @@ class Screen:
         self.cursor_col = stops[0] if stops else self.cols - 1
         self._pending_wrap = False
 
+    def _translate(self, ch):
+        """One character as the *designated* set draws it.
+
+        Idempotent: a glyph the table produced is not in the table's keys, so
+        REP repeating `_last_char` repeats the glyph rather than re-mapping.
+        """
+        if self._charsets[self._gl] != "0":
+            return ch
+        return _DEC_SPECIAL_GRAPHICS.get(ch, ch)
+
     def _put(self, ch):
+        ch = self._translate(ch)
         width = _char_width(ch)
         if width == 0:
             return
+        overflowed = False
         if self._pending_wrap:
             if self.autowrap:
-                self._wrapped[self.cursor_row] = True
-                self._index()
-                self.cursor_col = 0
+                self._record_wrap()
+            else:
+                # autowrap off: a real terminal overwrites the last cell, so
+                # this character is drawn and the one under it is destroyed.
+                # Nothing on the screen shows that afterwards, so it is
+                # recorded here or it is lost silently.
+                self._record_margin_loss(width)
+                overflowed = True
             self._pending_wrap = False
         if width == 2 and self.cursor_col == self.cols - 1:
             # a wide character cannot straddle the right margin
             if self.autowrap:
-                self._wrapped[self.cursor_row] = True
-                self._index()
-                self.cursor_col = 0
+                self._record_wrap()
             else:
+                if not overflowed:
+                    self._record_margin_loss(width)   # once, not once per test
                 return
+        if not overflowed:
+            # this row is being written, so any overflow recorded for it
+            # described content that is no longer there
+            self._overflow[self.cursor_row] = _NO_OVERFLOW
         row = self._grid[self.cursor_row]
         attr_row = self._attr_grid[self.cursor_row]
         if self.insert_mode:
@@ -1066,7 +1397,8 @@ class Screen:
         elif ch in "]P^_X":
             self._string_esc = False
             self._state = "string"
-        elif ch in "()*+-./":
+        elif ch in _CHARSET_SLOTS:
+            self._charset_slot = _CHARSET_SLOTS[ch]
             self._state = "charset"
         elif ch == "7":
             self._save_cursor()
@@ -1088,6 +1420,19 @@ class Screen:
         elif ch == ">":
             self.application_keypad = False
         # anything else: a one-character escape we do not need
+
+    def _charset(self, ch):
+        """The character after `ESC ( ` designates a set into that slot.
+
+        "0" is DEC Special Graphics — the box-drawing set every curses border
+        is drawn with; anything else (ASCII is "B") draws the characters
+        themselves.
+        """
+        self._state = "ground"
+        slot = self._charset_slot
+        self._charset_slot = None
+        if slot is not None:
+            self._charsets[slot] = ch
 
     def _string_char(self, ch):
         # OSC / DCS / APC / PM: runs until BEL or ST (ESC \)
@@ -1129,8 +1474,7 @@ class Screen:
             return
         params = []
         for chunk in raw.split(";"):
-            chunk = chunk.split(":")[0]
-            params.append(int(chunk) if chunk.isdigit() else None)
+            params.append(_param(chunk.split(":")[0]))
         if not params:
             params = [None]
 
@@ -1191,7 +1535,7 @@ class Screen:
         elif final == "T":
             self._scroll_down(p(0))
         elif final == "b":
-            for _ in range(p(0)):
+            for _ in range(self._clamp_repeat(p(0))):
                 self._put(self._last_char)
         elif final == "g":
             if p(0, 0) == 3:
@@ -1237,13 +1581,13 @@ class Screen:
             self._saved_screen = (
                 [row[:] for row in self._grid],
                 [row[:] for row in self._attr_grid],
-                self._wrapped[:],
+                self._overflow[:],
                 self.cursor_row,
                 self.cursor_col,
             )
             self._grid = [self._blank_row() for _ in range(self.rows)]
             self._attr_grid = [self._blank_attr_row() for _ in range(self.rows)]
-            self._wrapped = [False] * self.rows
+            self._overflow = [_NO_OVERFLOW] * self.rows
             self.in_alt_screen = True
         else:
             if not self.in_alt_screen:
@@ -1251,18 +1595,33 @@ class Screen:
             self.in_alt_screen = False
             if self._saved_screen is None:
                 return
-            grid, attr_grid, wrapped, row, col = self._fit_saved_screen(
+            grid, attr_grid, overflow, row, col = self._fit_saved_screen(
                 self._saved_screen, self.rows, self.cols
             )
             self._saved_screen = None
             self._grid = grid
             self._attr_grid = attr_grid
-            self._wrapped = wrapped
+            self._overflow = overflow
             if save_cursor:
                 self.cursor_row = self._clamp_row(row)
                 self.cursor_col = self._clamp_col(col)
 
     # -- cursor / scrolling ----------------------------------------------
+
+    def _clamp_repeat(self, count):
+        """A repeat count reduced to one that leaves the identical screen.
+
+        Once every cell holds the same character, each further `cols` repeats
+        put the screen and the cursor back exactly where they were: the rows
+        that scroll away are indistinguishable from the rows that replace
+        them. Writing the screen twice over reaches that state from any
+        starting cursor position, so anything past it is taken modulo the
+        width — the clamp is an equivalence, not an approximation.
+        """
+        settled = 2 * self.rows * self.cols
+        if count <= settled or self.cols <= 0:
+            return count
+        return settled + (count - settled) % self.cols
 
     def _clamp_row(self, row):
         return max(0, min(self.rows - 1, row))
@@ -1307,23 +1666,50 @@ class Screen:
         elif self.cursor_row > 0:
             self.cursor_row -= 1
 
+    def _region_height(self):
+        return self.scroll_bottom - self.scroll_top + 1
+
     def _scroll_up(self, count):
-        for _ in range(count):
+        # Scrolling the region away twice leaves the same blank region as
+        # scrolling it away once, so a count past the region height is the
+        # same screen — and a count of two hundred million is a hung harness,
+        # because feed() runs inside a drain that only checks its deadline
+        # between reads.
+        for _ in range(min(count, self._region_height())):
             del self._grid[self.scroll_top]
             del self._attr_grid[self.scroll_top]
-            del self._wrapped[self.scroll_top]
+            del self._overflow[self.scroll_top]
             self._grid.insert(self.scroll_bottom, self._blank_row())
             self._attr_grid.insert(self.scroll_bottom, self._blank_attr_row())
-            self._wrapped.insert(self.scroll_bottom, False)
+            self._overflow.insert(self.scroll_bottom, _NO_OVERFLOW)
 
     def _scroll_down(self, count):
-        for _ in range(count):
+        for _ in range(min(count, self._region_height())):
             del self._grid[self.scroll_bottom]
             del self._attr_grid[self.scroll_bottom]
-            del self._wrapped[self.scroll_bottom]
+            del self._overflow[self.scroll_bottom]
             self._grid.insert(self.scroll_top, self._blank_row())
             self._attr_grid.insert(self.scroll_top, self._blank_attr_row())
-            self._wrapped.insert(self.scroll_top, False)
+            self._overflow.insert(self.scroll_top, _NO_OVERFLOW)
+
+    def _record_wrap(self):
+        """The cursor ran off the right margin and the row continued below."""
+        self._overflow[self.cursor_row] = RowOverflow(
+            continued=self.cols, lost=self._overflow[self.cursor_row].lost
+        )
+        self._index()
+        self.cursor_col = 0
+
+    def _record_margin_loss(self, width=1):
+        """Content the right margin swallowed because autowrap was off.
+
+        Counted in cells, so a wide character that cannot fit costs two: the
+        row is that much wider than the screen ever showed.
+        """
+        record = self._overflow[self.cursor_row]
+        self._overflow[self.cursor_row] = RowOverflow(
+            continued=record.continued, lost=record.lost + width
+        )
 
     # -- erasing / editing -----------------------------------------------
 
@@ -1334,12 +1720,12 @@ class Screen:
             self._grid[row][col] = _BLANK
             self._attr_grid[row][col] = blank_attrs
         if start == 0 and end == self.cols:
-            self._wrapped[row] = False
+            self._overflow[row] = _NO_OVERFLOW
 
     def _erase_display(self, mode):
         if mode == 0:
             self._clear_row(self.cursor_row, self.cursor_col)
-            self._wrapped[self.cursor_row] = False
+            self._overflow[self.cursor_row] = _NO_OVERFLOW
             for row in range(self.cursor_row + 1, self.rows):
                 self._clear_row(row)
         elif mode == 1:
@@ -1354,7 +1740,7 @@ class Screen:
     def _erase_line(self, mode):
         if mode == 0:
             self._clear_row(self.cursor_row, self.cursor_col)
-            self._wrapped[self.cursor_row] = False
+            self._overflow[self.cursor_row] = _NO_OVERFLOW
         elif mode == 1:
             self._clear_row(self.cursor_row, 0, self.cursor_col + 1)
         else:
@@ -1367,26 +1753,28 @@ class Screen:
     def _insert_lines(self, count):
         if not self._in_region():
             return
-        for _ in range(count):
+        # past the foot of the region every further insert only pushes a blank
+        # row out, so the screen stops changing: clamping is equivalent
+        for _ in range(min(count, self.scroll_bottom - self.cursor_row + 1)):
             del self._grid[self.scroll_bottom]
             del self._attr_grid[self.scroll_bottom]
-            del self._wrapped[self.scroll_bottom]
+            del self._overflow[self.scroll_bottom]
             self._grid.insert(self.cursor_row, self._blank_row())
             self._attr_grid.insert(self.cursor_row, self._blank_attr_row())
-            self._wrapped.insert(self.cursor_row, False)
+            self._overflow.insert(self.cursor_row, _NO_OVERFLOW)
         self.cursor_col = 0
         self._pending_wrap = False
 
     def _delete_lines(self, count):
         if not self._in_region():
             return
-        for _ in range(count):
+        for _ in range(min(count, self.scroll_bottom - self.cursor_row + 1)):
             del self._grid[self.cursor_row]
             del self._attr_grid[self.cursor_row]
-            del self._wrapped[self.cursor_row]
+            del self._overflow[self.cursor_row]
             self._grid.insert(self.scroll_bottom, self._blank_row())
             self._attr_grid.insert(self.scroll_bottom, self._blank_attr_row())
-            self._wrapped.insert(self.scroll_bottom, False)
+            self._overflow.insert(self.scroll_bottom, _NO_OVERFLOW)
         self.cursor_col = 0
         self._pending_wrap = False
 
@@ -1395,6 +1783,9 @@ class Screen:
         attr_row = self._attr_grid[self.cursor_row]
         col = self.cursor_col
         keep = self.cols - col
+        # no clamp needed and none pretended: the slice below is empty once
+        # `count` reaches the end of the row, and nothing here is allocated
+        # per count the way `_insert_chars` would be
         row[col:] = (row[col + count:] + [_BLANK] * self.cols)[:keep]
         attr_row[col:] = (
             attr_row[col + count:] + [self._blank_attrs()] * self.cols
@@ -1406,6 +1797,10 @@ class Screen:
         attr_row = self._attr_grid[self.cursor_row]
         col = self.cursor_col
         keep = self.cols - col
+        # inserting more blanks than the row can hold blanks the rest of the
+        # row and nothing else — and building the list first would allocate
+        # once per count
+        count = min(count, keep)
         row[col:] = ([_BLANK] * count + row[col:])[:keep]
         attr_row[col:] = ([self._blank_attrs()] * count + attr_row[col:])[:keep]
         self._pending_wrap = False

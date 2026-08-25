@@ -369,6 +369,90 @@ sys.exit(0)
 '''
 
 
+DEMO_BORDER = r'''
+import curses
+import sys
+
+
+def main(stdscr):
+    curses.curs_set(0)
+    stdscr.keypad(True)
+    stdscr.erase()
+    rows, cols = stdscr.getmaxyx()
+    stdscr.addnstr(0, 0, "BORDER DEMO", cols - 1)
+    win = curses.newwin(5, 20, 1, 2)
+    win.border()
+    win.addnstr(2, 2, "PANE", 16)
+    stdscr.noutrefresh()
+    win.noutrefresh()
+    curses.doupdate()
+    while True:
+        if stdscr.getch() in (ord("q"), ord("Q")):
+            break
+
+
+curses.wrapper(main)
+sys.exit(0)
+'''
+
+# A curses program that draws one row right up to the last column. ncurses
+# cursor-addresses every row instead of letting the terminal wrap, so nothing
+# the terminal can observe distinguishes this from a row ncurses truncated to
+# make it fit.
+DEMO_EDGE = r'''
+import curses
+import sys
+
+
+def main(stdscr):
+    curses.curs_set(0)
+    stdscr.keypad(True)
+    stdscr.erase()
+    rows, cols = stdscr.getmaxyx()
+    stdscr.addnstr(0, 0, "EDGE DEMO", cols - 1)
+    try:
+        stdscr.addnstr(1, 0, "#" * cols, cols)
+    except curses.error:
+        pass          # ncurses complains about the cursor, not the cells
+    stdscr.refresh()
+    while True:
+        if stdscr.getch() in (ord("q"), ord("Q")):
+            break
+
+
+curses.wrapper(main)
+sys.exit(0)
+'''
+
+# Escape sequences whose parameter is far larger than the screen, fed in a
+# *subprocess* with a timeout. Never in-process: an unclamped `_scroll_up`
+# loops once per count inside `feed()`, and a loop of two hundred million
+# cannot be interrupted by the test that started it — a thread you join() does
+# not die (.relay/skills/probing-paths-that-never-return.md). The exit code is
+# the result.
+PROBE_HUGE_COUNTS = r'''
+import resource
+import sys
+
+sys.path.insert(0, sys.argv[1])
+import frame
+
+screen = frame.Screen(rows=24, cols=80)
+screen.feed("filler text")
+for _ in range(3):
+    for final in "STLM@PXb":
+        screen.feed("\x1b[200000000" + final)
+    # a digit run past CPython's int-from-string limit: int() raises rather
+    # than looping, which wedges feed() just as thoroughly
+    screen.feed("\x1b[" + "9" * 5000 + "S")
+    screen.feed("\x1b[" + "9" * 5000 + "m")
+peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+if sys.platform != "darwin":
+    peak *= 1024                 # Linux reports kilobytes, macOS bytes
+print("SURVIVED %d" % peak)
+'''
+
+
 @pytest.fixture
 def program(tmp_path):
     """Write one of the demo programs to disk and return its path."""
@@ -645,6 +729,204 @@ def test_display_width_counts_wide_characters_as_two():
 
 
 # --------------------------------------------------------------------------
+# Screen: the alternate character set
+#
+# `curses.border()` on xterm-256color does not send box-drawing characters. It
+# sends ESC ( 0, then the letters l q k x m j, then ESC ( B. A harness that
+# drops the designation renders the letters, so every pane border in every
+# frame it captures is a lie: `assert_contains("│")` can never pass and
+# `assert_not_contains(<short needle>)` is corrupted by the injected runs.
+# --------------------------------------------------------------------------
+
+
+def test_dec_special_graphics_draws_the_box_characters_it_was_sent():
+    # drop-the-designation renders "lqqk"
+    screen = feed("\x1b(0lqqk\x1b(Bplain")
+    assert screen.lines()[0].rstrip() == "┌──┐plain"
+
+
+def test_the_whole_graphics_table_is_mapped_not_guessed():
+    screen = feed("\x1b(0lqkxmjtuvwn\x1b(B", cols=20)
+    assert screen.lines()[0].rstrip() == "┌─┐│└┘├┤┴┬┼"
+
+
+def test_shift_out_selects_g1_and_shift_in_returns_to_ascii():
+    # SO/SI are single control bytes: ignoring them leaves "xx"
+    screen = feed("\x1b)0\x0ex\x0fx")
+    assert screen.lines()[0].rstrip() == "│x"
+
+
+def test_designating_ascii_again_ends_the_graphics_run():
+    screen = feed("\x1b(0q\x1b(Bq")
+    assert screen.lines()[0].rstrip() == "─q"
+
+
+def test_an_sgr_reset_does_not_end_the_graphics_run():
+    # SGR 0 resets attributes, never the charset: ncurses relies on this
+    screen = feed("\x1b(0\x1b[0mq")
+    assert screen.lines()[0].rstrip() == "─"
+
+
+def test_a_hard_reset_returns_to_ascii():
+    screen = feed("\x1b(0\x1bcq")
+    assert screen.lines()[0].rstrip() == "q"
+
+
+def test_repeat_repeats_the_graphics_glyph_not_the_letter():
+    screen = feed("\x1b(0q\x1b[3b\x1b(B")
+    assert screen.lines()[0].rstrip() == "────"
+
+
+def test_graphics_characters_are_one_cell_wide():
+    screen = feed("\x1b(0" + "q" * 20 + "\x1b(B", rows=3, cols=20)
+    assert screen.lines()[0] == "─" * 20
+    assert screen.wrapped_rows() == []
+
+
+# --------------------------------------------------------------------------
+# Screen: a parameter larger than the screen must not wedge the emulator
+#
+# `feed()` runs inside `_drain`, which checks its deadline only *between*
+# reads. One twelve-byte sequence looping two hundred million times therefore
+# hangs the harness with no exception and no timeout, and a hung judge is
+# indistinguishable from a slow one.
+# --------------------------------------------------------------------------
+
+
+def test_a_huge_escape_parameter_cannot_hang_the_emulator(tmp_path):
+    probe = tmp_path / "probe.py"
+    probe.write_text(PROBE_HUGE_COUNTS)
+    result = subprocess.run(
+        [sys.executable, str(probe), str(Path(__file__).resolve().parent)],
+        capture_output=True,
+        text=True,
+        timeout=4.0,
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert result.stdout.startswith("SURVIVED"), result.stdout
+    # a count is clamped before anything is *allocated* over it too: an
+    # unclamped `CSI 200000000 @` builds a ten-million-element list, which no
+    # timeout catches and no assertion about the screen can see
+    peak = int(result.stdout.split()[1])
+    assert peak < 100 * 1024 * 1024, "peak memory %d bytes" % peak
+
+
+def test_a_scroll_past_the_screen_matches_scrolling_the_screen_away():
+    """The clamp has to be *equivalent*, not merely fast."""
+    clamped = feed("one\r\ntwo\r\nthree\x1b[300S")
+    one_at_a_time = feed("one\r\ntwo\r\nthree" + "\x1b[S" * 300)
+    assert clamped.lines() == one_at_a_time.lines()
+    assert [line.rstrip() for line in clamped.lines()] == [""] * 5
+
+
+def test_a_reverse_scroll_past_the_screen_matches_scrolling_one_at_a_time():
+    clamped = feed("one\r\ntwo\r\nthree\x1b[300T")
+    one_at_a_time = feed("one\r\ntwo\r\nthree" + "\x1b[T" * 300)
+    assert clamped.lines() == one_at_a_time.lines()
+
+
+def test_inserting_and_deleting_more_lines_than_the_screen_holds():
+    inserted = feed("one\r\ntwo\r\nthree\x1b[1;1H\x1b[300L")
+    step = feed("one\r\ntwo\r\nthree\x1b[1;1H" + "\x1b[L" * 300)
+    assert inserted.lines() == step.lines()
+    deleted = feed("one\r\ntwo\r\nthree\x1b[1;1H\x1b[300M")
+    step = feed("one\r\ntwo\r\nthree\x1b[1;1H" + "\x1b[M" * 300)
+    assert deleted.lines() == step.lines()
+
+
+def test_a_repeat_past_the_screen_matches_writing_the_characters():
+    """REP is only clamped where the clamp cannot be seen.
+
+    Past a full screen every cell holds the same character, so a further
+    `cols` repeats put the screen and the cursor back exactly where they were.
+    The oracle is writing the characters out.
+    """
+    # 5007 is not a whole number of screens *or* of rows: a clamp that drops
+    # the residue leaves the cursor in the wrong column
+    repeated = feed("A\x1b[5007b")
+    written = feed("A" * 5008)
+    assert repeated.lines() == written.lines()
+    assert (repeated.cursor_row, repeated.cursor_col) == (
+        written.cursor_row,
+        written.cursor_col,
+    )
+
+
+def test_inserting_more_characters_than_the_row_holds():
+    clamped = feed("abcdef\x1b[1;3H\x1b[5000@")
+    step = feed("abcdef\x1b[1;3H" + "\x1b[@" * 5000)
+    assert clamped.lines() == step.lines()
+    assert clamped.lines()[0] == "ab" + " " * 18
+
+
+def test_a_parameter_too_long_to_be_a_number_is_survived():
+    """CPython refuses int() past 4300 digits; the emulator must not.
+
+    The clamped value still has to mean "more than the screen holds": three
+    rows of content have to leave, not one.
+    """
+    screen = feed("one\r\ntwo\r\nthree\x1b[" + "9" * 5000 + "S")
+    assert [line.rstrip() for line in screen.lines()] == [""] * 5
+    screen = feed("\x1b[" + "9" * 5000 + "mHI")
+    assert screen.lines()[0].rstrip() == "HI"
+
+
+# --------------------------------------------------------------------------
+# Screen: what "this row continued onto the next" is worth
+#
+# `overlong_lines()` reads wrap flags, so every way of getting a wrap flag
+# wrong is a way of making `assert_within_width()` pass on a screen it should
+# fail, or fail on a screen that is fine.
+# --------------------------------------------------------------------------
+
+
+def test_a_narrowing_resize_does_not_lose_an_overlong_line():
+    screen = Screen(5, 20)
+    screen.feed("X" * 50)
+    assert screen.frame().overlong_lines() == [(0, 50)]
+    screen.resize(5, 10)
+    assert screen.frame().overlong_lines() == [(0, 50)]
+
+
+def test_a_widening_resize_does_not_inflate_the_width():
+    screen = Screen(5, 20)
+    screen.feed("X" * 50)
+    screen.resize(5, 40)
+    # 50 cells of content: not 90, which is what recomputing from the new width
+    # invents
+    assert screen.frame().overlong_lines() == [(0, 50)]
+
+
+def test_a_row_rewritten_after_it_wrapped_is_no_longer_continued():
+    screen = Screen(5, 10)
+    screen.feed("A" * 15)
+    assert screen.frame().overlong_lines() == [(0, 15)]
+    screen.feed("\x1b[1;1HBBBBB")
+    assert screen.wrapped_rows() == []
+    assert screen.frame().overlong_lines() == []
+
+
+def test_a_wide_character_the_margin_cannot_hold_is_recorded_in_cells():
+    screen = Screen(5, 10)
+    screen.feed("\x1b[?7l" + "z" * 9 + "\u65e5")
+    frame = screen.frame()
+    assert frame.lines[0] == "z" * 9      # the wide glyph never fitted
+    assert frame.overlong_lines() == [(0, 11)]
+
+
+def test_content_written_past_the_margin_with_autowrap_off_is_recorded():
+    screen = Screen(5, 10)
+    screen.feed("\x1b[?7l" + "Z" * 14)
+    frame = screen.frame()
+    assert frame.lines[0] == "Z" * 10          # what a human sees
+    assert screen.wrapped_rows() == []          # nothing continued anywhere
+    assert frame.overlong_lines() == [(0, 14)]  # four cells were destroyed
+    with pytest.raises(AssertionError) as excinfo:
+        frame.assert_within_width()
+    assert "14" in str(excinfo.value)
+
+
+# --------------------------------------------------------------------------
 # Frame helpers
 # --------------------------------------------------------------------------
 
@@ -683,6 +965,52 @@ def test_frame_dump_writes_text(tmp_path):
     assert out.read_text() == "alpha\nbeta\n"
     out2 = frame.dump(tmp_path / "with-header.txt", header="80x24 overview")
     assert out2.read_text().splitlines()[0] == "# 80x24 overview"
+
+
+# --------------------------------------------------------------------------
+# Frame: an assertion that cannot fail is a check that reports success
+# --------------------------------------------------------------------------
+
+
+def test_a_needle_split_by_a_wrap_is_still_on_the_screen():
+    """A line-by-line search cannot see text the terminal wrapped."""
+    screen = Screen(3, 10)
+    screen.feed("XXXXXFAILED")
+    frame = screen.frame()
+    assert frame.lines[:2] == ["XXXXXFAILE", "D"]
+    assert frame.contains("FAILED")
+    frame.assert_contains("FAILED")
+    with pytest.raises(AssertionError) as excinfo:
+        frame.assert_not_contains("FAILED")
+    assert "row 0" in str(excinfo.value)
+
+
+def test_text_is_not_invented_across_rows_that_did_not_wrap():
+    screen = Screen(3, 10)
+    screen.feed("XXXXXFAILE\r\nD")
+    frame = screen.frame()
+    assert frame.lines[:2] == ["XXXXXFAILE", "D"]
+    assert not frame.contains("FAILED")
+    frame.assert_not_contains("FAILED")
+
+
+def test_two_frames_that_differ_only_in_colour_are_not_equal():
+    """`frame_after != frame_before` is how "the screen changed" is asserted."""
+    red = Screen(1, 10)
+    red.feed("\x1b[31mFAILED")
+    green = Screen(1, 10)
+    green.feed("\x1b[32mFAILED")
+    assert red.frame().lines == green.frame().lines
+    assert red.frame() != green.frame()
+
+
+def test_two_frames_drawn_the_same_way_are_equal():
+    one = Screen(1, 10)
+    one.feed("\x1b[31mFAILED")
+    two = Screen(1, 10)
+    two.feed("\x1b[31mFAILED")
+    assert one.frame() == two.frame()
+    assert Frame(("a", "b")) == Frame(("a", "b"))
 
 
 # --------------------------------------------------------------------------
@@ -871,15 +1199,21 @@ def test_width_helper_passes_on_a_line_that_exactly_fits(program):
     with session(path, "80", rows=10, cols=80) as term:
         frame = term.wait_for("HEADER")
         assert frame.overlong_lines() == []
-        frame.assert_within_width()
+        # a row that fills the width is not a violation, but the terminal
+        # cannot tell a fit from a truncation: the caller says which
+        with pytest.raises(AssertionError):
+            frame.assert_within_width()
+        frame.assert_within_width(allow_full_width=True)
         assert frame.lines[1] == "X" * 80
 
 
 def test_width_helper_passes_on_a_well_behaved_curses_app(menu):
+    """No wrap and no row at the margin: the pass is provable, not vacuous."""
     with session(menu, rows=24, cols=80) as term:
         frame = term.wait_for("alpha")
         frame.assert_within_width()
         assert frame.overlong_lines() == []
+        assert all(len(line) < 80 for line in frame.lines)
 
 
 def test_dump_captured_frame_to_evidence(menu, tmp_path):
@@ -891,6 +1225,45 @@ def test_dump_captured_frame_to_evidence(menu, tmp_path):
         assert text.splitlines()[0] == "# menu 80x24 overview"
         assert "SIZE 24x80" in text
         assert "> alpha" in text
+
+
+def test_a_curses_border_reaches_the_frame_as_box_drawing(program):
+    """The frames S2 and S3 are judged through carry real pane borders."""
+    path = program("border", DEMO_BORDER)
+    with session(path, rows=10, cols=40) as term:
+        frame = term.wait_for("PANE")
+        frame.assert_contains("┌")
+        frame.assert_contains("│")
+        frame.assert_contains("┘")
+        assert frame.line_with("┌").strip() == "┌" + "─" * 18 + "┐"
+        assert frame.line_with("PANE").strip() == "│ PANE" + " " * 13 + "│"
+        # the letters ncurses sends inside the graphics set must not reach the
+        # text: "lqqqqk" / "x" is what dropping ESC ( 0 shows a judge
+        frame.assert_not_contains("lqq")
+        frame.assert_not_contains("qqj")
+        term.send("q")
+
+
+def test_the_width_helper_refuses_to_certify_a_curses_app_at_the_margin(program):
+    """The guard that tells a working width helper from a disabled one.
+
+    ncurses cursor-addresses every row rather than letting the terminal wrap,
+    so no curses screen ever carries a wrap flag and `overlong_lines()` is
+    empty whatever the app drew. A row that runs to the last column is either
+    an exact fit or content ncurses clipped, and nothing the terminal can
+    observe tells them apart — so the helper says so instead of passing.
+    """
+    path = program("edge", DEMO_EDGE)
+    with session(path, rows=10, cols=40) as term:
+        frame = term.wait_for("EDGE DEMO")
+        assert frame.overlong_lines() == []
+        with pytest.raises(AssertionError) as excinfo:
+            frame.assert_within_width()
+        assert "row 1" in str(excinfo.value)
+        assert "truncat" in str(excinfo.value)
+        # the caller can say which it is; nothing else can
+        frame.assert_within_width(allow_full_width=True)
+        term.send("q")
 
 
 DEMO_ENV = r'''

@@ -539,6 +539,67 @@ def test_cell_attrs_describe_itself_readably():
 
 
 # --------------------------------------------------------------------------
+# Assertions that could pass without asserting anything
+#
+# Every helper below had a way of reporting success while proving nothing: no
+# expectation at all, a misspelt flag name, or a needle drawn two different
+# ways in two places where only the first was ever looked at.
+# --------------------------------------------------------------------------
+
+
+def test_assert_attrs_with_nothing_to_assert_is_refused():
+    screen = feed("\x1b[31;1mSTATUS")
+    frame = screen.frame()
+    with pytest.raises(ValueError) as excinfo:
+        frame.assert_attrs("STATUS")
+    assert "fg" in str(excinfo.value)
+    frame.assert_attrs("STATUS", fg=31)          # still fine with a criterion
+
+
+def test_assert_attrs_rejects_a_flag_name_it_does_not_know():
+    """`lacks="bolt"` used to pass on anything at all."""
+    screen = feed("\x1b[1mSTATUS")
+    frame = screen.frame()
+    for kwargs in ({"lacks": "bolt"}, {"has": "bolt"}, {"lacks": ["bold", "revrese"]}):
+        with pytest.raises(ValueError) as excinfo:
+            frame.assert_attrs("STATUS", **kwargs)
+        assert "underline" in str(excinfo.value)   # the known names are listed
+    frame.assert_attrs("STATUS", has="bold", lacks="reverse")
+
+
+def test_run_with_refuses_a_needle_drawn_two_ways_on_two_rows():
+    """A green STATUS on row 0 and a red one on row 2 is not one answer."""
+    screen = feed("\x1b[32mSTATUS\x1b[0m\r\n\r\n\x1b[31mSTATUS")
+    frame = screen.frame()
+    with pytest.raises(AssertionError) as excinfo:
+        frame.run_with("STATUS")
+    message = str(excinfo.value)
+    assert "row 0" in message and "row 2" in message
+    with pytest.raises(AssertionError):
+        frame.assert_attrs("STATUS", fg=32)
+    # naming the row is how the caller says which one it means
+    assert frame.run_with("STATUS", row=0).attrs.fg == (32,)
+    frame.assert_attrs("STATUS", fg=32, row=0)
+    frame.assert_attrs("STATUS", fg=31, row=2)
+
+
+def test_run_with_refuses_a_needle_drawn_two_ways_on_one_row():
+    screen = feed("\x1b[32mOK\x1b[0m--\x1b[31mOK")
+    frame = screen.frame()
+    with pytest.raises(AssertionError) as excinfo:
+        frame.run_with("OK")
+    assert "col" in str(excinfo.value)
+
+
+def test_run_with_answers_when_every_copy_agrees():
+    """Two panes drawing the same label the same way is not ambiguous."""
+    screen = feed("\x1b[36mLEG\x1b[0m\r\n\x1b[36mLEG")
+    frame = screen.frame()
+    assert frame.run_with("LEG").row == 0
+    frame.assert_attrs("LEG", fg=36)
+
+
+# --------------------------------------------------------------------------
 # TerminalSession: what ncurses actually emits
 # --------------------------------------------------------------------------
 
