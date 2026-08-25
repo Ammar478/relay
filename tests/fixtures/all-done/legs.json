@@ -1,0 +1,9 @@
+{
+  "relay": "all-done",
+  "stages": [{ "id": "S1", "name": "Only stage", "legs": ["a", "b", "c"] }],
+  "legs": [
+    { "id": "a", "stage": "S1", "kind": "impl", "goal": "A.", "status": "done" },
+    { "id": "b", "stage": "S1", "kind": "fix", "goal": "B.", "repairs": ["ACC-C-001"], "status": "finished" },
+    { "id": "c", "stage": "S1", "kind": "impl", "goal": "C.", "status": "skipped" }
+  ]
+}

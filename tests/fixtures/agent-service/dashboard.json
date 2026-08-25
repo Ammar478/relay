@@ -1,0 +1,10 @@
+{
+  "title": "Wave 2 PostgreSQL cutover (dev)",
+  "attention": [
+    "NEEDS YOUR CALL: create_teams_channel writes Teams channels into the AGENTS table and then reads back from the Teams table the write never reached. Broken today, silently. Under PostgreSQL it 500s instead. Earlier research recorded Teams as dead surface awaiting D11 deletion - if that is right it should be deleted, not repaired. If Teams is live it needs its own leg before cutover.",
+    "Coach error corrected: a leg was marked running for ~90 minutes without a runner ever being dispatched. Encoded as a skill - never report a leg in flight without confirming against a commit, a baton, or transcript mtime.",
+    "process-entitlement now genuinely running: a guest token bound to agent A can POST /process/ with agent B and spend B's Cortex PAT. This surface was opened by the security branch, not pre-existing.",
+    "Nothing has touched a live environment. All work is local commits on feat/wave2-cutover-reconciled."
+  ],
+  "notes": "S2 is now 11 legs. Credential work is complete on both update and create paths; the register route is queued behind the current leg."
+}

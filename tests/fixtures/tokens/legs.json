@@ -1,0 +1,12 @@
+{
+  "relay": "measured",
+  "stages": [{ "id": "S1", "name": "Measured stage", "legs": ["measured-leg", "next-leg"] }],
+  "legs": [
+    { "id": "measured-leg", "stage": "S1", "kind": "impl", "goal": "Measure it.",
+      "fulfills": ["ACC-M-001"], "touches": ["src/"], "boundaries": ["stdlib only"],
+      "verification": ["pytest -q"], "status": "done" },
+    { "id": "next-leg", "stage": "S1", "kind": "impl", "goal": "Next.",
+      "fulfills": ["ACC-M-002"], "dependsOn": ["measured-leg"],
+      "verification": ["pytest -q"], "status": "running" }
+  ]
+}

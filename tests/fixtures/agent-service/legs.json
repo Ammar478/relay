@@ -1,0 +1,824 @@
+{
+  "relay": "wave-2-postgres-cutover-dev",
+  "stages": [
+    {
+      "id": "S1",
+      "name": "Reconcile the branch stack",
+      "legs": [
+        "reconcile-develop",
+        "reconcile-security",
+        "code-judge-S1",
+        "behaviour-judge-S1"
+      ]
+    },
+    {
+      "id": "S2",
+      "name": "Correctness of the PostgreSQL write and read paths",
+      "legs": [
+        "credential-parity",
+        "create-path-credential-guard",
+        "register-route-credential-guard",
+        "process-entitlement",
+        "chat-session-ownership",
+        "thread-id-ownership",
+        "pg-repository-correctness",
+        "agent-write-tests",
+        "pg-tests-run-in-ci",
+        "s2-test-quality",
+        "mask-shape-coverage",
+        "code-judge-S2",
+        "behaviour-judge-S2"
+      ]
+    },
+    {
+      "id": "S3",
+      "name": "Ship the image and prove the data",
+      "legs": [
+        "open-and-green-mr",
+        "merge-to-develop",
+        "bump-db-migrate-pin",
+        "deploy-and-soak",
+        "data-parity-verify",
+        "code-judge-S3",
+        "behaviour-judge-S3"
+      ]
+    },
+    {
+      "id": "S4",
+      "name": "Cut over and verify",
+      "legs": [
+        "rollback-procedure",
+        "cutover-flip",
+        "cutover-verify",
+        "rollback-rehearsal",
+        "code-judge-S4",
+        "behaviour-judge-S4"
+      ]
+    }
+  ],
+  "legs": [
+    {
+      "id": "reconcile-develop",
+      "stage": "S1",
+      "kind": "impl",
+      "goal": "feature/non-prod-wave2-cutover contains every develop commit, with both sides' admin_db_service.py changes intact.",
+      "fulfills": [
+        "ACC-MERGE-001"
+      ],
+      "dependsOn": [],
+      "touches": [
+        "services/agent-service/src/services/admin_db_service.py"
+      ],
+      "boundaries": [
+        "a trial merge already showed this is a clean auto-merge; if a conflict appears, stop and report rather than resolving creatively",
+        "do not push to develop"
+      ],
+      "verification": [
+        "git rev-list --count HEAD..develop is 0",
+        "pytest tests/ --ignore=tests/pg"
+      ],
+      "status": "done"
+    },
+    {
+      "id": "reconcile-security",
+      "stage": "S1",
+      "kind": "impl",
+      "goal": "The reconciled branch carries both the wave-2 work and the security branch, with all five write methods and the whole security suite intact.",
+      "fulfills": [
+        "ACC-MERGE-002",
+        "ACC-MERGE-003"
+      ],
+      "dependsOn": [
+        "reconcile-develop"
+      ],
+      "touches": [
+        "services/agent-service/src/config/agents.py",
+        "services/agent-service/src/services/admin_db_service.py",
+        "services/db-schema/copy_wave2.py"
+      ],
+      "boundaries": [
+        "three files overlap; the security side's edits are small, wave 2's are large - preserve both intents rather than taking one side wholesale",
+        "the security suite is the regression gate: it must stay green"
+      ],
+      "verification": [
+        "pytest tests/security",
+        "pytest tests/ --ignore=tests/pg",
+        "symbol probe for the five write methods"
+      ],
+      "status": "done"
+    },
+    {
+      "id": "code-judge-S1",
+      "stage": "S1",
+      "kind": "judge",
+      "goal": "Tests, lint, and a per-leg review of the reconciliation. Did anything get lost or silently reverted in the merge?",
+      "fulfills": [],
+      "dependsOn": [
+        "reconcile-security"
+      ],
+      "status": "done"
+    },
+    {
+      "id": "behaviour-judge-S1",
+      "stage": "S1",
+      "kind": "judge",
+      "goal": "Drive the reconciled app: entitlement, guest binding, session ownership and admin flows still behave as the security contract requires.",
+      "fulfills": [
+        "ACC-MERGE-002"
+      ],
+      "dependsOn": [
+        "reconcile-security"
+      ],
+      "status": "done"
+    },
+    {
+      "id": "credential-parity",
+      "stage": "S2",
+      "kind": "impl",
+      "goal": "The two backends agree on what counts as a credential, and no input can destroy a stored PAT.",
+      "fulfills": [
+        "ACC-CRED-001",
+        "ACC-CRED-002",
+        "ACC-CRED-003",
+        "ACC-CRED-004",
+        "ACC-CRED-005",
+        "ACC-CRED-006"
+      ],
+      "dependsOn": [
+        "reconcile-security"
+      ],
+      "touches": [
+        "services/agent-service/src/db/pg_repositories.py",
+        "services/agent-service/src/services/admin_db_service.py"
+      ],
+      "boundaries": [
+        "the known divergence: _store_credential accepts any non-empty string, so a mask is written to the vault as the credential, while _is_a_real_credential rejects masks. The admin_db_service guard is inert under PostgreSQL because provider_config cannot hold a PAT by constraint",
+        "one shared predicate, used by both paths - do not duplicate the rule"
+      ],
+      "verification": [
+        "pg tests per mask value",
+        "table-driven test asserting both paths agree"
+      ],
+      "status": "done"
+    },
+    {
+      "id": "create-path-credential-guard",
+      "stage": "S2",
+      "kind": "impl",
+      "goal": "A newly created agent cannot be born with a masked value as its credential, on either backend.",
+      "fulfills": [],
+      "dependsOn": [
+        "credential-parity"
+      ],
+      "touches": [
+        "services/agent-service/src/routers/admin.py",
+        "services/agent-service/tests/"
+      ],
+      "boundaries": [
+        "found by the credential-parity runner: routers/admin.py accepts a mask as a valid new cortex_agent_pat on create, so an agent can be created with '********' as its credential. The update path is now guarded; create is not",
+        "reuse src/utils/credential_value.is_a_real_credential - do not write a second rule",
+        "create must REJECT (a create with no usable credential is an error), unlike update which preserves; state the difference in the commit",
+        "mutation-check every assertion"
+      ],
+      "verification": [
+        "pytest tests/ --ignore=tests/pg",
+        "pytest tests/security",
+        "mutation results per assertion"
+      ],
+      "status": "done"
+    },
+    {
+      "id": "register-route-credential-guard",
+      "stage": "S2",
+      "kind": "impl",
+      "goal": "POST /api/v1/agents/register cannot accept a masked value as a credential either.",
+      "fulfills": [],
+      "dependsOn": [
+        "create-path-credential-guard"
+      ],
+      "touches": [
+        "services/agent-service/src/routers/agents.py",
+        "services/agent-service/tests/"
+      ],
+      "boundaries": [
+        "found by create-path-credential-guard: agents.py:134 declares cortex_agent_pat as a plain required str, so a mask is accepted. It populates the in-memory registry, so the effect is an agent that lists fine and fails every Snowflake call",
+        "reuse src/utils/credential_value.is_a_real_credential - assert function identity in a test so a future copy-paste fails",
+        "reject like create does, do not preserve",
+        "mutation-check every assertion"
+      ],
+      "verification": [
+        "masks rejected, real credential accepted",
+        "pytest tests/security stays 474",
+        "mutation results"
+      ],
+      "status": "done"
+    },
+    {
+      "id": "process-entitlement",
+      "stage": "S2",
+      "kind": "impl",
+      "goal": "/process routes enforce entitlement to the agent named in the request body, closing a surface the security branch turned from inert to live.",
+      "fulfills": [],
+      "dependsOn": [
+        "credential-parity"
+      ],
+      "touches": [
+        "services/agent-service/src/routers/chat.py",
+        "services/agent-service/tests/security/"
+      ],
+      "boundaries": [
+        "CRITICAL, found by code-judge-S1. At merge-base ProcessRequest had no agent_id so chat.py:151 would raise and the endpoint was inert. The security branch added agent_id and router-level get_current_user, making it LIVE and AUTHENTICATED but never entitled",
+        "get_current_user accepts guest tokens, so a guest bound to agent alpha can POST /process/ with agent_id beta and spend beta's Cortex PAT",
+        "consume src/middleware/entitlements.py rather than writing a second rule",
+        "tests/security R9 only covers anonymous and wrong-key on /process; there is no cross-agent test - add one",
+        "while here: chat.py:91 and dynamic_chat.py:127 carry loose bool(x.get('isAdmin') or ...) duplicates of the strict predicate. Not currently exploitable because get_current_user normalises to a real bool, but entitlements.is_platform_admin is public and takes an arbitrary claims dict. Consolidate onto is_admin_claim"
+      ],
+      "verification": [
+        "guest bound to A refused on B via /process",
+        "entitled user allowed",
+        "pytest tests/security",
+        "mutation results"
+      ],
+      "status": "done",
+      "agentId": "a1c645c1d6aa9537b"
+    },
+    {
+      "id": "chat-session-ownership",
+      "stage": "S2",
+      "kind": "impl",
+      "goal": "A caller cannot read or append to another user's conversation by passing their session_id to chat.",
+      "fulfills": [],
+      "dependsOn": [
+        "credential-parity"
+      ],
+      "touches": [
+        "services/agent-service/src/routers/agents.py",
+        "services/agent-service/src/services/session_client.py",
+        "services/agent-service/tests/"
+      ],
+      "boundaries": [
+        "HIGH, found by code-judge-S1. ChatRequest.session_id is caller-supplied and SessionClient.get_session_messages/add_message have no requester scoping, unlike agent_session_service which the guarded read routes use correctly",
+        "so a caller entitled to agent A passes another user's session_id to POST /agents/chat, loads their history as model context and appends to it - reading through the front door what GET /{id}/sessions/{sid}/messages correctly refuses",
+        "session-service is an external service outside this repo: if ownership cannot be enforced at its boundary, enforce it before the call and say so",
+        "mutation-check every assertion"
+      ],
+      "verification": [
+        "a foreign session_id is refused on /agents/chat",
+        "the owner's own session still works",
+        "pytest tests/security"
+      ],
+      "status": "done",
+      "agentId": "a41e1016d9e23865f"
+    },
+    {
+      "id": "pg-repository-correctness",
+      "stage": "S2",
+      "kind": "impl",
+      "goal": "PgAgentRepository and the two mapping repositories are correct and complete: right conflict target, no undeletable rows, and every column the application reads survives a round trip.",
+      "fulfills": [
+        "ACC-WRITE-009",
+        "ACC-WRITE-010",
+        "ACC-WRITE-011",
+        "ACC-WRITE-012",
+        "ACC-PARITY-001",
+        "ACC-PARITY-002",
+        "ACC-PARITY-003"
+      ],
+      "dependsOn": [
+        "credential-parity"
+      ],
+      "touches": [
+        "services/agent-service/src/db/pg_repositories.py",
+        "services/agent-service/tests/pg/"
+      ],
+      "boundaries": [
+        "MERGED from mapping-conflict-target and read-path-columns: both rewrite the same file, so one runner owns it",
+        "both mapping callers mint a fresh uuid4 per call, so ON CONFLICT (legacy_id) can NEVER fire - the real conflict is (agent_id, group_id) and (user_id, group_id). copy_wave2 targets legacy_id, correct for a one-shot migration and wrong here",
+        "delete_all matches WHERE legacy_id = ANY(%s), so a NULL legacy_id row is permanently undeletable - never write one",
+        "a role of 'Agent_Manager' was silently dropped once: normalise case before the enum cast",
+        "_select() omits queue_name, tool_choice, max_threads, session_ttl_days, max_session_messages, rate_limit_per_minute, rate_limit_per_hour, tools_enabled, guest_access_enabled. engineering_ai has queue_name='engineering' in dev and would silently fall back to 'default', sending its RQ jobs to the wrong queue",
+        "the guest flag WRITE path fails loudly too: _UPDATABLE has no guestAccessEnabled entry while admin_db_service updatable_fields does, so update_fields raises ValueError, and routers/admin.py catches ValueError BEFORE HTTPException - an admin toggling guest access on PG gets HTTP 404 with the internal column allowlist in the body. PgAgentRepository.put also omits it, so creation silently stores false",
+        "behaviour judge confirmed the read side fails CLOSED (guest gets 404), so it is a functionality regression not a security hole",
+        "YOU ALSO OWN tests/pg/conftest.py: _reachable catches bare Exception, so a missing psycopg driver is misreported as a missing database and PGTEST_REQUIRED then fails with a misleading reason. Cheap to fix while you are in there; not required by any check"
+      ],
+      "verification": [
+        "PGTEST_REQUIRED=1 pytest tests/pg against a database at alembic head",
+        "mutation results per assertion"
+      ],
+      "status": "done",
+      "agentId": "a9f2e6c31d96d389e"
+    },
+    {
+      "id": "thread-id-ownership",
+      "stage": "S2",
+      "kind": "impl",
+      "goal": "A caller-supplied thread_id cannot be used to reach another user's thread.",
+      "fulfills": [],
+      "dependsOn": [
+        "chat-session-ownership"
+      ],
+      "touches": [
+        "services/agent-service/src/routers/agents.py",
+        "services/agent-service/src/services/session_client.py",
+        "services/agent-service/tests/security/"
+      ],
+      "boundaries": [
+        "found by chat-session-ownership: thread_id is the IDENTICAL defect to session_id - caller-supplied, unscoped, passed to generate_response and written via set_thread_id",
+        "that leg established the pattern: verify ownership before the call, refuse 404 to match how the entitlement layer refuses an unseen agent, reuse PLACEHOLDER_OWNER_IDS rather than duplicating it",
+        "the same trap applies: both handlers wrap their body in except Exception returning 200 with success:false, which would convert a 404 into a 200 and leave the guard decorative. Re-raise HTTPException first",
+        "platform admins keep unscoped reach, as the read and delete routes already grant",
+        "mutation-check every assertion; the previous leg had one mutation survive its first battery because no test exercised the placeholder-owner branch"
+      ],
+      "verification": [
+        "a foreign thread_id is refused on chat",
+        "the owner's own thread still works",
+        "pytest tests/security",
+        "mutation results"
+      ],
+      "status": "done",
+      "agentId": "a8de1d0ce62d69528"
+    },
+    {
+      "id": "agent-write-tests",
+      "stage": "S2",
+      "kind": "impl",
+      "goal": "PgAgentRepository put, update_fields and delete are proven substitutable for the DynamoDB implementation against a real database.",
+      "fulfills": [
+        "ACC-WRITE-001",
+        "ACC-WRITE-002",
+        "ACC-WRITE-003",
+        "ACC-WRITE-004",
+        "ACC-WRITE-005",
+        "ACC-WRITE-006",
+        "ACC-WRITE-007",
+        "ACC-WRITE-008",
+        "ACC-WRITE-013"
+      ],
+      "dependsOn": [
+        "reconcile-security"
+      ],
+      "touches": [
+        "services/agent-service/tests/pg/"
+      ],
+      "boundaries": [
+        "mirror the patterns in test_pg_wave1.py",
+        "conftest clean() covers only iam tables - extend it to catalog.agent_groups and catalog.agents or tests will leak into each other",
+        "bring the database to alembic head, not sql/0001, because guest_access_enabled comes from 0003"
+      ],
+      "verification": [
+        "PGTEST_REQUIRED=1 pytest tests/pg"
+      ],
+      "status": "done",
+      "agentId": "a18b3c11b25134919",
+      "attempt": 2,
+      "note": "runner killed by API error after writing tests; coach validated and mutation-checked, then committed"
+    },
+    {
+      "id": "pg-tests-run-in-ci",
+      "stage": "S2",
+      "kind": "impl",
+      "goal": "agent-service tests/pg actually execute in CI instead of skipping silently.",
+      "fulfills": [],
+      "dependsOn": [
+        "agent-write-tests"
+      ],
+      "touches": [
+        ".gitlab-ci.yml",
+        "services/agent-service/tests/pg/conftest.py"
+      ],
+      "boundaries": [
+        "auth-service has a pg job and PGTEST_REQUIRED; agent-service has neither, so every new wave-2 test would skip and read as green",
+        "mirror the existing auth-service job rather than inventing a new shape",
+        "tests/pg/conftest.py _reachable catches bare Exception, so a missing psycopg driver is misreported as a missing database - PGTEST_REQUIRED then fails with a misleading reason",
+        "testpaths omits tests/db and tests/pg: 7 and 3 files on disk are not collected by a bare pytest. CI is unaffected because it passes tests/ explicitly, but a local developer gets a false green - and tests/pg/test_pg_agent_writes.py plus test_pg_mapping_puts.py are exactly the ACC-MERGE-003 coverage"
+      ],
+      "verification": [
+        "the job fails when the database is absent and PGTEST_REQUIRED is set"
+      ],
+      "status": "done",
+      "closedBy": "inspection",
+      "evidence": "already satisfied on this branch: job pg-integration-test (.gitlab-ci.yml:194) brings up postgres:16-alpine, runs alembic upgrade head in db-schema (line 229) so the database is at HEAD including 0003, then runs BOTH auth-service and agent-service tests/pg with PGTEST_REQUIRED=1. agent-service conftest.py:94 honours the flag and raises rather than skipping. The earlier research claim that agent-service had no pg job was reading develop, not the reconciled branch."
+    },
+    {
+      "id": "mask-shape-coverage",
+      "stage": "S2",
+      "kind": "impl",
+      "goal": "The credential predicate refuses the mask shapes real admin UIs actually produce, not only the three that were enumerated.",
+      "fulfills": [],
+      "dependsOn": [
+        "s2-test-quality"
+      ],
+      "touches": [
+        "services/agent-service/src/utils/credential_value.py",
+        "services/agent-service/tests/"
+      ],
+      "boundaries": [
+        "found by the S2 behaviour judge and confirmed by the coach. MASK_CHARACTERS is '*BULLET-MIDDOT-CIRCLE-BULLETOP' only, so these all read as REAL credentials today: partial reveal 'dots+abcd' (the one that matters - real admin forms render it and it would overwrite a live PAT), U+2217, U+FF0A fullwidth, U+204E, U+25CB, and a zero-width space which str.strip() does not remove",
+        "the partial-reveal case is the hard one: it is a real string with real characters, so a pure character-class rule cannot catch it. Think about what distinguishes a masked value from a credential rather than extending the character list and calling it done",
+        "whatever rule you choose must keep every currently-accepted real credential accepted - check the existing parity tests before and after",
+        "one shared predicate still: do not add a second rule anywhere",
+        "mutation-check every assertion"
+      ],
+      "verification": [
+        "each shape refused",
+        "real credentials still accepted",
+        "pytest tests/pg and tests/security",
+        "mutation results"
+      ],
+      "status": "done",
+      "agentId": "pending"
+    },
+    {
+      "id": "code-judge-S2",
+      "stage": "S2",
+      "kind": "judge",
+      "goal": "Tests, lint, types, and a parallel review per leg. Are the new tests mutation-proof, or do they pass against a broken implementation?",
+      "fulfills": [],
+      "dependsOn": [
+        "chat-session-ownership",
+        "pg-repository-correctness",
+        "agent-write-tests",
+        "pg-tests-run-in-ci",
+        "thread-id-ownership"
+      ],
+      "status": "done",
+      "round": 2
+    },
+    {
+      "id": "behaviour-judge-S2",
+      "stage": "S2",
+      "kind": "judge",
+      "goal": "Against a real PostgreSQL, drive the write paths as the application does and confirm every WRITE, CRED and PARITY check.",
+      "fulfills": [
+        "ACC-WRITE-001",
+        "ACC-CRED-003",
+        "ACC-PARITY-001"
+      ],
+      "dependsOn": [
+        "chat-session-ownership",
+        "pg-repository-correctness",
+        "agent-write-tests",
+        "pg-tests-run-in-ci",
+        "thread-id-ownership"
+      ],
+      "status": "done",
+      "round": 2
+    },
+    {
+      "id": "open-and-green-mr",
+      "stage": "S3",
+      "kind": "impl",
+      "goal": "One MR carrying the reconciled wave-2 work, with a real description, a green pipeline, and no protected branch pushed.",
+      "fulfills": [],
+      "dependsOn": [
+        "behaviour-judge-S2"
+      ],
+      "touches": [],
+      "boundaries": [
+        "target develop, never push to it directly",
+        "the description must state the rollback data cost, not just the feature"
+      ],
+      "verification": [
+        "pipeline status success",
+        "MR state opened with a description"
+      ],
+      "status": "done",
+      "agentId": "coach",
+      "evidence": "MR !159 merged; develop 8e66244->0cb30b5f09; pipeline 103657 green 17/17"
+    },
+    {
+      "id": "merge-to-develop",
+      "stage": "S3",
+      "kind": "impl",
+      "goal": "The reconciled branch is merged to develop via MR, which is the ONLY way an image containing revision 0003 can ever be built.",
+      "fulfills": [],
+      "dependsOn": [
+        "open-and-green-mr"
+      ],
+      "touches": [],
+      "boundaries": [
+        "HARD PREREQUISITE, established by research: the db-schema image builds ONLY on branch develop or db-PostgreSQL (.gitlab-ci.yml:502-504). feat/wave2-cutover-reconciled builds nothing, so 0003 cannot reach any environment from it",
+        "verified: all 26 published db-schema tags were resolved SHA->tree and NONE contains 0003",
+        "merge through the MR, never push to develop directly",
+        "REQUIRES EXPLICIT OWNER APPROVAL before merging - this lands the wave-2 work AND the 10-commit security branch on develop together",
+        "record the resulting image tag: the format is <prefix>-<pipeline_iid>.<short_sha> and the sha identifies the exact build commit"
+      ],
+      "verification": [
+        "MR merged",
+        "pipeline green on develop",
+        "a db-schema image tag exists whose sha contains 0003"
+      ],
+      "status": "done",
+      "evidence": "merge_commit 0cb30b5f09 verified on origin/develop"
+    },
+    {
+      "id": "bump-db-migrate-pin",
+      "stage": "S3",
+      "kind": "impl",
+      "goal": "dev's db-migrate image pin points at a build containing 0003, and the PostSync hook has applied it.",
+      "fulfills": [
+        "ACC-IMAGE-003"
+      ],
+      "dependsOn": [
+        "merge-to-develop"
+      ],
+      "touches": [
+        "aihub-gitops apps/dev/db-migrate/values.yaml"
+      ],
+      "boundaries": [
+        "dev only - never apps/stage or apps/prod",
+        "this pin is NEVER auto-bumped: the gitops auto-bump job rewrites only agent-service, auth-service and registry-service. Every db-migrate bump in history is a hand-written commit",
+        "migrations run as an ArgoCD PostSync hook Job (helm/db-migrate/templates/job.yaml:12,54) executing `alembic upgrade head` from the pinned image, with ALEMBIC_VERSION_TABLE_SCHEMA=ops",
+        "ArgoCD excludes hook manifests from its diff, so an image-tag-only change may not reliably drive OutOfSync. After committing, explicitly run `argocd app sync aihub-dev-db-migrate` rather than waiting",
+        "do NOT apply the DDL by hand with the migrator credential: the immutable-tag policy exists so nothing changes what the Job applies without a gitops change"
+      ],
+      "verification": [
+        "ops.alembic_version reads 0003_agent_guest_access",
+        "catalog.agents.guest_access_enabled exists"
+      ],
+      "status": "done",
+      "baseline": "dev PG pre-0003 baseline: alembic=0002_pat_alias_case, guest_access_enabled_col=0, agents=7, user_groups=49, agent_groups=19, pat_secret_arn=5/7",
+      "note": "pin lives in apps/dev/db-migrate/values.yaml, isolated from update_gitops_develop sed",
+      "evidence": "gitops !77 merged (main bb31cdf88b). ArgoCD reported Synced/Healthy WITHOUT running the hook - all chart resources are helm hooks, excluded from sync comparison. Required an explicit sync operation. Job db-migrate Complete 1/1; log shows \"Running upgrade 0002_pat_alias_case -> 0003_agent_guest_access\"."
+    },
+    {
+      "id": "deploy-and-soak",
+      "stage": "S3",
+      "kind": "impl",
+      "goal": "A dev image containing the resolver and all five write methods is running, with DB_BACKEND_WAVE2 still absent.",
+      "fulfills": [
+        "ACC-IMAGE-001",
+        "ACC-IMAGE-002"
+      ],
+      "dependsOn": [
+        "bump-db-migrate-pin"
+      ],
+      "touches": [],
+      "boundaries": [
+        "prove the image with the symbol probe, never by comparing tags",
+        "the flag stays absent in this leg - this is wave 1's lesson, prove the image separately from the flag",
+        "ORDERING IS LOAD-BEARING: read-path-columns makes the application SELECT guest_access_enabled. db-migrate and agent-service are SEPARATE ArgoCD Applications with no ordering between them and a failed migration does not stop the app rolling out, so the migration must be confirmed applied BEFORE this image deploys or the app queries a column that does not exist"
+      ],
+      "verification": [
+        "symbol probe prints True three times",
+        "pod Running, DB_BACKEND_WAVE2 absent from env"
+      ],
+      "status": "done",
+      "note": "db-schema Dockerfile ships only alembic.ini/checks.py/migrations/sql, ENTRYPOINT alembic, boto3 absent from requirements.txt. PostSync hook applies DDL ONLY. Copy re-run is out-of-band from a workstation with psycopg+boto3.",
+      "evidence": "dev PG: alembic=0003_agent_guest_access, guest_access_enabled column present, agents=7, pat_secret_arn=5/7 unchanged. agent-service+auth-service running dev-676.0cb30b5f."
+    },
+    {
+      "id": "data-parity-verify",
+      "stage": "S3",
+      "kind": "impl",
+      "goal": "dev data agrees between the two stores on every column the application reads.",
+      "fulfills": [
+        "ACC-PARITY-004"
+      ],
+      "dependsOn": [
+        "deploy-and-soak"
+      ],
+      "touches": [
+        "services/db-schema/copy_wave2.py"
+      ],
+      "boundaries": [
+        "the verify checksum compares only slug, name, provider, is_active - it must cover the columns in ACC-PARITY-001 or a wrongly copied value passes silently",
+        "re-run the copy after 0003 so guest_access_enabled is populated rather than defaulted",
+        "cmd_verify checksums source against target over ONE shared `fields` tuple: adding a column means changing it in two places, or verify fails on every row with a bare 'checksum mismatch'"
+      ],
+      "verification": [
+        "copy_wave2.py verify exits 0 with the widened checksum"
+      ],
+      "status": "done",
+      "note": "Run `copy_wave2.py agents` (NOT all). Never --prune: with 7 agents the orphan allowance is max(1,0)=1, so exactly one agent could be deleted silently, cascading to agent_groups/chat. Never --write-secrets: on ResourceExistsException it put_secret_value()s the stale DynamoDB PAT over the live secret. Without it COALESCE preserves all 5 ARNs. Column value alone cannot distinguish copied-false from defaulted-false: prove via updated_at>=copy_start AND xmin change on all 7, plus DynamoDB source id set.",
+      "evidence": "PARITY PASS 7/7 on the cmd_verify checksum fields (slug,name,provider,is_active,guest_access_enabled), computed independently of copy_wave2.py from a direct DynamoDB scan vs catalog.agents.",
+      "decision": "Mutating copy re-run DELIBERATELY SKIPPED. All 7 DynamoDB items lack the guestAccessEnabled attribute entirely (0 true, 0 non-bool). Mapper is `guest_access_enabled = raw_guest_access is True`, so the copied value for every row is false - identical to the 0003 column default. The re-run therefore cannot change the target column, while it WOULD overwrite all 17 agent columns from DynamoDB. Risk without benefit; parity proven read-only instead."
+    },
+    {
+      "id": "code-judge-S3",
+      "stage": "S3",
+      "kind": "judge",
+      "goal": "Review the MR as a reviewer who has not seen it written. Is the rollback cost stated honestly? Is anything claimed that is not proven?",
+      "fulfills": [],
+      "dependsOn": [
+        "data-parity-verify"
+      ],
+      "status": "done",
+      "verdict": "BLOCKED",
+      "evidence": "C1,C2,C4 VERIFIED against a real PostgreSQL 16 (443 passed tests/pg). C3 REFUTED both directions. C5 MIXED: 4 of 5 mutations killed, 1 survived. ruff/black/isort clean. Baseline held at 5 failed / 1626 passed.",
+      "findings": "F1 CRITICAL interior-mask accepted as credential, destroys stored PAT, demonstrated end-to-end. F2 CRITICAL _owner_scoped_filter has zero coverage, mutation to unconditional raise survived. F3 HIGH PG outage renders as 404 not 5xx. F4 MEDIUM get_group_by_name fails open, lets create_group overwrite. F5 LOW real secret with >=50pc asterisks rejected. F7 teams-channel write into catalog.agents now contends for agents_slug_key."
+    },
+    {
+      "id": "behaviour-judge-S3",
+      "stage": "S3",
+      "kind": "judge",
+      "goal": "Independently confirm the image, the migration and the data parity against live dev, read-only.",
+      "fulfills": [
+        "ACC-IMAGE-001",
+        "ACC-IMAGE-003",
+        "ACC-PARITY-004"
+      ],
+      "dependsOn": [
+        "data-parity-verify"
+      ],
+      "status": "done",
+      "verdict": "BLOCKED",
+      "evidence": "B1-B6 all VERIFIED. B7 found a CRITICAL breaker no row-parity gate could catch: agentType case round-trip is not identity on the PG backend. pg_repositories.py:404 lowercases agentType into storage provider on write; :248 returns row[\"provider\"] straight back as agentType on read. dynamic_chat_service.py:290 compares `agent_type != \"Snowflake\"` exact-match, and admin.py:58 pins pattern ^(Snowflake|SAP|AWS|Custom)$. Proven live by running both repositories side by side inside the pod: DDB=Snowflake PG=snowflake for all 7 agents. Post-flip every chat returns None and every admin agent PUT 422s, while /health stays green and all 5 gates stay green."
+    },
+    {
+      "id": "rollback-procedure",
+      "stage": "S4",
+      "kind": "impl",
+      "goal": "A written revert procedure naming the exact change and every category of write it strands.",
+      "fulfills": [
+        "ACC-ROLLBACK-001"
+      ],
+      "dependsOn": [
+        "behaviour-judge-S3"
+      ],
+      "touches": [],
+      "boundaries": [
+        "no .md in the code repo - use a GitLab issue or the MR description",
+        "must name the rotated-PAT asymmetry: after a revert the agent uses the old PAT and Cortex 401s with no visible config change"
+      ],
+      "verification": [
+        "the issue or MR section exists and covers every endpoint in the research table"
+      ],
+      "status": "done",
+      "evidence": "Written into gitops !78 description before the flip, per contract. Revert e3fb136 -> ArgoCD auto-syncs; absent DB_BACKEND_WAVE2 means DynamoDB. Includes the three capture queries that must run BEFORE reverting, because rollback is clean for reads and lossy for writes: DynamoDB is never written post-flip, so admin changes made during the PostgreSQL window exist only in PG and a revert strands them."
+    },
+    {
+      "id": "fix-agenttype-case-roundtrip",
+      "stage": "S3",
+      "status": "done",
+      "fulfills": [
+        "ACC-CUTOVER-CHAT-001",
+        "ACC-CUTOVER-ADMIN-002"
+      ],
+      "note": "Root cause: repository storage<->domain translation is asymmetric. Fix the round trip in one place, not the consumers.",
+      "evidence": "branch fix/agenttype-case-roundtrip. New src/db/agent_provider.py is the single source of truth: CANONICAL_AGENT_TYPES + canonical_agent_type() + agent_type_pattern(). _to_item maps the stored slug back to canonical; admin.py derives its pydantic pattern from agent_type_pattern() instead of a duplicated regex, so it cannot drift again. Independently verified by me: round trip identity for all 4 canonical types, unknown slug passes through unmangled, suite 5 failed / 1649 passed (baseline 1626, +23). Mutation: reverting pg_repositories.py failed 18 of 23 new tests.",
+      "followUp": "pg_repositories.py:533 update_fields lowercases agentType without the slug-shape validation put() has. Pre-existing asymmetry between the two write sites, deliberately left out of scope."
+    },
+    {
+      "id": "fix-mask-predicate-interior",
+      "stage": "S3",
+      "status": "done",
+      "fulfills": [
+        "ACC-CRED-005"
+      ],
+      "note": "F1. Verified independently: abcd****wxyz -> True (overwrites real PAT), s*e*c*r* -> False (rejects valid credential). Majority rule only catches masks whose glyphs are >=50pc.",
+      "evidence": "branch fix/interior-mask-credential-predicate. Mask detected by run shape, not majority count. Two deliberately separate thresholds both at 3: decorative filler glyphs vs structural credential punctuation (-_.:/+=~ legitimately repeats as base64 == padding). Independently verified by me: 28/28 correct across 16 mask shapes and 12 real credentials, both directions. First round regressed 3 valid credentials (my!!secret, pw##123, a$$b) at threshold 2; caught in review and returned to the runner. Suite 5 failed / 1666 passed. Mutation to the old majority rule: 28 failed."
+    },
+    {
+      "id": "test-session-ownership-guard",
+      "stage": "S3",
+      "status": "done",
+      "fulfills": [
+        "ACC-OWN-001"
+      ],
+      "note": "F2. Verified independently: no test file imports agent_session_service. Guard at agent_session_service.py:45 called from :154,:357,:429 backing 3 REST endpoints, entirely unexercised.",
+      "evidence": "branch test/session-ownership-guard-coverage. 37 tests, no src changes (git diff --stat -- src empty). I re-ran mutation M-A myself: replacing the guard body with an unconditional raise now gives 24 failed / 13 passed, where before it left the suite byte-identical to baseline. Also pins the IMPOSSIBLE_OWNER_PREDICATE branch via a placeholder requester that would self-match under a naive {user_id: requester_id}. Suite 5 failed / 1663 passed.",
+      "followUp": "requester_id=None bypasses scoping entirely; safe only because AgentAccess.requester_id returns None solely for platform admins. Coupling is implicit and untested at the boundary; behaviour is now pinned by test but the source contract is unchanged."
+    },
+    {
+      "id": "code-judge-S3-r2",
+      "stage": "S3",
+      "status": "running",
+      "note": "Pinned to the integration branch head. Re-judge after the three fixes; must confirm the original findings are dead and no new ones opened."
+    },
+    {
+      "id": "behaviour-judge-S3-r2",
+      "stage": "S3",
+      "status": "pending",
+      "note": "Must run against a DEPLOYED image containing the three fixes. Cannot start until !161 merges and the build publishes."
+    },
+    {
+      "id": "fix-agenttype-write-paths",
+      "stage": "S3",
+      "status": "pending",
+      "note": "Reviewer BLOCK A/B + CI. put() silently rewrites an unrecognised agentType to snowflake; update_fields() does not, so the two write paths disagree. Six literal definitions of the canonical set survive. tests/pg test_pg_agent_writes.py:671 and :1091 assert the OLD lowercase contract and now fail in CI."
+    },
+    {
+      "id": "fix-credential-predicate-r2",
+      "stage": "S3",
+      "status": "pending",
+      "note": "Reviewer BLOCK C. Verified by me: PEM headers, my---secret, pass...word, host=db;pwd=x///y all FALSE-REJECTED; xxxx-xxxx-xxxx-1234, XXXXXXXXXXXX3f9a, abcd**wxyz, ab*cd*ef*gh all wrongly accepted. The 2->3 threshold change I recommended reopened 2-run masks. Root issue: string shape cannot separate a mask from a credential; failure must be loud instead."
+    },
+    {
+      "id": "cutover-flip",
+      "stage": "S4",
+      "kind": "impl",
+      "goal": "DB_BACKEND_WAVE2 is postgres in dev for both services, and every wave-2 repository binds to PostgreSQL.",
+      "fulfills": [
+        "ACC-CUTOVER-001",
+        "ACC-CUTOVER-002"
+      ],
+      "dependsOn": [
+        "rollback-procedure"
+      ],
+      "touches": [
+        "aihub-gitops apps/dev/agent-service/values.yaml",
+        "aihub-gitops apps/dev/auth-service/values.yaml"
+      ],
+      "boundaries": [
+        "dev only - never touch apps/stage or apps/prod",
+        "both files in ONE commit: iam.user_groups is shared and splitting them puts it in two stores",
+        "dev ArgoCD is fully automated, so a merge auto-deploys - there is no manual gate",
+        "keep admin traffic off during the roll: replicas is 1, so old and new pods briefly write to different stores"
+      ],
+      "verification": [
+        "in-pod probe prints Pg* for all four repositories across both services"
+      ],
+      "status": "blocked",
+      "note": "ORDERING CONSTRAINT: copy re-run overwrites all 17 agent columns from DynamoDB unconditionally. It must run BEFORE this flip, while DynamoDB is still authoritative. Re-running it after cutover reverts every Postgres-side admin edit.",
+      "evidence": "gitops !78 open and deliberately NOT merged. Held by behaviour-judge-S3 finding 1 (CRITICAL) and 2 (HIGH).",
+      "blockedBy": "agentType-case-roundtrip fix"
+    },
+    {
+      "id": "cutover-verify",
+      "stage": "S4",
+      "kind": "impl",
+      "goal": "The cutover is proven end to end: credentials resolve, chat works, administration works, login is unaffected, and the two broken agents are no worse.",
+      "fulfills": [
+        "ACC-CUTOVER-003",
+        "ACC-CUTOVER-004",
+        "ACC-CUTOVER-005",
+        "ACC-CUTOVER-006",
+        "ACC-CUTOVER-007",
+        "ACC-CUTOVER-008"
+      ],
+      "dependsOn": [
+        "cutover-flip"
+      ],
+      "touches": [],
+      "boundaries": [
+        "use a disposable agent for the create/delete checks, never a real one",
+        "do not mint credentials for the two PAT-less agents - prove only that they are unchanged",
+        "CANARY: Facilities F&Q (agent-4426745d) is the designated first agent, chosen on evidence not convenience. Parity proven before cutover: identity, host, database DEV_TDEV_ANALYTICS_DB, schema FAQSCHATBOOT, cortex name FACILITIES_FAQ and warehouse all match; PAT correctly absent from provider_config with has_pat_arn=True and alias agent-4426745d; and every column the read path drops is unset in BOTH stores for this agent, so the known read-path gap cannot affect it. Verify it first: first chat, first admin edit. If it misbehaves, revert rather than continue",
+        "engineering_ai is the opposite case - it has queue_name='engineering' and WILL silently fall back to 'default' until read-path-columns lands, sending its RQ jobs to the wrong queue. Do not use it as the canary",
+        "KNOWN BEHAVIOUR CHANGE AT CUTOVER: create_teams_channel (admin_db_service.py ~705) assigns the teams table then never uses it, writes the channel into catalog.agents via agent_repository.put, and returns a read of the teams table the write never reached. Broken today; under PostgreSQL the item has no agentType so agents_provider_ck rejects it and the endpoint 500s instead of failing silently. Verify whether Teams surface is exercised at all before treating a 500 there as a cutover regression"
+      ],
+      "verification": [
+        "a real Cortex response",
+        "admin create, update and delete each visible in catalog.agents",
+        "the internal by-entra lookup returning groups and roles"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "rollback-rehearsal",
+      "stage": "S4",
+      "kind": "impl",
+      "goal": "The revert is exercised in dev and proven to restore service, so the escape hatch is known to work before it is needed.",
+      "fulfills": [
+        "ACC-ROLLBACK-002"
+      ],
+      "dependsOn": [
+        "cutover-verify"
+      ],
+      "touches": [
+        "aihub-gitops apps/dev/agent-service/values.yaml",
+        "aihub-gitops apps/dev/auth-service/values.yaml"
+      ],
+      "boundaries": [
+        "dev only",
+        "revert, prove every wave-2 repository binds back to DynamoDB and the service is healthy, then re-apply the cutover",
+        "use only the disposable agent from cutover-verify - this deliberately strands whatever was written to PostgreSQL in between, which is the behaviour being demonstrated, so nothing real may be in flight",
+        "keep admin traffic off for both rolls"
+      ],
+      "verification": [
+        "in-pod probe shows DynamoDB classes after the revert and Pg* again after re-applying",
+        "service healthy at both points"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "code-judge-S4",
+      "stage": "S4",
+      "kind": "judge",
+      "goal": "Review the gitops diff and the evidence trail. Was every gate actually met before the flip, or was one assumed?",
+      "fulfills": [],
+      "dependsOn": [
+        "rollback-rehearsal"
+      ],
+      "status": "pending"
+    },
+    {
+      "id": "behaviour-judge-S4",
+      "stage": "S4",
+      "kind": "judge",
+      "goal": "Independently drive dev after the cutover and confirm every CUTOVER check, plus that a revert would restore service.",
+      "fulfills": [
+        "ACC-CUTOVER-002",
+        "ACC-CUTOVER-003",
+        "ACC-CUTOVER-004",
+        "ACC-CUTOVER-005",
+        "ACC-ROLLBACK-002"
+      ],
+      "dependsOn": [
+        "rollback-rehearsal"
+      ],
+      "status": "pending"
+    }
+  ]
+}

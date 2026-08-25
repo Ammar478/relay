@@ -1,0 +1,8 @@
+{
+  "relay": "no-dashboard",
+  "stages": [{ "id": "S1", "name": "Stage one", "legs": ["build-it", "judge-it"] }],
+  "legs": [
+    { "id": "build-it", "stage": "S1", "kind": "impl", "goal": "Build it.", "status": "DONE" },
+    { "id": "judge-it", "stage": "S1", "kind": "judge", "goal": "Judge it.", "status": "running" }
+  ]
+}

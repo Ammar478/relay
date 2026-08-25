@@ -1,0 +1,5 @@
+{
+  "relay": "legs-only",
+  "stages": [{ "id": "S1", "name": "Only stage", "legs": ["solo"] }],
+  "legs": [{ "id": "solo", "stage": "S1", "kind": "impl", "goal": "Do the thing.", "status": "wip" }]
+}

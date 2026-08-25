@@ -1,0 +1,8 @@
+{
+  "relay": "all-done",
+  "phase": "complete",
+  "currentStage": "S1",
+  "currentLeg": "c",
+  "checks": { "ACC-C-001": { "status": "passed", "stage": "S1", "claimedBy": "b", "round": 2,
+                             "evidence": "screenshot in .relay/evidence/ACC-C-001.png" } }
+}

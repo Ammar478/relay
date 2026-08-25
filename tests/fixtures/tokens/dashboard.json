@@ -1,0 +1,17 @@
+{
+  "title": "Measured relay",
+  "path": "~/dev/measured",
+  "elapsed": "6h 38m",
+  "tokens": { "input": "324.0K", "cached": "16.8M", "output": "111.0K" },
+  "models": { "coach": { "model": "Opus 4.6", "effort": "high" },
+              "runner": { "model": "Sonnet 4.5", "effort": "medium" },
+              "judge": { "model": "GPT-5", "effort": "high" } },
+  "log": [
+    { "t": "22m ago", "m": "Stage judging: ACC-M-002 still failing", "cls": "gatebad" },
+    { "t": "1h ago", "m": "measured-leg landed", "cls": "gate" },
+    { "t": "3h ago", "m": "plan approved", "cls": "note" }
+  ],
+  "attention": [{ "level": "warn", "label": "SLOW", "text": "next-leg at 47m, median 18m",
+                  "action": "pause -> mark complete" }],
+  "checkTitles": { "ACC-M-001": "Metrics are measured, not guessed" }
+}

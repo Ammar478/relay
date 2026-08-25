@@ -1,0 +1,9 @@
+{
+  "relay": "measured",
+  "phase": "running",
+  "currentStage": "S1",
+  "currentLeg": "next-leg",
+  "checks": { "ACC-M-001": { "status": "passed", "stage": "S1", "claimedBy": "measured-leg", "round": 1,
+                             "evidence": "pytest -q -> 4 passed" },
+              "ACC-M-002": { "status": "pending", "stage": "S1", "claimedBy": "next-leg" } }
+}

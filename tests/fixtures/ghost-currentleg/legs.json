@@ -1,0 +1,8 @@
+{
+  "relay": "ghost",
+  "stages": [{ "id": "S1", "name": "Stage one", "legs": ["one", "two", "vanished"] }],
+  "legs": [
+    { "id": "one", "stage": "S1", "kind": "impl", "goal": "One.", "status": "complete" },
+    { "id": "two", "stage": "S1", "kind": "impl", "goal": "Two.", "status": "queued" }
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "relay": "running-impl",
+  "stages": [
+    { "id": "S1", "name": "Prove the seam", "legs": ["seam-model", "seam-view", "seam-judge"] }
+  ],
+  "legs": [
+    { "id": "seam-model", "stage": "S1", "kind": "impl",
+      "goal": "The model reconciles both sources.",
+      "fulfills": ["ACC-SEAM-001"],
+      "boundaries": ["stdlib only"],
+      "verification": ["ACC-SEAM-001 model built for every fixture"],
+      "status": "done" },
+    { "id": "seam-view", "stage": "S1", "kind": "impl",
+      "goal": "The view draws the seam the model reconciled, at every terminal size, degrading rather than crashing when a pane runs out of rows.",
+      "fulfills": ["ACC-SEAM-002", "ACC-SEAM-003"],
+      "dependsOn": ["seam-model"],
+      "touches": ["src/view.py"],
+      "boundaries": [
+        "do not touch the model",
+        "no hardcoded widths",
+        "colour degrades to monochrome",
+        "read-only with respect to the relay"
+      ],
+      "verification": [
+        "ACC-SEAM-002 frame at 160x48 shows the whole pane",
+        "ACC-SEAM-003 frame at 80x24 keeps the marker on its own row",
+        "ACC-SEAM-004 soak run against the live relay",
+        "python3 -m pytest tests/test_seam.py -q"
+      ],
+      "status": "running" },
+    { "id": "seam-judge", "stage": "S1", "kind": "judge",
+      "goal": "Re-judge the seam once the view lands.",
+      "dependsOn": ["seam-view"], "status": "pending" }
+  ]
+}
