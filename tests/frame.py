@@ -19,8 +19,10 @@ Quick start
         frame.assert_contains("RUNNING")
         frame.assert_within_width()            # nothing wider than 80 cells
 
-        frame = term.send("<Down><Down><Enter>")
+        frame = term.send("<Down><Down><Enter>")   # waits for the program to act
         assert frame.find("cutover-flip") is not None
+
+        frame = term.send("<Enter>", expect="Leg detail")   # the sound form
 
         frame = term.resize(48, 160)           # SIGWINCH, then recapture
         frame.dump(".relay/evidence/legs-160x48.txt")
@@ -47,10 +49,40 @@ literally; `<Name>` is a named key:
     <C-c>, <C-a>, ... (control keys; <^C> works too)
     <lt>  a literal "<"
 
+A step in `run_frames(keys=...)` may also be `(keys, expect)`, which is
+`send(keys, expect=...)`.
+
 Names are case-insensitive. Arrow/Home/End encoding follows the *program's own*
 DECCKM state, exactly as a real terminal does: the harness watches for
 `ESC [ ? 1 h` in the output and switches to `ESC O A` form, so ncurses apps that
 call `keypad(True)` receive real KEY_UP/KEY_DOWN.
+
+Synchronising with the program
+------------------------------
+
+A frame is evidence only if it is the screen the program drew *after* the
+action. `send()` therefore does not simply write the keys and read whatever is
+there; it waits, on two positive signals:
+
+* **Delivery.** The keys are waited out of the pty's input queue, which is
+  something a terminal can observe without the program's cooperation: bytes sit
+  there until the program reads them (`FIONREAD` on the slave fd). So "the
+  program has seen this keystroke" is an observation, not an assumption, and a
+  frame can no longer predate the keystroke it is meant to show. A program that
+  is alive and still has not read within `timeout` fails the call — a wedged
+  TUI is a finding, not a frame.
+* **The answer.** `send(keys, expect="...")` waits for text the repaint must
+  show; it is the sound form and the one to reach for, because it fails loudly
+  with the frame instead of returning a stale one. Without `expect`, the wait
+  ends at the first byte the program writes and the repaint settling after it,
+  bounded by `redraw` (0.75s) for a keystroke that draws nothing at all.
+
+The remaining failure mode, stated plainly: a keystroke whose repaint *starts*
+later than `redraw`, with no `expect` given, still yields the pre-repaint frame.
+That is a bounded wait, not a guess — name the text with `expect=` (or raise
+`redraw=`) whenever a transition may be slower than that. `resize()` has no
+delivery barrier to use, because a signal leaves nothing in the input queue:
+`expect=` is the only sound signal there.
 
 What the screen emulator does
 -----------------------------
@@ -112,6 +144,11 @@ Gotchas worth knowing before you debug something
 * A curses program writes its endwin cleanup on the way out and blocks there if
   nobody is reading the pty, so `wait()` and `close()` keep draining while they
   wait. Do not replace them with a bare `os.waitpid`.
+* A resize while the program holds the alternate screen keeps the saved primary
+  screen, clipped and padded to the new size. ncurses takes the alternate screen
+  (`?1049`) on `xterm-256color`, so a SIGWINCH mid-run and a clean quit meet
+  here: dropping it would mean the program could never hand back the screen it
+  was given.
 * `lines` are right-stripped; use `raw_lines` when a column position matters.
 * Width is *display* width: wide (East Asian W/F) characters count as two cells,
   combining marks as zero.
@@ -841,11 +878,36 @@ class Screen:
         self.cursor_col = min(self.cursor_col, cols - 1)
         self._pending_wrap = False
         self._tabs = set(range(8, cols, 8))
-        self._saved_screen = None
+        # A resize while the program holds the alternate screen must not cost it
+        # the primary screen it is holding: that screen is what it gives back on
+        # the way out, and a TUI is resized far more often than it exits.
+        if self._saved_screen is not None:
+            self._saved_screen = self._fit_saved_screen(self._saved_screen, rows, cols)
 
     @staticmethod
     def _blank_row_of(cols):
         return [_BLANK] * cols
+
+    @staticmethod
+    def _fit_plane(plane, rows, cols, blank):
+        """A saved grid reshaped to `rows` x `cols`: clipped, then padded."""
+        fitted = [
+            row[:cols] + [blank] * max(0, cols - len(row)) for row in plane[:rows]
+        ]
+        fitted.extend([blank] * cols for _ in range(rows - len(fitted)))
+        return fitted
+
+    @classmethod
+    def _fit_saved_screen(cls, saved, rows, cols):
+        """A saved (grid, attrs, wrapped, cursor) tuple reshaped to a new size."""
+        grid, attr_grid, wrapped, row, col = saved
+        return (
+            cls._fit_plane(grid, rows, cols, _BLANK),
+            cls._fit_plane(attr_grid, rows, cols, DEFAULT_ATTRS),
+            (list(wrapped) + [False] * rows)[:rows],
+            min(row, rows - 1),
+            min(col, cols - 1),
+        )
 
     # -- output ----------------------------------------------------------
 
@@ -1164,19 +1226,13 @@ class Screen:
             self.in_alt_screen = False
             if self._saved_screen is None:
                 return
-            grid, attr_grid, wrapped, row, col = self._saved_screen
+            grid, attr_grid, wrapped, row, col = self._fit_saved_screen(
+                self._saved_screen, self.rows, self.cols
+            )
             self._saved_screen = None
-            self._grid = [r[: self.cols] + [_BLANK] * (self.cols - len(r)) for r in grid]
-            self._attr_grid = [
-                r[: self.cols] + [DEFAULT_ATTRS] * (self.cols - len(r))
-                for r in attr_grid
-            ]
-            while len(self._grid) < self.rows:
-                self._grid.append(self._blank_row())
-                self._attr_grid.append(self._blank_attr_row())
-            self._grid = self._grid[: self.rows]
-            self._attr_grid = self._attr_grid[: self.rows]
-            self._wrapped = (wrapped + [False] * self.rows)[: self.rows]
+            self._grid = grid
+            self._attr_grid = attr_grid
+            self._wrapped = wrapped
             if save_cursor:
                 self.cursor_row = self._clamp_row(row)
                 self.cursor_col = self._clamp_col(col)
@@ -1430,6 +1486,12 @@ def _set_winsize(fd, rows, cols):
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
 
 
+# How many bytes are still queued for the program to read. Absent on a platform
+# that does not define it, in which case the delivery barrier has no signal and
+# says so rather than guessing.
+_FIONREAD = getattr(termios, "FIONREAD", None)
+
+
 class TerminalSession:
     """A program running under a pty of a fixed size, with a screen attached.
 
@@ -1447,6 +1509,7 @@ class TerminalSession:
         settle: float = 0.25,
         idle: float = 0.08,
         timeout: float = 5.0,
+        redraw: float = 0.75,
         escdelay: str = "25",
     ):
         self.argv = list(argv)
@@ -1456,6 +1519,7 @@ class TerminalSession:
         self.settle = settle
         self.idle = idle
         self.timeout = timeout
+        self.redraw = redraw
         self.screen = Screen(rows, cols)
         self.pid = None
         self.master_fd = None
@@ -1631,19 +1695,120 @@ class TerminalSession:
         self._drain(settle=settle, timeout=timeout)
         return self.frame()
 
-    def send(self, keys, settle: float = None) -> Frame:
-        """Send a key script, wait for the screen to settle, return the frame."""
-        text = encode_keys(keys, self.screen.application_cursor_keys)
-        return self.send_bytes(text.encode("utf-8"), settle=settle)
+    def send(self, keys, settle: float = None, expect: str = None,
+             timeout: float = None, regex: bool = False) -> Frame:
+        """Send a key script, wait for the program to act on it, return the frame.
 
-    def send_bytes(self, data, settle: float = None) -> Frame:
+        The returned frame is the screen *after* the keystroke, not before it:
+
+        1. the keys are written, then waited out of the pty's input queue, which
+           is how the program reading them becomes an observation rather than an
+           assumption — see `_await_delivery`;
+        2. the program's answer is waited for. `expect` names text the repaint
+           must show and is the sound form — the wait ends when it appears and
+           fails loudly with the frame if it never does. Without `expect` the
+           wait ends at the first byte the program writes and the repaint
+           settling after it, bounded by `redraw` for a keystroke that draws
+           nothing at all.
+
+        `settle` overrides that bound for one call; `timeout` bounds both the
+        delivery barrier and `expect`.
+        """
+        text = encode_keys(keys, self.screen.application_cursor_keys)
+        return self.send_bytes(
+            text.encode("utf-8"), settle=settle, expect=expect, timeout=timeout,
+            regex=regex,
+        )
+
+    def send_bytes(self, data, settle: float = None, expect: str = None,
+                   timeout: float = None, regex: bool = False) -> Frame:
         if self.master_fd is None:
             raise RuntimeError("session is not running")
         if isinstance(data, str):
             data = data.encode("utf-8")
         os.write(self.master_fd, data)
-        self._drain(settle=settle)
+        answered = self._await_delivery(data, timeout=timeout)
+        if expect is not None:
+            return self.wait_for(expect, timeout=timeout, regex=regex)
+        window = self.redraw if settle is None else settle
+        # A prompt program repaints in the same breath as it reads: the barrier
+        # has already picked that repaint up, and only the settling is left.
+        self._await_response(self.idle if answered else window)
         return self.frame()
+
+    def _input_pending(self):
+        """Bytes written to the program that it has not read yet, or None.
+
+        Read from the *slave* fd: its input queue is the one the program reads
+        from, and it is the same on macOS and Linux. None means there is no
+        signal to be had — the pty is gone, the platform has no `FIONREAD`, or
+        the line discipline cannot answer (BSD counts only complete lines in
+        canonical mode, so a half-typed line reads as zero). A missing signal
+        never fails a test; it only means this barrier does not fire.
+        """
+        fd = self._slave_fd
+        if fd is None or _FIONREAD is None:
+            return None
+        try:
+            return struct.unpack("i", fcntl.ioctl(fd, _FIONREAD, b"\0" * 4))[0]
+        except (OSError, ValueError):
+            return None
+
+    def _await_delivery(self, sent, timeout: float = None) -> bool:
+        """Wait until the program has taken `sent` out of the pty input queue.
+
+        This is the one positive signal a terminal can read without the
+        program's cooperation, and it rules out the whole class of frames
+        captured before the program ever saw the key. A program that is alive
+        and still has not read after `timeout` raises: a TUI that has stopped
+        reading its input is a finding, not a frame.
+
+        Returns whether the program answered in the same breath as it read —
+        the waiting has to keep draining the pty (a full buffer would block the
+        program in the middle of its repaint), so a prompt repaint is picked up
+        here rather than by the caller's response wait.
+        """
+        timeout = self.timeout if timeout is None else timeout
+        deadline = time.monotonic() + timeout
+        answered = False
+        while True:
+            pending = self._input_pending()
+            if not pending:
+                return answered
+            if not self.is_running:
+                return answered
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    self.frame()._message(
+                        "the program has not read the %d byte(s) sent to it (%r) "
+                        "within %.1fs — it is not reading its input"
+                        % (pending, sent, timeout)
+                    )
+                )
+            # Only the last slice can hold the answer: while bytes were still
+            # queued the program had not read the keys yet.
+            answered = self._drain(settle=0.005, idle=0.005, timeout=0.05)
+
+    def _await_response(self, window: float) -> bool:
+        """Wait for the program's answer to something it has just been sent.
+
+        Returns as soon as output arrives and then settles, so a program that
+        answers at once pays only its own latency — this is a bounded positive
+        wait, not a sleep. `window` bounds the silent case: a keystroke that
+        legitimately draws nothing must not cost the full timeout. Returns
+        whether anything was drawn.
+        """
+        slice_ = max(self.idle, 0.05)
+        deadline = time.monotonic() + window
+        while True:
+            if self._drain(settle=slice_, idle=self.idle):
+                return True
+            if not self.is_running:
+                # Nothing more is coming; take whatever the exit path wrote.
+                self._drain(settle=0.02, idle=0.02)
+                return False
+            if time.monotonic() >= deadline:
+                return False
 
     def wait_for(self, needle: str, timeout: float = None, regex: bool = False) -> Frame:
         """Wait until the screen shows `needle`; return that frame.
@@ -1671,8 +1836,17 @@ class TerminalSession:
                 )
             self._drain(settle=0.05, idle=0.05, wait_for_first=False)
 
-    def resize(self, rows: int, cols: int, settle: float = None) -> Frame:
-        """Resize the pty and deliver SIGWINCH, then capture."""
+    def resize(self, rows: int, cols: int, settle: float = None,
+               expect: str = None, timeout: float = None,
+               regex: bool = False) -> Frame:
+        """Resize the pty and deliver SIGWINCH, then wait for the redraw.
+
+        A signal leaves nothing in the input queue, so there is no delivery
+        barrier to be had here: `expect` — text the program paints at the new
+        size — is the only sound signal that the redraw has happened. Without
+        it the wait ends at the first byte of the redraw, bounded by `redraw`
+        for a program that does not repaint at all.
+        """
         if self.master_fd is None:
             raise RuntimeError("session is not running")
         self.rows = rows
@@ -1682,7 +1856,9 @@ class TerminalSession:
             _set_winsize(self._slave_fd, rows, cols)
         self.screen.resize(rows, cols)
         self.signal(signal.SIGWINCH)
-        self._drain(settle=settle)
+        if expect is not None:
+            return self.wait_for(expect, timeout=timeout, regex=regex)
+        self._await_response(self.redraw if settle is None else settle)
         return self.frame()
 
     def signal(self, sig):
@@ -1761,6 +1937,10 @@ def run_frames(
     `frames[0]` is the first paint; `frames[n]` is the screen after `keys[n-1]`.
     `wait_for` makes the first frame deterministic by waiting for some text the
     program paints on start-up.
+
+    Every step is synchronised the way `TerminalSession.send()` is. A step given
+    as `(keys, expect)` waits for `expect` to appear before its frame is taken,
+    which is the sound form for a transition the program is slow to paint.
     """
     frames = []
     with TerminalSession(argv, rows=rows, cols=cols, **kwargs) as term:
@@ -1769,5 +1949,9 @@ def run_frames(
         else:
             frames.append(term.frame())
         for step in keys:
-            frames.append(term.send(step))
+            if isinstance(step, (tuple, list)):
+                script, expect = step
+                frames.append(term.send(script, expect=expect))
+            else:
+                frames.append(term.send(step))
     return frames

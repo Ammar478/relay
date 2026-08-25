@@ -415,6 +415,19 @@ def test_attributes_survive_the_alternate_screen():
     assert frame.attrs_for("shell").fg == (32,)
 
 
+def test_the_saved_attribute_plane_survives_a_resize():
+    """A SIGWINCH while the app holds the alternate screen must not cost the
+    primary screen its colours either."""
+    screen = feed("\x1b[32mshell\x1b[?1049h\x1b[2J\x1b[1;1H\x1b[31mapp")
+    screen.resize(6, 24)
+    screen.feed("\x1b[?1049l")
+    frame = screen.frame()
+    assert frame.lines[0] == "shell"
+    assert frame.attrs_for("shell").fg == (32,)
+    assert len(frame.attrs) == 6
+    assert all(len(row) == 24 for row in frame.attrs)
+
+
 def test_reset_clears_the_attribute_plane():
     screen = feed("\x1b[7mREV\x1bcPLAIN")
     frame = screen.frame()

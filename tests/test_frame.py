@@ -202,6 +202,84 @@ curses.wrapper(main)
 sys.exit(0)
 '''
 
+# A program whose response to a keystroke is unambiguous and *slow*. Three
+# shapes of slowness, each of which a "write the keys and read whatever is on
+# screen" capture gets wrong in a different way:
+#
+#   late-read   the key sits unread in the pty while the program is busy, so
+#               the screen still shows the state from before the keystroke.
+#   late-paint  the program reads the key at once but takes its time redrawing.
+#   deaf        the program never reads its input at all — a wedged TUI.
+#
+# The repaint erases the screen first, so "READY" and "AFTER-KEY" can never
+# both be on screen: a frame shows one state or the other, never a blur.
+DEMO_SLOW = r'''
+import os
+import sys
+import termios
+import time
+import tty
+
+mode = sys.argv[1]
+delay = float(sys.argv[2])
+
+fd = sys.stdin.fileno()
+old = termios.tcgetattr(fd)
+tty.setraw(fd)
+try:
+    sys.stdout.write("\x1b[2J\x1b[HREADY")
+    sys.stdout.flush()
+    if mode == "deaf":
+        time.sleep(30)
+    if mode == "late-read":
+        time.sleep(delay)
+    data = os.read(fd, 64)
+    if mode == "late-paint":
+        time.sleep(delay)
+    sys.stdout.write("\x1b[2J\x1b[HAFTER-KEY " + repr(data.decode("utf-8", "replace")))
+    sys.stdout.flush()
+    os.read(fd, 1)
+finally:
+    termios.tcsetattr(fd, termios.TCSADRAIN, old)
+'''
+
+# Writes to the primary screen, then hands it to curses — which takes the
+# alternate screen (`smcup` is `\E[?1049h` on xterm-256color) and gives it back
+# on the way out. This is the ACC-ROBUST-003 / ACC-NAV-005 path: the app is
+# resized while it holds the alternate screen, and what it found must still be
+# there when it quits.
+DEMO_ALT_SCREEN = r'''
+import curses
+import sys
+
+sys.stdout.write("SHELL-LINE\r\n")
+sys.stdout.flush()
+
+
+def main(stdscr):
+    curses.curs_set(0)
+    stdscr.keypad(True)
+    stdscr.timeout(100)
+    last = None
+    while True:
+        size = stdscr.getmaxyx()
+        if size != last:
+            stdscr.erase()
+            stdscr.addnstr(0, 0, "APP-SCREEN %dx%d" % size, size[1] - 1)
+            stdscr.refresh()
+            last = size
+        ch = stdscr.getch()
+        if ch == curses.KEY_RESIZE:
+            curses.update_lines_cols()
+            last = None
+        elif ch in (ord("q"), ord("Q")):
+            break
+
+
+curses.wrapper(main)
+sys.exit(0)
+'''
+
 
 @pytest.fixture
 def program(tmp_path):
@@ -218,6 +296,11 @@ def program(tmp_path):
 @pytest.fixture
 def menu(program):
     return program("menu", DEMO_MENU)
+
+
+@pytest.fixture
+def slow(program):
+    return program("slow", DEMO_SLOW)
 
 
 def session(path, *args, **kwargs):
@@ -397,6 +480,30 @@ def test_alternate_screen_is_restored_on_exit():
     assert screen.lines()[0].rstrip() == "app text"
     screen.feed("\x1b[?1049l")
     assert screen.lines()[0].rstrip() == "shell text"
+
+
+def test_alternate_screen_survives_a_resize():
+    """A resize must not throw away the primary screen the app is holding.
+
+    ncurses uses `?1049` on xterm-256color, so a SIGWINCH delivered to a running
+    TUI lands exactly here: dropping the saved screen means the app can never
+    give back the terminal it was handed.
+    """
+    screen = feed("shell text\x1b[?1049h\x1b[2J\x1b[1;1Happ text")
+    screen.resize(8, 30)
+    assert screen.lines()[0].rstrip() == "app text"
+    screen.feed("\x1b[?1049l")
+    assert screen.lines()[0].rstrip() == "shell text"
+    assert len(screen.lines()) == 8
+    assert all(len(line) == 30 for line in screen.lines())
+
+
+def test_a_saved_screen_wider_than_the_new_size_is_clipped_not_lost():
+    screen = feed("0123456789ABCDEFGHIJ\x1b[?1049h\x1b[2Japp", rows=5, cols=20)
+    screen.resize(3, 10)
+    screen.feed("\x1b[?1049l")
+    assert screen.lines()[0] == "0123456789"
+    assert len(screen.lines()) == 3
 
 
 def test_osc_title_is_consumed():
@@ -733,6 +840,127 @@ def test_a_program_that_exits_at_once_leaves_its_message_in_the_frame(program):
         assert frame.lines[0] == "relay-control: no .relay directory here"
         frame.assert_not_contains("Traceback")
         assert term.wait(timeout=5) == 2
+
+
+# --------------------------------------------------------------------------
+# send() has to synchronise with the child
+#
+# A frame handed to a judge must be the screen the program drew *after* the
+# keystroke. The defect these pin: send() wrote the keys and returned whatever
+# was on screen once the pty had been quiet for a moment, so the frame could
+# predate the keystroke entirely — and every assertion made on it, especially
+# every negative one ("no traceback", "nothing changed", "no line too wide"),
+# passed without the program having processed the key at all.
+#
+# Each test below fails against a harness that only drains: the program is
+# deliberately slower than any quiet-period heuristic.
+# --------------------------------------------------------------------------
+
+
+def test_send_waits_for_the_program_to_read_the_keys(slow):
+    """The frame must not predate the keystroke it is supposed to show."""
+    with session(slow, "late-read", "0.5", rows=10, cols=60) as term:
+        term.wait_for("READY")
+        frame = term.send("x")
+        assert frame.contains("AFTER-KEY"), "send() returned a pre-keystroke frame"
+        assert not frame.contains("READY")
+
+
+def test_send_waits_for_a_repaint_that_starts_late(slow):
+    """Reading the key is not drawing it: the repaint has to be waited for too."""
+    with session(slow, "late-paint", "0.3", rows=10, cols=60) as term:
+        term.wait_for("READY")
+        frame = term.send("x")
+        assert frame.contains("AFTER-KEY"), "send() returned a pre-repaint frame"
+
+
+def test_send_takes_the_text_to_wait_for(slow):
+    """`expect=` is the sound form: a positive signal with no time limit but its
+    own, and a loud failure instead of a stale frame."""
+    with session(slow, "late-paint", "0.9", rows=10, cols=60) as term:
+        term.wait_for("READY")
+        frame = term.send("x", expect="AFTER-KEY")
+        assert frame.line_with("AFTER-KEY") == "AFTER-KEY 'x'"
+
+
+def test_send_expect_fails_with_the_frame_it_actually_got(slow):
+    with session(slow, "late-paint", "0.1", rows=10, cols=60) as term:
+        term.wait_for("READY")
+        with pytest.raises(AssertionError) as excinfo:
+            term.send("x", expect="NEVER-DRAWN", timeout=1.0)
+        message = str(excinfo.value)
+        assert "NEVER-DRAWN" in message
+        assert "AFTER-KEY" in message  # the real screen is in the failure
+
+
+def test_send_fails_when_the_program_never_reads_its_input(slow):
+    """A wedged TUI is a finding, not a frame."""
+    with session(slow, "deaf", "0", rows=10, cols=60) as term:
+        term.wait_for("READY")
+        with pytest.raises(AssertionError) as excinfo:
+            term.send("x", timeout=0.5)
+        assert "has not read" in str(excinfo.value)
+
+
+def test_run_frames_synchronises_every_step(slow):
+    """The one-shot judge API inherits the synchronisation."""
+    frames = run_frames(
+        [sys.executable, slow, "late-read", "0.4"],
+        keys=["x"],
+        rows=10,
+        cols=60,
+        wait_for="READY",
+    )
+    assert len(frames) == 2
+    assert frames[0].contains("READY")
+    assert frames[1].contains("AFTER-KEY")
+
+
+def test_run_frames_takes_the_text_a_step_should_reach(slow):
+    """A step given as `(keys, expect)` waits for the paint it names."""
+    frames = run_frames(
+        [sys.executable, slow, "late-paint", "0.9"],
+        keys=[("x", "AFTER-KEY")],
+        rows=10,
+        cols=60,
+        wait_for="READY",
+    )
+    assert frames[1].line_with("AFTER-KEY") == "AFTER-KEY 'x'"
+
+
+def test_synchronising_does_not_slow_a_program_that_answers_at_once(menu):
+    """The wait is positive, not a sleep: a prompt app pays only its own latency."""
+    import time as _time
+
+    with session(menu, rows=24, cols=80) as term:
+        term.wait_for("alpha")
+        started = _time.monotonic()
+        for _ in range(6):
+            term.send("<Down>")
+            term.send("<Up>")
+        elapsed = _time.monotonic() - started
+    assert elapsed < 6.0, "12 synchronised keystrokes took %.1fs" % elapsed
+
+
+def test_resize_then_quit_restores_the_primary_screen(program):
+    """ACC-ROBUST-003 and ACC-NAV-005 meet here.
+
+    A curses app takes the alternate screen, is resized while it holds it, and
+    must hand back the screen it was given when it quits.
+    """
+    path = program("altscreen", DEMO_ALT_SCREEN)
+    with session(path, rows=48, cols=160) as term:
+        term.wait_for("APP-SCREEN 48x160")
+        term.resize(24, 80)
+        frame = term.wait_for("APP-SCREEN 24x80")
+        frame.assert_within_width()
+        assert not frame.contains("SHELL-LINE")  # still on the alternate screen
+        term.send("q")
+        assert term.wait(timeout=5) == 0
+        frame = term.frame()
+        assert frame.contains("SHELL-LINE"), "the primary screen was not restored"
+        assert not frame.contains("APP-SCREEN")
+        assert term.initial_attrs == term.termios_attrs()
 
 
 # --------------------------------------------------------------------------
