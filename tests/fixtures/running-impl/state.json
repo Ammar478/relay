@@ -1,0 +1,16 @@
+{
+  "relay": "running-impl",
+  "phase": "running",
+  "currentStage": "S1",
+  "currentLeg": "seam-view",
+  "checks": {
+    "ACC-SEAM-001": { "status": "passed", "stage": "S1", "claimedBy": "seam-model", "round": 1,
+                      "evidence": "build() returns a dict for all nine fixtures" },
+    "ACC-SEAM-002": { "status": "passed", "stage": "S1", "claimedBy": "seam-view", "round": 1,
+                      "evidence": "frame at 160x48 in .relay/evidence/" },
+    "ACC-SEAM-003": { "status": "failed", "stage": "S1", "claimedBy": "seam-view", "round": 2,
+                      "reason": "the marker landed on the row above" },
+    "ACC-SEAM-004": { "status": "pending", "stage": "S1", "claimedBy": "seam-view" }
+  },
+  "rounds": { "S1": 2 }
+}
