@@ -13,8 +13,6 @@ fixture imported from `test_relay_model` does; do not write a second one.
 
 import json
 import os
-import re
-import shutil
 import subprocess
 import sys
 import time
@@ -27,16 +25,24 @@ sys.path.insert(0, str(REPO / "scripts"))
 
 import relay_model  # noqa: E402
 
-from test_relay_model import (  # noqa: E402,F401  (`relay` is a pytest fixture)
+# The git corpus lives in `test_relay_model` because ACC-DATA-007's sweeps read
+# it too, and that is the module this one already imports from. One corpus, two
+# checks: a second copy of it here is how the last hole survived its own repair.
+from test_relay_model import (  # noqa: E402,F401  (fixtures are used by name)
     AGENT_SERVICE_BATON_MTIMES,
+    CORPUS_FORK_POINT,
+    CORPUS_OWN,
+    CORPUS_QUOTED,
+    CORPUS_SILENT,
+    HAS_GIT,
+    corpus_relay,
+    git_run as _git,
     relay,
 )
 
 # Later than every recorded baton mtime in the agent-service fixture, so ages
 # come out positive. Pinned, so the whole file is deterministic.
 NOW = 1787600000.0
-
-HAS_GIT = shutil.which("git") is not None
 
 
 def entries_of(model, kind):
@@ -96,9 +102,51 @@ def test_age_is_derived_through_the_injectable_now(relay):
     assert [e["age"] for e in later["log"]] == [e["age"] + 3600 for e in model["log"]]
 
 
-def test_age_is_none_without_a_clock(relay):
-    """`now` is the only clock; without it no now-derived field is filled in."""
+def test_every_entry_carries_an_age_under_the_documented_one_argument_call(relay):
+    """ACC-DATA-005's evidence line, as amended at the S1 gate round 3.
+
+    `build(relay_dir)` is the signature the module documents and the one a view
+    makes. Under it every entry must carry a non-None `at` and a non-None
+    relative `age` — not only when a clock is injected. The check passed for
+    two rounds with `age` None on every entry of every relay, because its
+    evidence asked only for a count and an order.
+
+    The measurement is real, not a constant: an entry's age is the distance
+    from its own timestamp to a clock this test can bracket.
+    """
+    before = time.time()
     model = relay_model.build(relay("agent-service"))
+    after = time.time()
+
+    assert model["log"]
+    for e in model["log"]:
+        assert isinstance(e["t"], float), e
+        assert e["age"] is not None, e
+        assert isinstance(e["age"], float), e
+        assert (before - e["t"]) <= e["age"] <= (after - e["t"]), e
+
+
+def test_the_ages_of_two_entries_differ_by_the_distance_between_them(relay):
+    """And the age is derived from each entry's own time rather than stamped
+    once: two entries an hour apart are an hour apart in age too."""
+    model = relay_model.build(relay("agent-service"))
+    ordered = sorted(model["log"], key=lambda e: e["t"])
+    oldest, newest = ordered[0], ordered[-1]
+    assert newest["t"] > oldest["t"]
+    assert (oldest["age"] - newest["age"]) == pytest.approx(
+        newest["t"] - oldest["t"], abs=0.5)
+
+
+def test_age_is_none_when_the_clock_is_explicitly_refused(relay):
+    """The determinism the default used to provide, kept and made explicit.
+
+    `now=None` is a caller saying "no clock": every now-derived field stays
+    None and the model is byte-identical across builds, which is what a frame
+    capture needs. It used to be the DEFAULT, and that is what left ACC-DATA-005
+    unsatisfiable under its own documented call — the two intents are
+    reconciled by giving each its own spelling rather than by dropping one.
+    """
+    model = relay_model.build(relay("agent-service"), now=None)
     assert model["log"]
     assert all(e["age"] is None for e in model["log"])
     assert all(isinstance(e["t"], float) for e in model["log"])
@@ -201,6 +249,92 @@ def test_an_empty_explicit_log_falls_back_to_the_derived_one(relay, tmp_path):
     model = relay_model.build(target, now=NOW)
     assert model["logSource"] == "derived"
     assert len(model["log"]) >= 10
+    # An EMPTY array is deliberately not "the coach wrote a log": a coach who
+    # writes `[]` has narrated nothing, and the derived log is better than an
+    # empty pane. That is a reading of the contract's wording, not a bug, and
+    # it is pinned here so the warning added below does not swallow it.
+    assert not any("`log`" in w for w in model["warnings"]), model["warnings"]
+
+
+# --------------------------------------------------------------------------
+# ACC-DATA-006 — the edges of "verbatim"
+#
+# `log` was the one dashboard field that degraded SILENTLY. A `log` that is not
+# an array at all was ignored with no warning, unlike `tokens`, `title` and
+# `path`, which all name what they held; and a non-dict entry inside the array
+# was coerced into an entry shape with no word said, which is not "verbatim"
+# either. Whichever way each is decided, a supervisor is owed the same account
+# of it as every other malformed field in the file gets.
+# --------------------------------------------------------------------------
+
+#: Every shape a coach can write where `log` should be an array.
+NOT_AN_ARRAY = [
+    ({"22m ago": "landed"}, "dict"),
+    ("plan approved", "str"),
+    (7, "int"),
+    (True, "bool"),
+]
+
+
+@pytest.mark.parametrize("value,typename", NOT_AN_ARRAY,
+                         ids=[t for _, t in NOT_AN_ARRAY])
+def test_a_log_that_is_not_an_array_is_named_not_silently_ignored(
+        relay, value, typename):
+    target = relay("agent-service")
+    (target / "dashboard.json").write_text(json.dumps({"log": value}))
+
+    model = relay_model.build(target, now=NOW)
+
+    assert model["logSource"] == "derived"
+    assert len(model["log"]) >= 10
+    named = [w for w in model["warnings"] if "`log`" in w]
+    assert len(named) == 1, model["warnings"]
+    assert typename in named[0], named[0]
+
+
+def test_a_log_entry_that_is_not_an_object_is_named_and_still_readable(relay):
+    """The other half. A view reads `t` and `m` off every entry, so a bare
+    string cannot be passed through as it stands — it is quoted into the entry
+    shape with no time of its own, and the supervisor is told that happened
+    rather than left to wonder why an entry has no timestamp."""
+    target = relay("agent-service")
+    (target / "dashboard.json").write_text(json.dumps({"log": [
+        {"t": "1h ago", "m": "a proper entry", "cls": "note"},
+        "a bare string the coach wrote",
+        ["not an entry either"],
+    ]}))
+
+    model = relay_model.build(target, now=NOW)
+
+    assert model["logSource"] == "dashboard"
+    assert len(model["log"]) == 3
+    # The dict entry is untouched: verbatim means verbatim where it can be.
+    assert model["log"][0] == {"t": "1h ago", "m": "a proper entry", "cls": "note"}
+    assert model["log"][1] == {"t": None, "m": "a bare string the coach wrote",
+                               "cls": None}
+    # A non-string entry is RENDERED, never replaced by a placeholder: what the
+    # coach wrote is still legible on the pane (ACC-DATA-007).
+    assert model["log"][2]["t"] is None
+    assert model["log"][2]["m"] == '["not an entry either"]', model["log"][2]
+    assert "not an entry either" in model["log"][2]["m"]
+    assert "—" not in model["log"][2]["m"]
+    named = [w for w in model["warnings"] if "log entry" in w]
+    assert len(named) == 2, model["warnings"]
+    assert "#1" in named[0] and "str" in named[0], named[0]
+    assert "#2" in named[1] and "list" in named[1], named[1]
+
+
+def test_a_coach_written_entry_is_never_dressed_with_a_placeholder(relay):
+    """ACC-DATA-007's rule, where an explicit log meets it: the model quotes
+    what the coach wrote and does not fill an absent `t` with anything."""
+    target = relay("agent-service")
+    (target / "dashboard.json").write_text(json.dumps(
+        {"log": ["only prose"]}))
+
+    entry = relay_model.build(target, now=NOW)["log"][0]
+    assert entry["t"] is None
+    assert entry["m"] == "only prose"
+    assert "—" not in json.dumps(entry)
 
 
 # --------------------------------------------------------------------------
@@ -322,22 +456,6 @@ def test_the_fixture_in_place_still_clears_the_ten_entry_bar():
     assert model["logSource"] == "derived"
     assert len(model["log"]) >= 10
     assert {e["kind"] for e in model["log"]} <= {"baton", "check", "start"}
-
-
-def _git(cwd, *args, when=None):
-    env = dict(os.environ)
-    env.update({
-        "GIT_AUTHOR_NAME": "Relay Test", "GIT_AUTHOR_EMAIL": "t@example.com",
-        "GIT_COMMITTER_NAME": "Relay Test", "GIT_COMMITTER_EMAIL": "t@example.com",
-    })
-    if when is not None:
-        stamp = f"{int(when)} +0000"
-        env["GIT_AUTHOR_DATE"] = stamp
-        env["GIT_COMMITTER_DATE"] = stamp
-    out = subprocess.run(["git", "-C", str(cwd), *args],
-                         capture_output=True, text=True, env=env)
-    assert out.returncode == 0, out.stderr
-    return out
 
 
 @pytest.fixture
@@ -1012,152 +1130,6 @@ def test_a_baton_whose_leg_has_no_runner_row_still_attributes_its_commit(tmp_pat
     entry = commit_named(model, "alpha: the leg's work")
     assert entry is not None, [e["m"] for e in entries_of(model, "commit")]
     assert entry["leg"] == "alpha"
-
-
-# --------------------------------------------------------------------------
-# the real baton corpus (ACC-DATA-009)
-#
-# Every log test above this line runs against batons this file wrote, in the
-# one form the template prescribes, at event counts an order of magnitude
-# below the bounds that bite. The real corpus is nothing like that: of the ten
-# batons in `tests/fixtures/agent-service`, exactly ONE writes the sha the way
-# `**Commit:** <sha>` prescribes, three write it as a bare `Commit `<sha>``
-# heading, two as `Merge commit: `<sha>``, one as `Committed as `<sha>`` two
-# hundred lines down, and three claim no commit at all. The same batons quote
-# OTHER shas in prose - a branch point, a parent, a parallel runner's work -
-# and a sha appearing in a baton is not a claim that the leg produced it.
-#
-# These tests graft the frozen corpus onto a repository whose commits are the
-# shas those batons name. A 7-character sha prefix cannot be forged into a
-# real repository, so the graft goes the other way: the repository's own shas
-# are substituted into copies of the batons, one for one, leaving every baton's
-# prose, structure and line numbers exactly as its runner wrote them.
-# --------------------------------------------------------------------------
-
-# What each corpus baton claims as its OWN work, read by hand from the batons
-# and cross-checked against `behaviour-judge-S1`'s independent reading of them.
-CORPUS_OWN = {
-    "reconcile-develop": "c3319e2",
-    "reconcile-security": "b9183c3",
-    "create-path-credential-guard": "8036f9f",
-    "process-entitlement": "42a735f",
-    "pg-repository-correctness": "4f0b17c",
-    "thread-id-ownership": "7d031a3",
-    "s2-test-quality": "55732a4",
-}
-
-# Shas the same batons only MENTION. Each of these is a real commit in the
-# grafted repository and each sits in a baton next to words that are not a
-# claim: the branch `reconcile-develop` forked FROM, the PARENT of the commit
-# `create-path-credential-guard` made, the sha `pg-repository-correctness`
-# recorded as its own STARTING point. A log that credits one of these to the
-# leg whose baton mentions it is reporting the repository, not the run.
-CORPUS_QUOTED = ("7f8690c", "2d6c125", "378d178", "ac8b835")
-
-# Of those four, `7f8690c` is the commit the run's branch forked FROM -
-# `reconcile-develop`'s own baton says so in as many words - so it sits on
-# `main`, BEFORE the branch point, and not on the run's branch. Where the run
-# owns a branch the branch point is the floor for every commit on it,
-# attributed or not (ACC-DATA-009, amended 2026-08-25); a fork point grafted
-# onto the branch would therefore be inside the run's window, which the real
-# one is not. The topology is what excludes it, and the graft has to model the
-# topology to say so.
-CORPUS_FORK_POINT = "7f8690c"
-
-# Batons that name no commit anywhere. Three of ten: honest absence is the
-# common case in the real corpus, and it must stay absence.
-CORPUS_SILENT = ("chat-session-ownership", "credential-parity", "mask-shape-coverage")
-
-_EARLIEST_BATON = min(AGENT_SERVICE_BATON_MTIMES.values())
-_MT = AGENT_SERVICE_BATON_MTIMES
-
-# (token, when, subject). Every leg's own commit is OLDER than its own baton,
-# because a runner commits and then writes its baton. `7f8690c` is older than
-# the relay's earliest event by hours: it is the branch's starting point and
-# no part of this run.
-CORPUS_COMMITS = [
-    ("7f8690c", _EARLIEST_BATON - 12000,
-     "Merge branch 'feature/sub-1b-agent-write-methods'"),
-    ("c3319e2", _MT["reconcile-develop"] - 221,
-     "merge: land develop credential-preservation fix onto wave-2 cutover"),
-    ("b9183c3", _MT["reconcile-security"] - 54,
-     "merge: land agents-router authentication onto wave-2 cutover"),
-    ("2d6c125", _MT["create-path-credential-guard"] - 900,
-     "chore(deps): project traffic that is nobody's leg"),
-    ("8036f9f", _MT["create-path-credential-guard"] - 43,
-     "fix(credentials): refuse to create an agent with a masked PAT"),
-    ("42a735f", _MT["process-entitlement"] - 63,
-     "fix(process): require entitlement to the agent being addressed"),
-    ("ac8b835", _MT["chat-session-ownership"] - 1500,
-     "feat(chat): stamp the caller onto the session"),
-    ("378d178", _MT["pg-repository-correctness"] - 1200,
-     "test(pg): a starting point, not a landing"),
-    ("4f0b17c", _MT["pg-repository-correctness"] - 198,
-     "fix(db): return the whole agent row, and store the slug"),
-    ("7d031a3", _MT["thread-id-ownership"] - 100,
-     "fix(threads): refuse a thread the caller does not own"),
-    ("55732a4", _MT["s2-test-quality"] - 70,
-     "test: make six certifying tests capable of failing"),
-]
-
-
-@pytest.fixture
-def corpus_relay(tmp_path, relay):
-    """The frozen agent-service batons, on a repository holding their commits.
-
-    Returns `(relay_dir, sha_of)`, where `sha_of[token]` is the real short sha
-    that stands in for the corpus sha `token`.
-    """
-    source = relay("agent-service")            # mtimes already stamped
-    project = tmp_path / "grafted"
-    relay_dir = project / ".relay"
-    shutil.copytree(source, relay_dir)
-
-    _git(project, "init", "-q", "-b", "main")
-    (project / "README").write_text("the project existed before the relay\n")
-    _git(project, "add", "README", when=_EARLIEST_BATON - 20000)
-    _git(project, "commit", "-q", "-m", "chore: the project existed first",
-         when=_EARLIEST_BATON - 20000)
-    sha_of = {}
-
-    def land(token, when, subject):
-        _git(project, "commit", "-q", "--allow-empty", "-m", subject, when=when)
-        sha_of[token] = _git(project, "rev-parse", "--short=7", "HEAD").stdout.strip()
-
-    ordered = sorted(CORPUS_COMMITS, key=lambda c: c[1])
-    for token, when, subject in ordered:
-        if token == CORPUS_FORK_POINT:
-            land(token, when, subject)
-    _git(project, "checkout", "-q", "-b", "feat/wave2-cutover-reconciled")
-    for token, when, subject in ordered:
-        if token != CORPUS_FORK_POINT:
-            land(token, when, subject)
-
-    for path in sorted((relay_dir / "batons").glob("*.md")):
-        text = original = path.read_text()
-        for token, real in sha_of.items():
-            text = text.replace(token, real)
-        if text != original:
-            path.write_text(text)
-        when = AGENT_SERVICE_BATON_MTIMES[path.stem]
-        os.utime(path, (when, when))
-    return relay_dir, sha_of
-
-
-def test_the_corpus_fixture_still_names_the_shas_these_tests_read():
-    """The premise of every test below. The fixture has been refreshed once
-    already; if it is refreshed again and a baton's wording changes, this fails
-    here rather than as a silent false pass downstream."""
-    batons = FIXTURES / "agent-service" / "batons"
-    for leg, sha in CORPUS_OWN.items():
-        assert sha in (batons / f"{leg}.md").read_text(), (leg, sha)
-    for leg in CORPUS_SILENT:
-        text = (batons / f"{leg}.md").read_text()
-        loose = set(re.findall(r"`([0-9a-f]{7,40})`", text))
-        assert loose <= set(CORPUS_QUOTED), (leg, loose)
-    quoted = " ".join(p.read_text() for p in sorted(batons.glob("*.md")))
-    for sha in CORPUS_QUOTED:
-        assert sha in quoted, sha
 
 
 @pytest.mark.skipif(not HAS_GIT, reason="git is not installed")

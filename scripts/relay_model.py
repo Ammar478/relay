@@ -79,10 +79,13 @@ repository's (ACC-DATA-009).
 
 Determinism
 -----------
-The same directory yields the same model. The only wall-clock input is the
-optional `now` argument, which is required before any elapsed-time field is
-filled in; without it those fields stay `None`. `git` is read through a list
-argv with a timeout and a commit cap, and its absence is not an error.
+The same directory and the same clock yield the same model. `now` is the only
+wall-clock input and the only source of non-determinism in the module: omitted,
+it is read once at the top of `build()` so that ages and elapsed times are real
+(ACC-DATA-005); passed an epoch value it is pinned; passed `None` it is refused
+outright and every now-derived field stays `None`, which is what a frame
+capture wants. `git` is read through a list argv with a timeout and a commit
+cap, and its absence is not an error.
 """
 
 import json
@@ -91,6 +94,7 @@ import pathlib
 import re
 import stat
 import subprocess
+import time
 
 __all__ = [
     "build",
@@ -118,6 +122,23 @@ PLACEHOLDERS = {"", "-", "--", "—", "–", "n/a", "na", "none", "null", "tbd",
 
 class RelayNotFound(Exception):
     """The path given to build() is not a directory."""
+
+
+#: `build()`'s `now` when the caller did not mention a clock at all, which is
+#: distinct from a caller who passed `None` to refuse one. Two callers want two
+#: different things and they used to share one spelling:
+#:
+#: * a view, and every documented one-argument call, wants relative ages and
+#:   elapsed times - ACC-DATA-005 requires an age on every log entry under that
+#:   signature, and defaulting to no clock left it `None` on every entry of
+#:   every relay while the check's evidence still passed;
+#: * a test and a frame capture want the model to be byte-identical across
+#:   builds, which only a fixed clock - or none - can give.
+#:
+#: So the default reads the wall clock and `now=None` is the explicit refusal.
+#: A sentinel rather than a magic number, because every real epoch value is a
+#: legitimate thing to pin the model to.
+_NO_CLOCK = object()
 
 
 # --------------------------------------------------------------------------
@@ -398,7 +419,7 @@ def _read_relay_file(path):
             # Bound the loop as well, so a file growing under the read cannot
             # outrun it.
             if total > MAX_RELAY_FILE_BYTES:
-                return None, None, _too_big(total)
+                return None, None, _grew_too_big(total)
     finally:
         os.close(fd)
 
@@ -406,6 +427,21 @@ def _read_relay_file(path):
 def _too_big(size):
     return (f"it is over {size} bytes, past the {MAX_RELAY_FILE_BYTES}-byte "
             "limit one repaint can afford")
+
+
+def _grew_too_big(total):
+    """The in-loop bound's own words, deliberately not the pre-check's.
+
+    The two bounds answer two different questions - "this file was already too
+    big when it was opened" and "this file outgrew the bound while it was being
+    read" - and they are two different repairs for whoever left the path there.
+    They used to share one message, and because `MAX_RELAY_FILE_BYTES` is an
+    exact multiple of `_READ_CHUNK` the byte count was identical too: the test
+    for the pre-check passed by arithmetic coincidence and could not tell which
+    of the two bounds had fired.
+    """
+    return (f"it grew past the {MAX_RELAY_FILE_BYTES}-byte limit one repaint "
+            f"can afford while it was being read ({total} bytes and counting)")
 
 
 def _load(path):
@@ -650,12 +686,23 @@ def _plan_order(legs, stages, warnings):
         for pos, lid in enumerate(stage["legs"]):
             within.setdefault((stage["id"], lid), pos)
 
+    # RULE: a leg of no declared stage ranks after every declared one, and the
+    # rank that does that is `len(stages)` - NOT `len(stage_rank)`.
+    # `stage_rank` is built by skipping unusable ids and by collapsing
+    # duplicates, so it is SHORTER than `stages` for exactly the files this
+    # module already warns about: a null id, a list id, a repeated id. Its
+    # length then collides with a real stage's rank, and where the stage
+    # entries also carry no `legs` array the within-stage key ties too and the
+    # file index decides - putting a leg belonging to no declared stage AHEAD
+    # of S1, which moves `activeLeg` (ACC-DATA-002's second rule). The ranks
+    # themselves are indices into `stages`, so `len(stages)` is above all of
+    # them however many ids were unusable.
     tail = len(legs) + 1
     decorated = []
     for i, leg in enumerate(legs):
         sid = leg.get("stage")
         decorated.append((
-            (stage_rank.get(sid, len(stage_rank)),
+            (stage_rank.get(sid, len(stages)),
              within.get((sid, leg.get("id")), tail),
              i),
             leg,
@@ -1102,7 +1149,26 @@ def _in_a_repo(path, project):
     if limit != current and limit != current.parent:
         limit = current
     for candidate in [current, *current.parents]:
-        if (candidate / ".git").exists():
+        # RULE: a candidate that cannot answer is skipped, not fatal, and not
+        # an answer. `pathlib`'s `exists()` swallows the errors that mean
+        # "nothing is there" - ENOENT, ENOTDIR, ELOOP, EBADF - and lets EACCES
+        # through, because "I may not look" is not "there is nothing here". A
+        # relay directory with no search bit is still a directory, so `build()`
+        # is well past its RelayNotFound guard and `_load` has already degraded
+        # to permission warnings by the time this runs; an exception escaping
+        # here is an uncaught traceback inside a 2 s repaint loop, which
+        # ACC-DATA-001 forbids as plainly as any other.
+        #
+        # The walk CONTINUES rather than stopping, because the live relay shape
+        # is `<project>/.relay` with the `.git` at `<project>`: the directory
+        # that could not answer is the one whose parent holds the repository,
+        # and giving up at the first refusal would cost a chmod'd live relay
+        # its own history. The bound is unchanged - `limit` still ends it.
+        try:
+            found = (candidate / ".git").exists()
+        except OSError:
+            found = False
+        if found:
             return True
         if candidate == limit:
             break
@@ -1648,7 +1714,7 @@ def _derived_log(relay_dir, project, runners, batons, checks, now):
     return entries[:LOG_MAX_ENTRIES]
 
 
-def _log(extras, relay_dir, project, runners, batons, checks, now):
+def _log(extras, relay_dir, project, runners, batons, checks, now, warnings):
     """The Progress Log, and where it came from.
 
     ACC-DATA-006: a coach who writes `dashboard.json.log` is quoted verbatim,
@@ -1657,11 +1723,42 @@ def _log(extras, relay_dir, project, runners, batons, checks, now):
     ACC-DATA-005: otherwise the log is derived. `logSource` is None when there
     was nothing to derive, so a view says "none" honestly instead of rendering
     `1-0 of 0`.
+
+    RULE: `log` degrades the way every other dashboard field does - named, not
+    silently. `tokens`, `title` and `path` each warn when a coach writes
+    something the field cannot hold, and `log` was the one that did not: a
+    `log` that is a dict or a string was dropped without a word, and a non-dict
+    entry inside the array was quietly reshaped, which is not verbatim either.
+
+    RULE: an EMPTY array is not a written log. A coach who writes `[]` has
+    narrated nothing, and the derived log is better than an empty pane, so it
+    falls through with no warning. That is a reading of the contract's wording
+    rather than a defect, it is pinned by a test, and it is stated here so the
+    next reader does not "fix" it.
+
+    A non-dict entry cannot be passed through as it stands, because every view
+    reads `t` and `m` off an entry; it is quoted into the entry shape with no
+    time of its own - never a placeholder - and the reshaping is warned about.
     """
     raw = extras.get("log")
+    if raw is not None and not isinstance(raw, list):
+        warnings.append(f"dashboard.json: `log` is a {type(raw).__name__}, not "
+                        "an array; the derived log is being used instead")
     if isinstance(raw, list) and raw:
-        entries = [e if isinstance(e, dict) else {"t": None, "m": str(e), "cls": None}
-                   for e in raw]
+        entries = []
+        for i, entry in enumerate(raw):
+            if isinstance(entry, dict):
+                entries.append(entry)
+                continue
+            warnings.append(
+                f"dashboard.json: log entry #{i} is a {type(entry).__name__}, "
+                "not an object; it is being quoted as a message with no time "
+                "of its own")
+            entries.append({
+                "t": None,
+                "m": entry if isinstance(entry, str) else _render(entry),
+                "cls": None,
+            })
         return entries, "dashboard"
 
     entries = _derived_log(relay_dir, project, runners, batons, checks, now)
@@ -1672,12 +1769,25 @@ def _log(extras, relay_dir, project, runners, batons, checks, now):
 # build
 # --------------------------------------------------------------------------
 
-def build(relay_dir, now=None):
+def build(relay_dir, now=_NO_CLOCK):
     """Build the reconciled view-model of the relay at `relay_dir`.
 
-    `now` is the only clock. Pass `time.time()` for live elapsed values; leave
-    it None (the default) and every now-derived field stays None, which keeps
-    the model deterministic for tests and for frame capture.
+    `now` is the only clock, and it has three spellings:
+
+    * omitted - `build(relay_dir)`, the documented call - reads the wall clock
+      once, here, so every log entry carries a relative `age` and the running
+      runner carries an elapsed `duration` (ACC-DATA-005). One read, at the top
+      of the build, so every field in one model is measured against one instant
+      and two panes cannot disagree about what "now" was.
+    * an epoch float pins it: the model is byte-identical across builds, which
+      is what a test and a frame capture need.
+    * `None` refuses a clock outright: every now-derived field stays None and
+      the model is deterministic without having to name a time. That used to be
+      the default, and it is why ACC-DATA-005 was unsatisfiable under the
+      signature its own evidence line names.
+
+    Nothing below this line reads a clock, so determinism is a property of what
+    the caller passes and of nothing else.
 
     Raises RelayNotFound when the path is not a directory, is empty, or is not
     a path at all - `build("")` names no relay, and building the process's
@@ -1685,6 +1795,8 @@ def build(relay_dir, now=None):
     someone else's relay. Everything else degrades: a missing file is an empty
     panel, a malformed file is an empty panel plus a warning.
     """
+    if now is _NO_CLOCK:
+        now = time.time()
     if relay_dir is None or (isinstance(relay_dir, str) and not relay_dir.strip()):
         raise RelayNotFound("no relay directory given")
     try:
@@ -1807,7 +1919,7 @@ def build(relay_dir, now=None):
         warnings.append("dashboard.json: `tokens` is not an object; ignored")
 
     log, log_source = _log(extras, relay_dir, project, runners, batons, checks,
-                           now)
+                           now, warnings)
 
     return {
         "relay": {

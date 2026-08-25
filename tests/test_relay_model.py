@@ -18,6 +18,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -356,6 +357,45 @@ def test_every_spelling_lands_on_a_known_state():
         assert relay_model.normalise_status(raw) in LEG_STATES
 
 
+#: The spellings ACC-DATA-004 names by name. The check does not say "some
+#: reasonable set of aliases"; it lists these nine, so these nine are what the
+#: vocabulary owes.
+CONTRACT_SPELLINGS = {
+    "done": "completed", "complete": "completed", "finished": "completed",
+    "DONE": "completed",
+    "in progress": "running", "in_progress": "running", "wip": "running",
+    "TODO": "pending", "queued": "pending",
+}
+
+
+@pytest.mark.parametrize("raw,expected", sorted(CONTRACT_SPELLINGS.items()))
+def test_a_named_spelling_is_recognised_not_merely_defaulted(raw, expected):
+    """Membership in the alias set, not only the mapped result.
+
+    `normalise_status` falls back to `pending`, so a pending alias maps
+    correctly whether or not the table contains it: deleting `queued` left the
+    whole suite green, and `def normalise_status(v): return "pending"` would
+    satisfy two of the nine spellings this check names. Asserting the result
+    alone cannot tell a recognised word from an unrecognised one. Asserting
+    membership can — and it is what makes the `TODO` and `queued` rows of the
+    table above evidence rather than arithmetic.
+    """
+    normalised = raw.strip().lower().replace(" ", "_")
+    assert normalised in relay_model.STATUS_ALIASES[expected], (
+        f"{raw!r} is not in the {expected} alias set; it only reaches "
+        f"{relay_model.normalise_status(raw)!r} through the fallback")
+    assert relay_model.normalise_status(raw) == expected
+
+
+def test_an_unrecognised_word_is_pending_and_is_in_no_alias_set():
+    """The other side of the membership rule: `pending` is still the answer for
+    a word the vocabulary does not know, and the test above must not be
+    satisfiable by adding every string to the table."""
+    assert relay_model.normalise_status("blorp") == "pending"
+    for aliases in relay_model.STATUS_ALIASES.values():
+        assert "blorp" not in aliases
+
+
 def test_leg_status_is_never_none_or_undefined(relay):
     for name in ALL_FIXTURES:
         model = relay_model.build(relay(name))
@@ -465,21 +505,47 @@ def test_runner_numbering_follows_landing_order(relay):
     assert numbered[-1] == "code-judge-S3-r2"      # the running runner is last
 
 
-def test_runner_duration_for_the_active_leg_needs_an_injected_now(relay):
+def test_runner_duration_for_the_active_leg_needs_a_clock(relay):
+    """`now=None` is the explicit refusal of a clock, and it is what keeps a
+    frame capture deterministic. It is no longer the DEFAULT: ACC-DATA-005
+    requires a relative age under the documented one-argument call, so the
+    default reads the wall clock and `now=None` is how a test says otherwise.
+    """
     target = relay("agent-service")
-    without = relay_model.build(target)
-    assert without["activeRunner"]["duration"] is None      # no wall-clock by default
+    refused = relay_model.build(target, now=None)
+    assert refused["activeRunner"]["duration"] is None
+    assert refused["activeRunner"]["start"] == pytest.approx(1787582967.6)
 
     pinned = relay_model.build(target, now=1787583000.0)
     assert pinned["activeRunner"]["start"] == pytest.approx(1787582967.6)
     assert pinned["activeRunner"]["duration"] == pytest.approx(32.4, abs=0.5)
 
 
-@pytest.mark.parametrize("name", ALL_FIXTURES)
-def test_no_em_dash_anywhere_in_the_model(name, relay):
-    model = relay_model.build(relay(name))
-    hits = [(where, s) for where, s in walk_strings(model) if EM_DASH in s]
-    assert hits == [], hits
+def test_the_documented_one_argument_call_measures_the_running_runner(relay):
+    """The other half of the same rule. `build(relay_dir)` is the call the
+    module documents and every caller makes, and under it the running runner's
+    elapsed time is a real measurement rather than an absence."""
+    before = time.time()
+    model = relay_model.build(relay("agent-service"))
+    after = time.time()
+    row = model["activeRunner"]
+    assert row["duration"] is not None
+    # Its start is the previous baton's landing, so the elapsed time is
+    # "now minus that", measured against this test's own clock.
+    assert (before - row["start"]) <= row["duration"] <= (after - row["start"])
+
+
+# RETIRED: `test_no_em_dash_anywhere_in_the_model` asserted the pre-amendment
+# rule — "no em-dash appears anywhere in the model" — which ACC-DATA-007's
+# 2026-08-25 amendment explicitly withdrew: a commit subject, a check's
+# evidence text and a coach's attention prose are quoted verbatim and may
+# legitimately contain one. It was green only because its corpus had zero
+# commit entries in it; against the git corpus below, whose commit subject
+# carries an em-dash the way real ones do, it goes red on a CORRECT model.
+# The amended rule is asserted by `test_model_carries_no_display_placeholders`
+# (a whole string that IS a placeholder), by the runner-column sweeps, and by
+# `test_a_quoted_commit_subject_may_carry_an_em_dash`, which pins the half the
+# amendment added.
 
 
 @pytest.mark.parametrize("name", ALL_FIXTURES)
@@ -558,8 +624,50 @@ def test_baton_status_becomes_runner_status(relay):
 #: Baton landing times, stamped rather than left to the filesystem: `start` and
 #: `duration` are handoffs between them and a test of "60 seconds" needs to
 #: know it was 60 seconds.
-UNSOURCED_MTIMES = {"batoned": 1_000_000.0, "handoff": 1_000_060.0,
-                    "quiet": 1_000_120.0}
+#: Recent enough that git will accept a commit dated relative to them: git's
+#: raw date parser refuses a timestamp small enough to look like a mistake, and
+#: the same relay is built inside a repository below.
+UNSOURCED_MTIMES = {"batoned": 1_787_000_000.0, "handoff": 1_787_000_060.0,
+                    "quiet": 1_787_000_120.0}
+
+
+UNSOURCED_LEGS = {
+    "relay": "unsourced",
+    "stages": [{"id": "S1", "name": "Stage One",
+                "legs": ["batoned", "handoff", "batonless", "quiet"]}],
+    "legs": [{"id": "batoned", "stage": "S1", "status": "done"},
+             {"id": "handoff", "stage": "S1", "status": "done"},
+             {"id": "batonless", "stage": "S1", "status": "done"},
+             {"id": "quiet", "stage": "S1", "status": "done"},
+             {"id": "stageless", "status": "done"},
+             {"status": "done", "goal": "a leg the coach left unnamed"},
+             {"id": "live", "stage": "S1", "status": "running"}],
+}
+
+
+def write_unsourced(root, name="unsourced"):
+    """Write the unsourced relay under `root/name` and return its path.
+
+    A function rather than only a fixture because the same relay has to exist
+    in two places: on its own in `tmp_path`, and as `<project>/.relay` inside a
+    real repository, where `_settle_commits` runs and a claimed commit can be
+    denied. A sweep that only ever reads the first of those cannot see a
+    placeholder written by the second (ACC-DATA-007).
+    """
+    target = write_relay(root, name, legs=UNSOURCED_LEGS)
+    batons = target / "batons"
+    batons.mkdir(exist_ok=True)
+    (batons / "batoned.md").write_text(
+        "# Baton: batoned\n\n**Status:** success\n**Commit:** 1a2b3c4\n")
+    (batons / "handoff.md").write_text(
+        "# Baton: handoff\n\n**Status:** success\n**Commit:** 2b3c4d5\n")
+    # No `Status:` line and no sentence that claims a commit: a runner who
+    # wrote prose and filled in none of the template's fields.
+    (batons / "quiet.md").write_text(
+        "# Baton: quiet\n\nI ran the leg and wrote this and nothing else.\n")
+    for stem, mtime in UNSOURCED_MTIMES.items():
+        os.utime(batons / f"{stem}.md", (mtime, mtime))
+    return target
 
 
 @pytest.fixture
@@ -574,42 +682,21 @@ def unsourced(tmp_path):
     * `batonless`— a completed leg whose runner left no baton at all.
     * `stageless`— the same, and the coach gave it no `stage`.
     * (no id)    — the same, and the coach gave it no `id` either.
-    * `live`     — the running leg: no baton yet, and no clock passed to
-                   `build()`, so its elapsed time is unknown too.
+    * `live`     — the running leg: no baton yet, and the rows below are built
+                   with the clock refused (`now=None`), so its elapsed time is
+                   unknown too.
     """
-    target = write_relay(
-        tmp_path, "unsourced",
-        legs={"relay": "unsourced",
-              "stages": [{"id": "S1", "name": "Stage One",
-                          "legs": ["batoned", "handoff", "batonless", "quiet"]}],
-              "legs": [{"id": "batoned", "stage": "S1", "status": "done"},
-                       {"id": "handoff", "stage": "S1", "status": "done"},
-                       {"id": "batonless", "stage": "S1", "status": "done"},
-                       {"id": "quiet", "stage": "S1", "status": "done"},
-                       {"id": "stageless", "status": "done"},
-                       {"status": "done", "goal": "a leg the coach left unnamed"},
-                       {"id": "live", "stage": "S1", "status": "running"}]})
-    batons = target / "batons"
-    batons.mkdir()
-    (batons / "batoned.md").write_text(
-        "# Baton: batoned\n\n**Status:** success\n**Commit:** 1a2b3c4\n")
-    (batons / "handoff.md").write_text(
-        "# Baton: handoff\n\n**Status:** success\n**Commit:** 2b3c4d5\n")
-    # No `Status:` line and no sentence that claims a commit: a runner who
-    # wrote prose and filled in none of the template's fields.
-    (batons / "quiet.md").write_text(
-        "# Baton: quiet\n\nI ran the leg and wrote this and nothing else.\n")
-    import os
-
-    for stem, mtime in UNSOURCED_MTIMES.items():
-        os.utime(batons / f"{stem}.md", (mtime, mtime))
-    return target
+    return write_unsourced(tmp_path)
 
 
 @pytest.fixture
 def unsourced_rows(unsourced):
-    """`{leg id: row}` for the unsourced relay. The unnamed leg keys on ``""``."""
-    model = relay_model.build(unsourced)
+    """`{leg id: row}` for the unsourced relay. The unnamed leg keys on ``""``.
+
+    Built with `now=None`: this fixture is about columns with NO source, and a
+    wall clock is a source for the running runner's elapsed time.
+    """
+    model = relay_model.build(unsourced, now=None)
     rows = {r["leg"]: r for r in model["runners"]}
     assert len(rows) == len(model["runners"]) == 7, model["runners"]
     return rows
@@ -740,6 +827,367 @@ def test_no_runner_column_carries_a_display_placeholder_when_unsourced(unsourced
 
 
 # --------------------------------------------------------------------------
+# THE CORPUS — relays that can reach the branch a sweep claims to guard
+#
+# Every sweep above this line reads a `relay(name)` copy in `tmp_path`. A
+# `tmp_path` copy is not inside a repository, so `_settle_commits` never runs,
+# no runner row's `commit` ever came from git, and the log holds no commit
+# entry at all. Measured at the S1 gate: 9 models, 39 runner rows, 312 column
+# values, ZERO commit entries. Two placeholders could therefore be written into
+# the model with the whole suite green — `_render`'s fallback returning an
+# em-dash (568 passed) and `_settle_commits` writing one for a claim the
+# repository denies (caught only by ACC-DATA-009, by none of ACC-DATA-007's
+# five sweeps).
+#
+# So the corpus below is the deliverable and the sweeps are its consumers. It
+# is the SAME corpus ACC-DATA-009 reads — the frozen agent-service batons on a
+# repository that really holds the commits they claim — plus the unsourced
+# relay placed inside a repository of its own, which is where a settled commit
+# can come back absent. It lives in this file rather than beside the log tests
+# because two checks read it and this is the module the other imports.
+#
+# A corpus is only evidence while it can still produce the shapes it exists to
+# produce; `test_the_corpus_can_reach_what_the_sweeps_guard` holds it to that.
+# --------------------------------------------------------------------------
+
+HAS_GIT = shutil.which("git") is not None
+
+
+def git_run(cwd, *args, when=None):
+    """`git -C cwd <args>` with a fixed identity and, optionally, a fixed date.
+
+    A test repository whose commits are dated by the wall clock cannot be
+    reasoned about: the whole point of the corpus is that a leg's commit is
+    older than its own baton by a known number of seconds.
+    """
+    env = dict(os.environ)
+    env.update({
+        "GIT_AUTHOR_NAME": "Relay Test", "GIT_AUTHOR_EMAIL": "t@example.com",
+        "GIT_COMMITTER_NAME": "Relay Test", "GIT_COMMITTER_EMAIL": "t@example.com",
+    })
+    if when is not None:
+        stamp = f"{int(when)} +0000"
+        env["GIT_AUTHOR_DATE"] = stamp
+        env["GIT_COMMITTER_DATE"] = stamp
+    out = subprocess.run(["git", "-C", str(cwd), *args],
+                         capture_output=True, text=True, env=env)
+    assert out.returncode == 0, out.stderr
+    return out
+
+
+# --------------------------------------------------------------------------
+# the real baton corpus (ACC-DATA-007, ACC-DATA-009)
+#
+# Batons this file writes are in the one form the template prescribes, at event
+# counts an order of magnitude below the bounds that bite. The real corpus is
+# nothing like that: of the ten batons in `tests/fixtures/agent-service`,
+# exactly ONE writes the sha the way `**Commit:** <sha>` prescribes, three
+# write it as a bare `Commit `<sha>`` heading, two as `Merge commit: `<sha>``,
+# one as `Committed as `<sha>`` two hundred lines down, and three claim no
+# commit at all. The same batons quote OTHER shas in prose - a branch point, a
+# parent, a parallel runner's work - and a sha appearing in a baton is not a
+# claim that the leg produced it.
+#
+# These tests graft the frozen corpus onto a repository whose commits are the
+# shas those batons name. A 7-character sha prefix cannot be forged into a
+# real repository, so the graft goes the other way: the repository's own shas
+# are substituted into copies of the batons, one for one, leaving every baton's
+# prose, structure and line numbers exactly as its runner wrote them.
+# --------------------------------------------------------------------------
+
+# What each corpus baton claims as its OWN work, read by hand from the batons
+# and cross-checked against `behaviour-judge-S1`'s independent reading of them.
+CORPUS_OWN = {
+    "reconcile-develop": "c3319e2",
+    "reconcile-security": "b9183c3",
+    "create-path-credential-guard": "8036f9f",
+    "process-entitlement": "42a735f",
+    "pg-repository-correctness": "4f0b17c",
+    "thread-id-ownership": "7d031a3",
+    "s2-test-quality": "55732a4",
+}
+
+# Shas the same batons only MENTION. Each of these is a real commit in the
+# grafted repository and each sits in a baton next to words that are not a
+# claim: the branch `reconcile-develop` forked FROM, the PARENT of the commit
+# `create-path-credential-guard` made, the sha `pg-repository-correctness`
+# recorded as its own STARTING point. A log that credits one of these to the
+# leg whose baton mentions it is reporting the repository, not the run.
+CORPUS_QUOTED = ("7f8690c", "2d6c125", "378d178", "ac8b835")
+
+# Of those four, `7f8690c` is the commit the run's branch forked FROM -
+# `reconcile-develop`'s own baton says so in as many words - so it sits on
+# `main`, BEFORE the branch point, and not on the run's branch. Where the run
+# owns a branch the branch point is the floor for every commit on it,
+# attributed or not (ACC-DATA-009, amended 2026-08-25); a fork point grafted
+# onto the branch would therefore be inside the run's window, which the real
+# one is not. The topology is what excludes it, and the graft has to model the
+# topology to say so.
+CORPUS_FORK_POINT = "7f8690c"
+
+# Batons that name no commit anywhere. Three of ten: honest absence is the
+# common case in the real corpus, and it must stay absence.
+CORPUS_SILENT = ("chat-session-ownership", "credential-parity", "mask-shape-coverage")
+
+# A commit subject carrying an em-dash, because real ones do. ACC-DATA-007's
+# amendment retired "no em-dash appears anywhere in the model" for exactly this
+# reason: a subject is quoted verbatim and truncating it would be worse than
+# admitting the character. The rule is about values the model INVENTS, and a
+# corpus with no em-dash in it anywhere cannot tell the two apart.
+CORPUS_EM_DASH_SUBJECT = ("merge: land develop credential-preservation fix — "
+                          "onto wave-2 cutover")
+
+_EARLIEST_BATON = min(AGENT_SERVICE_BATON_MTIMES.values())
+_MT = AGENT_SERVICE_BATON_MTIMES
+
+# (token, when, subject). Every leg's own commit is OLDER than its own baton,
+# because a runner commits and then writes its baton. `7f8690c` is older than
+# the relay's earliest event by hours: it is the branch's starting point and
+# no part of this run.
+CORPUS_COMMITS = [
+    ("7f8690c", _EARLIEST_BATON - 12000,
+     "Merge branch 'feature/sub-1b-agent-write-methods'"),
+    ("c3319e2", _MT["reconcile-develop"] - 221, CORPUS_EM_DASH_SUBJECT),
+    ("b9183c3", _MT["reconcile-security"] - 54,
+     "merge: land agents-router authentication onto wave-2 cutover"),
+    ("2d6c125", _MT["create-path-credential-guard"] - 900,
+     "chore(deps): project traffic that is nobody's leg"),
+    ("8036f9f", _MT["create-path-credential-guard"] - 43,
+     "fix(credentials): refuse to create an agent with a masked PAT"),
+    ("42a735f", _MT["process-entitlement"] - 63,
+     "fix(process): require entitlement to the agent being addressed"),
+    ("ac8b835", _MT["chat-session-ownership"] - 1500,
+     "feat(chat): stamp the caller onto the session"),
+    ("378d178", _MT["pg-repository-correctness"] - 1200,
+     "test(pg): a starting point, not a landing"),
+    ("4f0b17c", _MT["pg-repository-correctness"] - 198,
+     "fix(db): return the whole agent row, and store the slug"),
+    ("7d031a3", _MT["thread-id-ownership"] - 100,
+     "fix(threads): refuse a thread the caller does not own"),
+    ("55732a4", _MT["s2-test-quality"] - 70,
+     "test: make six certifying tests capable of failing"),
+]
+
+
+@pytest.fixture(scope="session")
+def corpus_relay(tmp_path_factory):
+    """The frozen agent-service batons, on a repository holding their commits.
+
+    Returns `(relay_dir, sha_of)`, where `sha_of[token]` is the real short sha
+    that stands in for the corpus sha `token`.
+
+    Session-scoped: fifteen git processes is too much to pay once per test, and
+    `build()` never writes to a relay directory (there is a test for that), so
+    every consumer sees the same bytes.
+    """
+    if not HAS_GIT:
+        pytest.skip("git is not installed")
+    root = tmp_path_factory.mktemp("corpus")
+    project = root / "grafted"
+    relay_dir = project / ".relay"
+    shutil.copytree(FIXTURES / "agent-service", relay_dir)
+
+    git_run(project, "init", "-q", "-b", "main")
+    (project / "README").write_text("the project existed before the relay\n")
+    git_run(project, "add", "README", when=_EARLIEST_BATON - 20000)
+    git_run(project, "commit", "-q", "-m", "chore: the project existed first",
+            when=_EARLIEST_BATON - 20000)
+    sha_of = {}
+
+    def land(token, when, subject):
+        git_run(project, "commit", "-q", "--allow-empty", "-m", subject, when=when)
+        sha_of[token] = git_run(project, "rev-parse", "--short=7",
+                                "HEAD").stdout.strip()
+
+    ordered = sorted(CORPUS_COMMITS, key=lambda c: c[1])
+    for token, when, subject in ordered:
+        if token == CORPUS_FORK_POINT:
+            land(token, when, subject)
+    git_run(project, "checkout", "-q", "-b", "feat/wave2-cutover-reconciled")
+    for token, when, subject in ordered:
+        if token != CORPUS_FORK_POINT:
+            land(token, when, subject)
+
+    for path in sorted((relay_dir / "batons").glob("*.md")):
+        text = original = path.read_text()
+        for token, real in sha_of.items():
+            text = text.replace(token, real)
+        if text != original:
+            path.write_text(text)
+        when = AGENT_SERVICE_BATON_MTIMES[path.stem]
+        os.utime(path, (when, when))
+    return relay_dir, sha_of
+
+
+def test_the_corpus_fixture_still_names_the_shas_these_tests_read():
+    """The premise of every test below. The fixture has been refreshed once
+    already; if it is refreshed again and a baton's wording changes, this fails
+    here rather than as a silent false pass downstream."""
+    batons = FIXTURES / "agent-service" / "batons"
+    for leg, sha in CORPUS_OWN.items():
+        assert sha in (batons / f"{leg}.md").read_text(), (leg, sha)
+    for leg in CORPUS_SILENT:
+        text = (batons / f"{leg}.md").read_text()
+        loose = set(re.findall(r"`([0-9a-f]{7,40})`", text))
+        assert loose <= set(CORPUS_QUOTED), (leg, loose)
+    quoted = " ".join(p.read_text() for p in sorted(batons.glob("*.md")))
+    for sha in CORPUS_QUOTED:
+        assert sha in quoted, sha
+
+
+#: The sha `unsourced-in-a-repo`'s `handoff` baton claims. Seven hex characters
+#: that name no object in any repository this test builds, so the claim is
+#: denied and the column must come back absent.
+DENIED_SHA = "2b3c4d5"
+
+
+@pytest.fixture(scope="session")
+def unsourced_in_a_repo(tmp_path_factory):
+    """The unsourced relay as `<project>/.relay` inside a real repository.
+
+    The relay with a row missing a source for every one of the eight columns,
+    where `_settle_commits` actually runs. Two of its batons make the contrast
+    the sweep needs:
+
+    * `batoned` claims the repository's own HEAD, so its `commit` column is a
+      real sha that came from git — erasing the column fails here.
+    * `handoff` claims `DENIED_SHA`, which the repository does not have, so the
+      model must report absence — inventing a placeholder fails here.
+
+    Every earlier em-dash sweep read a `tmp_path` copy, where neither branch
+    runs at all.
+    """
+    if not HAS_GIT:
+        pytest.skip("git is not installed")
+    project = tmp_path_factory.mktemp("unsourced-repo") / "project"
+    relay_dir = write_unsourced(project, ".relay")
+
+    git_run(project, "init", "-q", "-b", "main")
+    (project / "README").write_text("a project the relay supervises\n")
+    git_run(project, "add", "README", when=UNSOURCED_MTIMES["batoned"] - 300)
+    git_run(project, "commit", "-q", "-m", "chore: the project existed first",
+            when=UNSOURCED_MTIMES["batoned"] - 300)
+    git_run(project, "checkout", "-q", "-b", "feat/the-run")
+    git_run(project, "commit", "-q", "--allow-empty",
+            "-m", "batoned: the leg's own work — reported verbatim",
+            when=UNSOURCED_MTIMES["batoned"] - 60)
+    real = git_run(project, "rev-parse", "--short=7", "HEAD").stdout.strip()
+
+    baton = relay_dir / "batons" / "batoned.md"
+    baton.write_text(baton.read_text().replace("1a2b3c4", real))
+    when = UNSOURCED_MTIMES["batoned"]
+    os.utime(baton, (when, when))
+    return relay_dir, real
+
+
+#: The corpus, by the label a failure report should name it with.
+GIT_CORPUS_LABELS = ("agent-service grafted onto its own repository",
+                     "the unsourced relay inside a repository")
+
+
+@pytest.fixture(scope="session")
+def git_corpus(corpus_relay, unsourced_in_a_repo):
+    """`{label: relay_dir}` — every relay in the corpus, keyed for reporting."""
+    return dict(zip(GIT_CORPUS_LABELS, (corpus_relay[0], unsourced_in_a_repo[0])))
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_the_corpus_can_reach_what_the_sweeps_guard(git_corpus, unsourced_in_a_repo):
+    """The corpus assertion, and the reason this leg exists.
+
+    The old sweeps were decoration because their corpus could not produce the
+    values they forbade. This holds the new one to the four shapes the sweeps
+    below need — a git-sourced commit column, a denied claim, an unsourced row
+    for every column, and a quoted em-dash — so a corpus that quietly stops
+    producing one of them fails here rather than passing everything downstream.
+    """
+    models = {label: relay_model.build(target, now=None)
+              for label, target in git_corpus.items()}
+
+    commits = [e for m in models.values() for e in m["log"] if e["kind"] == "commit"]
+    assert len(commits) >= 4, [e["m"] for e in commits]
+
+    rows = [row for m in models.values() for row in m["runners"]]
+    _, real = unsourced_in_a_repo
+    sourced = [r for r in rows if r["commit"] is not None]
+    assert len(sourced) >= 4, rows
+    assert real in {r["commit"] for r in sourced}
+
+    # A claim the repository denies: the branch `_settle_commits` answers None
+    # on, which no `tmp_path` copy has ever reached.
+    denied = [r for r in rows if r["leg"] == "handoff"]
+    assert denied and denied[0]["commit"] is None, denied
+
+    # And a row with nothing behind each of the eight columns, in a relay where
+    # the git branches ran.
+    for column in sorted(RUNNER_KEYS - {"n", "leg", "status"}):
+        assert any(r[column] is None for r in rows), column
+
+    # The retired rule, made falsifiable: an em-dash the model quotes rather
+    # than invents. Against this corpus the pre-amendment
+    # "no em-dash anywhere in the model" test goes red, which is why it is gone.
+    subjects = [e["m"] for e in commits if EM_DASH in e["m"]]
+    assert subjects, [e["m"] for e in commits]
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+@pytest.mark.parametrize("label", GIT_CORPUS_LABELS)
+def test_no_runner_column_carries_a_display_placeholder_in_a_repository(
+        label, git_corpus):
+    """ACC-DATA-007's sweep, over relays where the commit column has a source.
+
+    This is the sweep the five before it should have been. `_render`'s fallback
+    and `_settle_commits`' absent claim both write into a runner column, and
+    both were mutable to an em-dash with the whole suite green because no sweep
+    read a relay that reached them.
+    """
+    _assert_no_placeholder_columns(
+        relay_model.build(git_corpus[label], now=None)["runners"], label)
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+@pytest.mark.parametrize("label", GIT_CORPUS_LABELS)
+def test_the_model_invents_no_placeholder_in_a_repository(label, git_corpus):
+    """And the whole-model placeholder sweep on the same corpus. A string the
+    model invented is one of these exactly; a string it quoted from a commit
+    subject or a coach's prose merely contains one."""
+    model = relay_model.build(git_corpus[label], now=None)
+    banned = {"—", "-", "N/A", "n/a", "undefined", "None", "null", "?"}
+    hits = [(where, s) for where, s in walk_strings(model) if s in banned]
+    assert hits == [], hits
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_quoted_commit_subject_may_carry_an_em_dash(corpus_relay):
+    """ACC-DATA-007 as amended: the rule is about invented values, and a
+    subject the model quotes verbatim is not one. The pre-amendment test
+    asserted the opposite and was green only because its corpus had no commits
+    in it; this asserts the amended rule in the same place."""
+    relay_dir, _ = corpus_relay
+    model = relay_model.build(relay_dir, now=None)
+    quoted = [e for e in model["log"]
+              if e["kind"] == "commit" and CORPUS_EM_DASH_SUBJECT in e["m"]]
+    assert quoted, [e["m"] for e in model["log"] if e["kind"] == "commit"]
+    # Quoted whole: the em-dash survives and the subject is not truncated at it.
+    assert quoted[0]["m"].endswith(CORPUS_EM_DASH_SUBJECT)
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_claimed_commit_the_repository_denies_is_absent_not_invented(
+        unsourced_in_a_repo):
+    """ACC-DATA-007 over `_settle_commits`' own fallback (NB-3). Mutating that
+    `None` to an em-dash was caught by two ACC-DATA-009 tests and by none of
+    ACC-DATA-007's five sweeps, because the path only exists in a repository.
+    Both halves are asserted together, so erasing the sourced column fails as
+    loudly as inventing the absent one."""
+    relay_dir, real = unsourced_in_a_repo
+    rows = {r["leg"]: r for r in relay_model.build(relay_dir, now=None)["runners"]}
+    assert rows["handoff"]["commit"] is None
+    assert rows["batoned"]["commit"] == real
+    assert DENIED_SHA not in str(rows["handoff"])
+
+
+# --------------------------------------------------------------------------
 # ACC-DATA-008 — Token and time metrics are absent, not zero
 # --------------------------------------------------------------------------
 
@@ -778,6 +1226,47 @@ def test_zero_is_kept_when_it_was_actually_measured(relay):
 
     model = relay_model.build(target)
     assert model["metrics"]["tokens"] == {"input": 0, "cached": 0, "output": 0}
+
+
+def test_a_measured_zero_elapsed_is_kept_and_is_not_absence(relay):
+    """The elapsed half of the measured-zero rule, which the tokens half had
+    covered for both. `if elapsed is not None:` mutated to `if elapsed:` left
+    the suite green, and it collapses "nothing spent" into "not measured" —
+    the one distinction ACC-DATA-008 exists to preserve."""
+    target = relay("tokens")
+    dash = json.loads((target / "dashboard.json").read_text())
+    dash["elapsed"] = 0
+    (target / "dashboard.json").write_text(json.dumps(dash))
+
+    model = relay_model.build(target)
+    assert "elapsed" in model["metrics"]
+    assert model["metrics"]["elapsed"] == 0
+
+    # And the other side, so the assertion cannot be satisfied by keeping the
+    # key unconditionally: a coach's placeholder is still absence.
+    dash["elapsed"] = "n/a"
+    (target / "dashboard.json").write_text(json.dumps(dash))
+    assert "elapsed" not in relay_model.build(target)["metrics"]
+
+
+def test_a_tokens_object_with_nothing_measurable_in_it_carries_no_key(relay):
+    """A `tokens` object every one of whose values is a display placeholder has
+    measured nothing, and an empty `tokens` dict in the model reads as "zero
+    tokens" to a view that only asks whether the key is there. Deleting the
+    `if measured:` guard left the suite green, because no fixture had a
+    `tokens` key with nothing measurable behind it."""
+    target = relay("tokens")
+    dash = json.loads((target / "dashboard.json").read_text())
+    dash["tokens"] = {"input": "—", "cached": "", "output": "n/a"}
+    (target / "dashboard.json").write_text(json.dumps(dash))
+
+    metrics = relay_model.build(target)["metrics"]
+    assert "tokens" not in metrics, metrics
+
+    # One real value among them and the key comes back, carrying only it.
+    dash["tokens"]["input"] = "12.0K"
+    (target / "dashboard.json").write_text(json.dumps(dash))
+    assert relay_model.build(target)["metrics"]["tokens"] == {"input": "12.0K"}
 
 
 def test_check_round_is_absent_rather_than_zero(relay):
@@ -955,8 +1444,17 @@ def test_relay_path_and_title(relay):
 
 @pytest.mark.parametrize("name", ALL_FIXTURES)
 def test_build_is_deterministic(name, relay):
+    """The same directory and the same clock yield the same model.
+
+    Both spellings of "the same clock": a pinned one, and none at all. The
+    default reads the wall clock — ACC-DATA-005 requires an age under the
+    one-argument call — so determinism is a property of the clock the caller
+    passes, and `now=None` is how a frame capture asks for no clock at all.
+    """
     target = relay(name)
-    assert relay_model.build(target) == relay_model.build(target)
+    assert relay_model.build(target, now=None) == relay_model.build(target, now=None)
+    assert (relay_model.build(target, now=1787600000.0)
+            == relay_model.build(target, now=1787600000.0))
 
 
 @pytest.mark.parametrize("name", ALL_FIXTURES)
@@ -1752,9 +2250,16 @@ def test_a_leg_field_too_deep_to_render_is_named_rather_than_raised():
     # Both halves of the coercion: a member of a list, which is rendered as
     # JSON, and a bare value that is neither string nor list, which is
     # rendered by `str`. Both recurse; a coach can write either.
-    for rendered in (relay_model._strlist([nest]), relay_model._strlist(deep)):
+    for value, rendered in ((nest, relay_model._strlist([nest])),
+                            (deep, relay_model._strlist(deep))):
         assert isinstance(rendered, list) and len(rendered) == 1
         assert isinstance(rendered[0], str) and rendered[0]
+        # "Named rather than raised" is the whole claim, and `assert rendered[0]`
+        # does not hold it: an em-dash is a non-empty string too, and that is
+        # the mutation of `_render` the suite walked past for two gate rounds.
+        # The value has to be NAMED (ACC-DATA-007: the model never invents).
+        assert type(value).__name__ in rendered[0], rendered[0]
+        assert EM_DASH not in rendered[0] and rendered[0] not in PLACEHOLDER_STRINGS
 
 
 @pytest.mark.parametrize("depth", NEST_DEPTHS)
@@ -1772,6 +2277,398 @@ def test_a_deeply_nested_leg_field_degrades_rather_than_recursing(tmp_path, dept
     assert isinstance(model, dict)
     json.dumps(model)
     assert model["legs"] == [] or model["legs"][0]["id"] == "a"
+
+
+# --------------------------------------------------------------------------
+# ACC-DATA-007 — the model's stringifier, on every branch it guards
+#
+# `_render` is where a coach's non-string value becomes a string, and its
+# `except` catches three exceptions. Only ONE of the three is reachable through
+# a relay file: `json.dumps` raises RecursionError on a structure the JSON
+# scanner accepted, and TypeError and ValueError need a value `json.loads` can
+# never produce — an arbitrary object, and a container that refers to itself.
+#
+# That is why `return "—"` there left 568 tests passing. A sweep cannot see a
+# placeholder written by a branch its corpus cannot reach, so the corpus for
+# those two branches is built here, at the seam, rather than pretended at
+# through a file that cannot carry them.
+# --------------------------------------------------------------------------
+
+def _self_referential():
+    """A list that contains itself: `json.dumps` answers ValueError."""
+    loop = []
+    loop.append(loop)
+    return loop
+
+
+def _too_deep_to_dump():
+    """Nesting past the interpreter's recursion limit: RecursionError."""
+    nest = []
+    for _ in range(60_000):
+        nest = [nest]
+    return nest
+
+
+RENDER_UNRENDERABLE = [
+    ("a value json cannot serialise (TypeError)", object()),
+    ("a container that refers to itself (ValueError)", _self_referential()),
+    ("nesting past the recursion limit (RecursionError)", _too_deep_to_dump()),
+]
+
+
+@pytest.mark.parametrize("label,value", RENDER_UNRENDERABLE,
+                         ids=[label for label, _ in RENDER_UNRENDERABLE])
+def test_render_names_what_it_could_not_render(label, value):
+    """Each of the three branches, with an input that actually reaches it.
+
+    The model never invents a value (ACC-DATA-007), and "I could not read this"
+    is a statement about the value; an em-dash is a view's way of printing
+    nothing at all, and it would be indistinguishable from a field the coach
+    left empty.
+    """
+    rendered = relay_model._render(value)
+    assert rendered == f"an unreadable {type(value).__name__}", label
+    assert EM_DASH not in rendered
+    assert rendered not in PLACEHOLDER_STRINGS
+
+
+def test_render_still_renders_everything_a_relay_file_can_hold():
+    """The other side, so the test above cannot be satisfied by naming the type
+    for every value: what a relay file CAN carry is rendered, not named."""
+    assert relay_model._render([1, "a"]) == '[1, "a"]'
+    assert relay_model._render({"b": 1, "a": 2}) == '{"a": 2, "b": 1}'
+    assert relay_model._render(None) == "null"
+
+
+@pytest.mark.parametrize("label,value", RENDER_UNRENDERABLE,
+                         ids=[label for label, _ in RENDER_UNRENDERABLE])
+def test_an_unrenderable_leg_field_is_named_in_the_model(tmp_path, label, value):
+    """And through `build()`, where the string lands in a leg row. `_strlist`
+    is the only caller of `_render`, and it feeds seven of the leg columns the
+    Active Leg pane draws."""
+    target = write_relay(tmp_path, f"unrenderable-{abs(hash(label))}",
+                         legs={"legs": [{"id": "a", "status": "running"}]})
+    # The value cannot travel through JSON — that is the point of it — so it is
+    # handed to the coercion the way a parsed file would hand it over.
+    rendered = relay_model._strlist([value])
+    assert rendered == [f"an unreadable {type(value).__name__}"], label
+    assert isinstance(relay_model.build(target, now=None), dict)
+
+
+# --------------------------------------------------------------------------
+# ACC-DATA-002 — plan order, when the stage list is not what it should be
+#
+# `_plan_order` ranked a leg of an undeclared stage with `len(stage_rank)`,
+# assuming that sorts after every declared stage. `stage_rank` is built by
+# SKIPPING unusable ids and by collapsing duplicates, so its length collides
+# with a real stage's rank; where the stage entries also carry no `legs` array
+# the within-stage key ties too and the file index decides, putting a leg that
+# belongs to no declared stage AHEAD of S1 — which moves `activeLeg`, and
+# ACC-DATA-002's second rule is about which leg that is.
+#
+# No test exercised plan order with an unusable or a duplicated stage id, which
+# is why a regression in code no recent commit touched went unseen.
+# --------------------------------------------------------------------------
+
+#: A `stages` list whose ids do not number as many as its entries. Each shape
+#: is one a coach can write into `legs.json` today and one the model already
+#: warns about elsewhere — the collision is that it warns and then mis-sorts.
+SHORT_RANKED_STAGES = {
+    "a stage whose id is null": [{"id": None}, {"id": "S1"}],
+    "a stage whose id is a list": [{"id": ["S0"]}, {"id": "S1"}],
+    "a stage whose id is a number": [{"id": 7}, {"id": "S1"}],
+    "a duplicated stage id": [{"id": "S1"}, {"id": "S1"}],
+    "an empty stage id": [{"id": "   "}, {"id": "S1"}],
+}
+
+
+@pytest.mark.parametrize("label,stages", sorted(SHORT_RANKED_STAGES.items()))
+def test_a_leg_of_no_declared_stage_sorts_after_the_declared_ones(
+        tmp_path, label, stages):
+    target = write_relay(
+        tmp_path, f"plan-order-{abs(hash(label))}",
+        legs={"relay": "plan-order", "stages": stages,
+              "legs": [{"id": "zz", "stage": "NOPE", "status": "running"},
+                       {"id": "a", "stage": "S1", "status": "running"}]})
+
+    model = relay_model.build(target, now=None)
+
+    assert [leg["id"] for leg in model["legs"]] == ["a", "zz"], label
+    # ACC-DATA-002 rule 2: the active leg is the FIRST running leg in plan
+    # order, so a broken order silently moves the pane's subject.
+    assert model["activeLeg"]["id"] == "a", label
+    assert model["activeRunner"]["leg"] == "a", label
+
+
+def test_the_declared_stages_still_sort_among_themselves(tmp_path):
+    """The other side of the same key: fixing the tail rank must not flatten
+    the order the stage list declares."""
+    target = write_relay(
+        tmp_path, "plan-order-declared",
+        legs={"relay": "plan-order",
+              "stages": [{"id": None}, {"id": "S1"}, {"id": "S2"}],
+              "legs": [{"id": "later", "stage": "S2", "status": "done"},
+                       {"id": "orphan", "stage": "NOPE", "status": "done"},
+                       {"id": "first", "stage": "S1", "status": "done"}]})
+
+    model = relay_model.build(target, now=None)
+    assert [leg["id"] for leg in model["legs"]] == ["first", "later", "orphan"]
+
+
+def test_a_stage_that_declares_its_legs_still_orders_them(tmp_path):
+    """And the within-stage key, which is what decides when the stage rank
+    ties. A stage's own `legs` array is the order the coach wrote."""
+    target = write_relay(
+        tmp_path, "plan-order-within",
+        legs={"relay": "plan-order",
+              "stages": [{"id": None}, {"id": "S1", "legs": ["second", "first"]}],
+              "legs": [{"id": "first", "stage": "S1", "status": "done"},
+                       {"id": "second", "stage": "S1", "status": "done"},
+                       {"id": "orphan", "stage": "NOPE", "status": "done"}]})
+
+    model = relay_model.build(target, now=None)
+    assert [leg["id"] for leg in model["legs"]] == ["second", "first", "orphan"]
+
+
+# --------------------------------------------------------------------------
+# ACC-DATA-001 — a relay directory the process may not search
+#
+# A relay directory with no search bit is STILL A DIRECTORY, so `build()` gets
+# past the RelayNotFound guard, `_load` degrades correctly to permission-denied
+# warnings, and then the log derivation walks it looking for `.git`.
+# `pathlib`'s `exists()` swallows ENOENT, ENOTDIR, EBADF and ELOOP and lets
+# EACCES through, and the `try/except OSError` nearby wrapped only the
+# `.resolve()` calls — so `build()` raised PermissionError. At S4 that is an
+# uncaught exception inside a 2-second repaint loop.
+#
+# The shape corpus above covers only NON-directories; nothing chmodded the
+# relay directory itself. Root ignores permission bits, so these skip there and
+# say so rather than reporting green for the wrong reason.
+# --------------------------------------------------------------------------
+
+NOT_ROOT = pytest.mark.skipif(
+    os.geteuid() == 0,
+    reason="root ignores permission bits, so a chmod test would pass for the "
+           "wrong reason")
+
+
+@pytest.fixture
+def chmodded():
+    """`chmod` paths and put every mode back, so a failure cannot leave a
+    directory the next run is unable to delete."""
+    restore = []
+
+    def _chmod(path, mode):
+        restore.append((path, os.stat(path).st_mode))
+        os.chmod(path, mode)
+        return path
+
+    try:
+        yield _chmod
+    finally:
+        for path, mode in reversed(restore):
+            try:
+                os.chmod(path, mode)
+            except OSError:
+                pass
+
+
+@NOT_ROOT
+@pytest.mark.parametrize("mode", [0o600, 0o000], ids=["no search bit", "no bits"])
+def test_a_relay_directory_with_no_search_bit_degrades_rather_than_raising(
+        tmp_path, chmodded, mode):
+    project = tmp_path / "project"
+    relay_dir = project / ".relay"
+    (relay_dir / "batons").mkdir(parents=True)
+    (relay_dir / "legs.json").write_text(json.dumps(
+        {"relay": "locked", "legs": [{"id": "a", "status": "done"}]}))
+    chmodded(relay_dir, mode)
+
+    model = build_in_time(relay_dir)
+
+    assert isinstance(model, dict)
+    json.dumps(model)
+    assert model["warnings"], "an unreadable relay says so"
+    assert any("permission" in w.lower() for w in model["warnings"]), \
+        model["warnings"]
+
+
+@NOT_ROOT
+def test_a_relay_whose_repository_is_readable_still_finds_it(tmp_path, chmodded):
+    """The other side of the guard, and the reason an unreadable candidate
+    CONTINUES the walk rather than ending it: the live relay shape is
+    `<project>/.relay` with the `.git` at `<project>`. A `.relay` that cannot
+    answer is a refusal, not an answer, and the repository is one level up."""
+    project = tmp_path / "project"
+    relay_dir = project / ".relay"
+    relay_dir.mkdir(parents=True)
+    (project / ".git").mkdir()
+    chmodded(relay_dir, 0o600)
+
+    assert relay_model._in_a_repo(relay_dir, project) is True
+
+
+@NOT_ROOT
+def test_a_batons_directory_that_cannot_be_listed_is_named_not_raised(
+        tmp_path, chmodded):
+    """The `pathlib` glob trap from the probing skill, at the one place this
+    module lists a directory it does not own."""
+    relay_dir = tmp_path / "relay"
+    batons = relay_dir / "batons"
+    batons.mkdir(parents=True)
+    (batons / "a.md").write_text("# Baton\nSTATUS: success\n")
+    (relay_dir / "legs.json").write_text(json.dumps(
+        {"legs": [{"id": "a", "status": "done"}]}))
+    chmodded(batons, 0o000)
+
+    model = build_in_time(relay_dir)
+
+    assert isinstance(model, dict)
+    assert any("batons" in w for w in model["warnings"]), model["warnings"]
+    assert {r["leg"]: r["batonPath"] for r in model["runners"]} == {"a": None}
+
+
+@NOT_ROOT
+def test_an_unreadable_baton_is_a_warning_and_an_absent_column(
+        tmp_path, chmodded):
+    relay_dir = tmp_path / "relay"
+    batons = relay_dir / "batons"
+    batons.mkdir(parents=True)
+    baton = batons / "a.md"
+    baton.write_text("# Baton\nSTATUS: success\n**Commit:** 1a2b3c4\n")
+    (relay_dir / "legs.json").write_text(json.dumps(
+        {"legs": [{"id": "a", "status": "done"}]}))
+    chmodded(baton, 0o000)
+
+    model = build_in_time(relay_dir)
+
+    rows = {r["leg"]: r for r in model["runners"]}
+    assert rows["a"]["commit"] is None and rows["a"]["batonLines"] is None
+    assert any("a.md" in w and "permission" in w.lower()
+               for w in model["warnings"]), model["warnings"]
+
+
+# --------------------------------------------------------------------------
+# ACC-DATA-001 — the read guard's own error paths
+#
+# Five branches of `_read_relay_file` and `_read_baton` that no test reached.
+# The sharpest was the size PRE-CHECK: `MAX_RELAY_FILE_BYTES` is an exact
+# multiple of `_READ_CHUNK`, so the in-loop bound reported the identical byte
+# count and the test asserting on the message could not tell which of the two
+# had fired. The two bounds answer two different questions — "this file is too
+# big" and "this file grew while I was reading it" — and they now say so.
+# --------------------------------------------------------------------------
+
+def test_the_size_pre_check_and_the_growth_bound_are_told_apart(tmp_path):
+    """The pre-check fires on a file that was already too big when it was
+    opened, and it says so in words the growth bound does not use."""
+    target = tmp_path / "relay"
+    target.mkdir()
+    oversized = target / "legs.json"
+    oversized.write_bytes(b"x" * (relay_model.MAX_RELAY_FILE_BYTES + 1))
+
+    model = relay_model.build(target, now=None)
+
+    why = [w for w in model["warnings"] if "legs.json" in w]
+    assert len(why) == 1, model["warnings"]
+    assert "it is over" in why[0], why[0]
+    assert "grew" not in why[0], why[0]
+
+
+def test_a_file_that_grows_past_the_bound_under_the_read_is_refused(tmp_path):
+    """The in-loop bound, which the pre-check cannot stand in for: `st_size` is
+    a snapshot and a live relay is being written to. A file whose reported size
+    is smaller than what the descriptor yields is exactly that race, held
+    still — `fstat` is made to under-report so the loop is the only bound left
+    to catch it.
+    """
+    target = tmp_path / "relay"
+    target.mkdir()
+    growing = target / "legs.json"
+    growing.write_bytes(b"y" * (relay_model.MAX_RELAY_FILE_BYTES + 1))
+    real_fstat = os.fstat
+
+    class Undersized:
+        """A stat answer that lies about `st_size`, and about nothing else."""
+
+        def __init__(self, st):
+            self.st_mode, self.st_mtime, self.st_size = st.st_mode, st.st_mtime, 1
+
+    def lying_fstat(fd):
+        st = real_fstat(fd)
+        return Undersized(st) if st.st_size > relay_model.MAX_RELAY_FILE_BYTES else st
+
+    raw, mtime, why = None, None, None
+    try:
+        os.fstat = lying_fstat
+        raw, mtime, why = relay_model._read_relay_file(growing)
+    finally:
+        os.fstat = real_fstat
+
+    assert raw is None and mtime is None
+    assert why is not None and "grew" in why, why
+    assert str(relay_model.MAX_RELAY_FILE_BYTES) in why
+
+
+def _open_descriptors():
+    """How many file descriptors this process holds, on macOS and on Linux."""
+    for probe in ("/dev/fd", "/proc/self/fd"):
+        if os.path.isdir(probe):
+            return len(os.listdir(probe))
+    pytest.skip("no descriptor table to read on this platform")
+
+
+def test_repeated_builds_do_not_leak_a_descriptor(relay):
+    """`_read_relay_file` closes in a `finally`, and nothing held it to that.
+    `build()` runs once every two seconds for as long as a supervisor watches,
+    reading three JSON files and a baton per leg: a descriptor leaked per read
+    exhausts the table in minutes."""
+    target = relay("agent-service")
+    relay_model.build(target, now=None)          # warm anything cached
+    before = _open_descriptors()
+    for _ in range(40):
+        relay_model.build(target, now=None)
+    after = _open_descriptors()
+    assert after - before <= 2, (before, after)
+
+
+def test_a_path_with_an_embedded_nul_is_refused_rather_than_raising():
+    """`baton_text` is public and a detail view calls it on whatever path a row
+    carries. `os.open` answers a NUL in a path with ValueError, which is not an
+    OSError and was not caught anywhere below it."""
+    assert relay_model.baton_text("/tmp/a\x00b") is None
+    assert relay_model.baton_text(b"\x00") is None
+    assert relay_model.baton_text(object()) is None
+
+
+def test_a_baton_whose_path_cannot_be_resolved_still_yields_its_row(tmp_path):
+    """`_read_baton` resolves the path it read, for the `batonPath` a detail
+    view opens. `resolve()` is a second walk of the filesystem and can fail
+    where the read did not; the row is still worth having, with the path the
+    caller gave."""
+    relay_dir = tmp_path / "relay"
+    batons = relay_dir / "batons"
+    batons.mkdir(parents=True)
+    (batons / "a.md").write_text("# Baton\nSTATUS: success\n**Commit:** 1a2b3c4\n")
+    (relay_dir / "legs.json").write_text(json.dumps(
+        {"legs": [{"id": "a", "status": "done"}]}))
+
+    real_resolve = Path.resolve
+
+    def refusing_resolve(self, *args, **kwargs):
+        if self.name == "a.md":
+            raise OSError(62, "Too many levels of symbolic links")
+        return real_resolve(self, *args, **kwargs)
+
+    try:
+        Path.resolve = refusing_resolve
+        model = relay_model.build(relay_dir, now=None)
+    finally:
+        Path.resolve = real_resolve
+
+    row = {r["leg"]: r for r in model["runners"]}["a"]
+    assert row["commit"] == "1a2b3c4"
+    assert row["batonPath"] is not None and row["batonPath"].endswith("a.md")
 
 
 # --------------------------------------------------------------------------
