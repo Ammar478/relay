@@ -999,6 +999,18 @@ def _attention(checks, extras, leg_counts):
 # and are not a replacement for these. The entry bound is applied to the
 # relay's own events before the budget is worked out, so that the loosest bound
 # in the module cannot re-order what the tightest one decided.
+#
+# WHAT THE WALK DROPS, and why in that order. `git log` walks back from HEAD,
+# so `LOG_MAX_COMMITS` keeps the NEWEST commits of the window and drops the
+# oldest: a run whose branch carries more than 200 commits loses the commit
+# entries of its first legs'. That is the one direction git bounds cheaply -
+# asking for the OLDEST two hundred means walking all of them, on every
+# repaint - and it is affordable here because a leg's landing entry names its
+# own commit sha whatever the walk returned. What a dropped entry costs the log
+# is the commit's SUBJECT LINE, not the attribution. With the two floors of
+# ACC-DATA-009 settled and the budget forbidden to buy attribution, this is the
+# last bound left standing over an attributed commit, and it is deliberately
+# the loosest one.
 LOG_MAX_COMMITS = 200
 LOG_MAX_ENTRIES = 300
 GIT_TIMEOUT = 3.0
@@ -1095,6 +1107,52 @@ def _in_a_repo(path, project):
         if candidate == limit:
             break
     return False
+
+
+def _project_dir(written, relay_dir, warnings):
+    """The directory the relay's repository is READ from.
+
+    `written` is `dashboard.json.path` as the coach typed it, or None. That
+    string is quoted back verbatim as `relay.path` - a supervisor's label for
+    their own project is theirs - but a read needs a directory, and the two are
+    not the same thing.
+
+    RULE: `~` is expanded. A coach writes a shell path by hand and nothing else
+    in this module expands one, so `~/dev/thing` names a directory called `~`
+    under the process's working directory. `_in_a_repo` then clamps back to the
+    relay directory, finds no `.git`, and the relay is read as one that owns no
+    repository: not a commit in the log, not a baton's claim settled, and not
+    one word about any of it. This repository's own `dashboard.json` was in
+    exactly that state and the log looked merely quiet.
+
+    RULE: a value that still names no directory is a coach's typo, and it is
+    handled the way every other malformed field here is (`_text_or_warn`) -
+    warned about and ignored, so the read falls back to the relay's own
+    project. Ignoring it cannot widen anything: the fallback is the derived
+    project, which is the widest bound `_in_a_repo` allows a written path
+    anyway. `path` may only NARROW that walk, and expanding a `~` is a reading
+    of what the coach wrote rather than a licence to leave the relay's own
+    tree - a `~` that resolves to the host repository is clamped like any other
+    ancestor.
+
+    Never raises: `written` is untrusted, and every shape of it that cannot be
+    read from is the same answer here.
+    """
+    resolved = relay_dir.resolve()
+    derived = str(resolved.parent if resolved.name == ".relay" else resolved)
+    if written is None:
+        return derived
+    try:
+        expanded = os.path.expanduser(written)
+        usable = os.path.isdir(expanded)
+    except (OSError, TypeError, ValueError):
+        expanded, usable = written, False
+    if usable:
+        return expanded
+    warnings.append(f"dashboard.json: `path` {written!r} is not a directory; "
+                    "commits are being read from the relay's own project "
+                    "instead")
+    return derived
 
 
 def _git(relay_dir, *args, stdin=None):
@@ -1308,14 +1366,14 @@ def _relay_commits(relay_dir, project):
       (ACC-DATA-009), and the caller needs both answers to know which of the
       two floors is in force.
 
-    The two bounds do not stack. Where the run owns a branch the branch point
-    is the floor for EVERY commit on it, attributed or not (ACC-DATA-009, as
-    amended 2026-08-25): everything after a branch point is this run's work by
-    construction, and the record floor cannot tighten that without dropping
-    commits the budget was willing to buy. A runner commits *before* it writes its baton,
-    so a first leg's commits are all older than any event the relay recorded;
-    flooring them at the record floor lost every one of them but the claimed
-    one. That is why `branched` is reported rather than folded in here.
+    The two bounds compose PER POPULATION, and the caller composes them: a
+    commit some baton claims is floored at the branch point, a commit nobody
+    claims is floored at the relay's earliest record, and where there is no
+    branch the record floor is the only floor either population has. See
+    `_commit_floors`, which is where that rule is written down once.
+
+    `branched` is reported rather than folded in here because this function
+    knows the topology and not the records, and the two floors need both.
 
     A relay with no records at all has neither bound. It has no window and
     nothing to count against, and the outer `--max-count` walk is all that is
@@ -1334,6 +1392,57 @@ def _relay_commits(relay_dir, project):
         if branch:
             return branch, True
     return _git_log(relay_dir), False
+
+
+def _commit_floors(since, branched):
+    """The TWO floors of ACC-DATA-009: `(claimed, unclaimed)`, in epoch seconds.
+
+    `since` is the floor of the relay's own records and `branched` says the
+    walk is already floored at the branch point. There is one floor per
+    POPULATION, because the two populations are evidenced differently:
+
+    * a commit some leg's baton CLAIMS is floored at the BRANCH POINT. A runner
+      commits before it writes its baton, so a first leg's commit predates
+      every record the relay has, and the branch point is the only bound that
+      admits it. Where the walk is already floored there, no time floor is left
+      to apply and this one is None.
+    * a commit NO leg claims is floored at the relay's EARLIEST RECORD. A run
+      supervised on a branch that already existed does not own what that branch
+      carried before it started: that is the project's history, which is what
+      ACC-DATA-009's title forbids.
+
+    RULE: where there is no branch there is no branch point, and the record
+    floor is the only floor either population has - so a claim is NOT exempt
+    from it there. That exemption is what let a merge dated a day before the
+    relay began into the live relay's log, on the strength of a baton that only
+    mentioned the sha.
+
+    Neither floor is the budget's, and the budget may not stand in for either:
+    a commit must be absent because it is out of window, never because the
+    budget ran out before reaching it. Attribution decides what the budget
+    buys; it also decides which floor applies, and nothing else.
+
+    Nothing on disk tells a first leg's unclaimed second commit from a
+    long-lived branch's pre-relay work - both sit after the branch point and
+    before every record - so the contract picks the side that never lets
+    another run's history in, and pays for it in the first leg's unclaimed
+    extras. Making the branch point the floor for both, as the 2026-08-25
+    amendment first said, pulls a long-lived branch's pre-relay work into the
+    log; that clause was corrected the same day.
+    """
+    return (None if branched else since), since
+
+
+def _floored(commits, floor):
+    """The commits at or after `floor`; all of them when there is no floor.
+
+    Inclusive: a runner that commits and writes its baton inside the same
+    second is the ordinary case, not an edge one, and an exclusive floor loses
+    that commit for a reason nobody could read off the pane.
+    """
+    if floor is None:
+        return commits
+    return [c for c in commits if c[0] >= floor]
 
 
 def _commit_entries(relay_dir, project, batons, records, budget, now):
@@ -1364,18 +1473,14 @@ def _commit_entries(relay_dir, project, batons, records, budget, now):
     first, which above 150 relay events starts discarding attributed commits
     oldest-first and re-inverts the property at scale.
 
-    RULE: one floor for every commit, attributed or not. Where the run owns a
-    branch that floor is the BRANCH POINT, already applied topologically by the
-    walk; where it does not, it is the relay's earliest record. Attribution
-    decides what the budget buys, never what the window admits. The two used to
-    be tangled - attributed commits were exempt from the time bound inside a
-    branch and unattributed ones were not - and the two halves were not
-    composable: a first leg that commits twice before writing its baton had one
-    commit admitted and the other silently dropped, with budget left unspent.
-    Exempting attributed commits from the bound where there is NO branch is a
-    different matter and is still refused; that is what let a merge dated a day
-    before the relay began into the live relay's log on the strength of a baton
-    that only mentioned it.
+    RULE: TWO floors, one per population, and neither of them is the budget
+    (`_commit_floors`). A commit some baton claims is floored at the BRANCH
+    POINT, already applied topologically by the walk; a commit nobody claims is
+    floored at the relay's EARLIEST RECORD; where there is no branch, the
+    record floor is the only floor either has. A commit must be absent from the
+    log because it is out of window, never because the budget ran out before
+    reaching it - the two are indistinguishable on the pane and only one of
+    them is the property.
 
     Only commits are budgeted. A baton, a handoff or a check transition is
     never dropped to make room: they are the events a supervisor came to the
@@ -1402,16 +1507,15 @@ def _commit_entries(relay_dir, project, batons, records, budget, now):
         if baton["commit"]:
             by_commit.setdefault(baton["commit"], leg)
     if has_records:
-        # The walk is ALREADY floored at the branch point when the run owns a
-        # branch, and that is the whole window there: `since` may not tighten
-        # it. Only where there is no branch to bound by does the time bound do
-        # any work, and there it applies to every commit alike.
-        if branched or since is None:
-            in_window = commits
-        else:
-            in_window = [c for c in commits if c[0] >= since]
-        attributed = [c for c in in_window if by_commit.get(c[1])]
-        rest = [c for c in in_window if not by_commit.get(c[1])]
+        # The window, applied to each population at its own floor. The walk is
+        # ALREADY floored at the branch point where the run owns a branch, so
+        # `claimed_floor` is None there and the claim reaches back to it; the
+        # record floor still applies to everything nobody claimed.
+        claimed_floor, unclaimed_floor = _commit_floors(since, branched)
+        attributed = _floored(
+            [c for c in commits if by_commit.get(c[1])], claimed_floor)
+        rest = _floored(
+            [c for c in commits if not by_commit.get(c[1])], unclaimed_floor)
         kept = attributed + rest[:max(0, budget - len(attributed))]
         # `git log` already yields newest first; sorting states the intent and
         # is stable, so equal commit times keep git's own order and the merge
@@ -1642,13 +1746,20 @@ def build(relay_dir, now=None):
     # against that repository before either the runner rows or the log quotes
     # it. Two panes naming different commits for one leg is the class of defect
     # this module exists to remove.
-    path = _text_or_warn(extras.get("path"), "dashboard.json: `path`", warnings)
-    if path is None:
-        resolved = relay_dir.resolve()
-        path = str(resolved.parent if resolved.name == ".relay" else resolved)
+    #
+    # RULE: what is REPORTED and what is READ FROM are two answers. `relay.path`
+    # is the coach's own label for the project, quoted as written; `project` is
+    # a directory to read a repository from, which a label is not (`~` is a
+    # shell convention, and a path can name nothing at all). They differ only
+    # where the written value cannot be read from, and each pane wants a
+    # different one of the two.
+    written = _text_or_warn(extras.get("path"), "dashboard.json: `path`",
+                            warnings)
+    project = _project_dir(written, relay_dir, warnings)
+    path = written if written is not None else project
 
     batons = _read_batons(relay_dir, warnings)
-    _settle_commits(relay_dir, path, batons)
+    _settle_commits(relay_dir, project, batons)
     runners, runner_counts, active_runner = _runner_rows(
         batons, leg_rows, active_leg, now, warnings)
 
@@ -1695,7 +1806,8 @@ def build(relay_dir, now=None):
     elif tokens is not None:
         warnings.append("dashboard.json: `tokens` is not an object; ignored")
 
-    log, log_source = _log(extras, relay_dir, path, runners, batons, checks, now)
+    log, log_source = _log(extras, relay_dir, project, runners, batons, checks,
+                           now)
 
     return {
         "relay": {

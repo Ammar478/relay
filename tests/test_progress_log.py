@@ -1316,26 +1316,60 @@ def test_this_repos_own_relay_credits_only_shas_this_repo_has():
                     if subprocess.run(["git", "-C", str(REPO), "cat-file", "-t", sha],
                                       capture_output=True, text=True).returncode != 0]
     assert unresolvable == [], unresolvable
-    assert "a43fbd8" in {e["commit"] for e in entries_of(model, "commit")}
+    # Derived at assert time, never hardcoded. This branch's history was
+    # rewritten wholesale on 2026-08-25 - an author rewrite, same trees, every
+    # sha new - and the sha this line used to name stopped existing. A test
+    # naming a sha survives that as a green test that no longer tests anything;
+    # HEAD is the one commit the log must always carry, and git is asked for it.
+    head = _git(REPO, "rev-parse", "--short=7", "HEAD").stdout.strip()
+    assert head in {e["commit"] for e in entries_of(model, "commit")}
 
 
 # --------------------------------------------------------------------------
-# pre-relay history on the relay's own branch (ACC-DATA-009)
+# TWO floors, and neither of them is the budget
+# (ACC-DATA-009, corrected 2026-08-25)
+#
+#   * a commit some leg's baton CLAIMS is floored at the BRANCH POINT. A runner
+#     commits before it writes its baton, so a first leg's commit predates
+#     every record the relay has, and the branch point is the only bound that
+#     admits it.
+#   * a commit NO leg claims is floored at the relay's EARLIEST RECORD. A run
+#     supervised on a branch that already existed does not own what that branch
+#     carried beforehand: that is the project's history, which is the thing
+#     this check's title forbids.
+#
+# THE EVIDENCE RULE for this whole section. The budget is `len(events)`, so a
+# small relay hides a pre-relay commit whether or not the window works: it
+# simply runs out of budget before reaching it, and the test goes green for the
+# wrong reason. Every exclusion below is therefore asserted with SPARE LEGS -
+# batons that are events and claim nothing, so the budget can afford every
+# commit the walk returned and only the window can still refuse one. A test
+# that goes green when the budget is raised is not evidence.
 # --------------------------------------------------------------------------
 
-@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
-def test_pre_relay_commits_on_the_relays_own_branch_are_not_in_the_log(tmp_path):
-    """The branch point is not always the relay's beginning: a run can be
-    supervised on a branch that already existed, and everything the branch
-    carried before the run started is the project's history, not this run's."""
-    project = tmp_path / "older-branch"
+def _long_lived_branch(project, spare_legs=0):
+    """A relay supervised on a branch that ALREADY EXISTED.
+
+    `main` carries the project's first commit. `feat/long-lived` carries three
+    more from long before the relay, then alpha's own work; alpha's baton lands
+    after that commit and claims it, then one commit dated at the baton to the
+    second, then five nobody claims. `spare_legs` further batons land later
+    still and claim nothing: each is one more relay event, and the budget is
+    the event count.
+
+    So the branch holds a commit of each population the two floors separate, on
+    both sides of both floors.
+    """
     relay_dir = project / ".relay"
     (relay_dir / "batons").mkdir(parents=True)
-    (relay_dir / "legs.json").write_text(json.dumps({
-        "relay": "older-branch",
-        "stages": [{"id": "S1", "legs": ["alpha"]}],
-        "legs": [{"id": "alpha", "stage": "S1", "status": "done"}],
-    }))
+    legs = [{"id": "alpha", "stage": "S1", "status": "done"}]
+    legs += [{"id": f"spare-{i:03d}", "stage": "S1", "status": "done"}
+             for i in range(spare_legs)]
+    (relay_dir / "legs.json").write_text(json.dumps(
+        {"relay": "long-lived",
+         "stages": [{"id": "S1", "legs": [leg["id"] for leg in legs]}],
+         "legs": legs}))
+
     _git(project, "init", "-q", "-b", "main")
     _git(project, "add", "-A", when=NOW - 90000)
     _git(project, "commit", "-q", "-m", "chore: on main", when=NOW - 90000)
@@ -1347,10 +1381,109 @@ def test_pre_relay_commits_on_the_relays_own_branch_are_not_in_the_log(tmp_path)
     _git(project, "commit", "-q", "--allow-empty", "-m", "alpha: the leg's work",
          when=NOW - 4100)
     _land(relay_dir, "alpha", NOW - 4000, _short_sha(project))
+    # Dated to the second the earliest record carries. A floor is a floor and
+    # not a fence: a runner that commits and writes its baton inside the same
+    # second is the ordinary case, not an edge one.
+    _git(project, "commit", "-q", "--allow-empty",
+         "-m", "on the floor: dated exactly at the earliest record",
+         when=NOW - 4000)
+    for n in range(5):
+        _git(project, "commit", "-q", "--allow-empty",
+             "-m", f"after: the project carried on {n}", when=NOW - 3000 + n)
+    for i in range(spare_legs):
+        _land(relay_dir, f"spare-{i:03d}", NOW - 3900 + i)
+    return relay_dir
 
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+@pytest.mark.parametrize("spare", [0, 8, 40])
+def test_a_long_lived_branchs_pre_relay_commits_are_out_of_window(tmp_path, spare):
+    """The check's own title, asserted so the budget cannot supply the answer.
+
+    At `spare=0` this is the test this section replaces, and it passed whether
+    or not the window worked: one event bought one commit and the attributed
+    one took it. At `spare=8` and `spare=40` the budget can afford every commit
+    the walk returned, and only the window can still exclude these three.
+    """
+    relay_dir = _long_lived_branch(tmp_path / "older", spare)
     model = relay_model.build(relay_dir, now=NOW)
-    assert commit_named(model, "alpha: the leg's work") is not None
-    assert not [e["m"] for e in entries_of(model, "commit") if "before:" in e["m"]]
+    commits = entries_of(model, "commit")
+    events = relay_events(model)
+    assert len(events) == 1 + spare, [e["m"] for e in events]
+    assert not [e["m"] for e in commits if "before:" in e["m"]]
+    if spare:
+        # The budget could have bought every commit on the branch, and bought
+        # every one the window admits: what is missing is missing because it is
+        # out of WINDOW. Asserted as an equality against the branch itself
+        # rather than as a count, so a budget that quietly tightens cannot make
+        # this pass.
+        on_branch = _git(relay_dir, "log", "--format=%s", "HEAD",
+                         "--not", "refs/heads/main").stdout.splitlines()
+        assert len(on_branch) == 10
+        assert {s for s in on_branch if not s.startswith("before:")} == \
+            {e["m"].split(": ", 1)[1] for e in commits}
+        assert len(commits) < len(events)      # and budget still left over
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_claimed_commit_that_predates_every_record_is_kept(tmp_path):
+    """The other floor, on the same branch. Alpha committed before it wrote its
+    baton, so its commit is older than every record the relay has; the branch
+    point is the only bound that admits it, and the claim is what reaches."""
+    relay_dir = _long_lived_branch(tmp_path / "older", 8)
+    model = relay_model.build(relay_dir, now=NOW)
+    entry = commit_named(model, "alpha: the leg's work")
+    assert entry is not None, [e["m"] for e in entries_of(model, "commit")]
+    assert entry["leg"] == "alpha"
+    assert entry["t"] < min(e["t"] for e in relay_events(model))
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_an_unclaimed_commit_before_the_earliest_record_is_absent(tmp_path):
+    """The rule stated as an invariant rather than by name: inside a branch,
+    every commit older than the relay's earliest record carries a leg."""
+    relay_dir = _long_lived_branch(tmp_path / "older", 40)
+    model = relay_model.build(relay_dir, now=NOW)
+    floor = min(e["t"] for e in relay_events(model))
+    for entry in entries_of(model, "commit"):
+        assert entry["leg"] or entry["t"] >= floor, entry["m"]
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_an_unclaimed_commit_after_the_earliest_record_is_present(tmp_path):
+    """The floor is a floor and not a ban: the project's traffic from while the
+    relay was running is part of the run's story, and the budget buys it."""
+    relay_dir = _long_lived_branch(tmp_path / "older", 8)
+    model = relay_model.build(relay_dir, now=NOW)
+    after = [e for e in entries_of(model, "commit") if "after:" in e["m"]]
+    assert len(after) == 5, [e["m"] for e in entries_of(model, "commit")]
+    assert all(e["leg"] is None for e in after)
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_commit_dated_exactly_at_the_earliest_record_is_in_the_window(tmp_path):
+    """The floor is inclusive. A runner that commits and writes its baton
+    inside the same second is the ordinary case, and an exclusive floor loses
+    that commit for a reason nobody could read off the pane."""
+    relay_dir = _long_lived_branch(tmp_path / "older", 8)
+    model = relay_model.build(relay_dir, now=NOW)
+    entry = commit_named(model, "on the floor:")
+    assert entry is not None, [e["m"] for e in entries_of(model, "commit")]
+    assert entry["leg"] is None                        # nothing claims it
+    assert entry["t"] == min(e["t"] for e in relay_events(model))
+
+
+def test_the_two_floors_are_derived_from_the_records_and_the_topology():
+    """`_commit_floors` at its own seam, with no repository in sight: the two
+    floors differ only where the run owns a branch, and where it does not, a
+    claim is NOT exempt from the record floor. That exemption is what let a
+    merge dated a day before the relay began into the live relay's log, on the
+    strength of a baton that only mentioned it."""
+    assert relay_model._commit_floors(1000.0, True) == (None, 1000.0)
+    assert relay_model._commit_floors(1000.0, False) == (1000.0, 1000.0)
+    # A relay whose records cannot be timed has a window and no floor.
+    assert relay_model._commit_floors(None, True) == (None, None)
+    assert relay_model._commit_floors(None, False) == (None, None)
 
 
 # --------------------------------------------------------------------------
@@ -1616,14 +1749,22 @@ def test_a_detached_head_is_bounded_by_the_records_like_any_other(tmp_path):
 
 
 # --------------------------------------------------------------------------
-# the branch point is the floor for EVERY commit, attributed or not
-# (ACC-DATA-009, amended 2026-08-25 at the S1 gate round 3)
+# a first leg's CLAIMED commit reaches back past the records; its unclaimed
+# ones do not (ACC-DATA-009, corrected 2026-08-25)
 #
-# "The window opens at the branch point" and "the remaining budget goes to the
-# newest unattributed ones" were not composable while the model floored
-# UNATTRIBUTED commits at the earliest recorded event: an unattributed commit
-# after the branch point was eligible by one clause and excluded by the other,
-# and the budget went unspent while in-window commits were dropped.
+# The 2026-08-25 amendment made the branch point the floor for EVERY commit,
+# attributed or not, so that all three of a first leg's commits were admitted.
+# The coach wrote that clause and it was wrong: the same rule admits everything
+# a long-lived branch carried before the run started, which is the project's
+# history and the thing this check's title forbids. The contract was corrected
+# the same day - two floors, one per population - and this fixture is where the
+# correction is paid for.
+#
+# Two of alpha's three commits are now OUT, and that is a real loss: they are
+# the run's work. Nothing on disk tells them from a long-lived branch's
+# pre-relay work - both sit after the branch point and before every record - so
+# the only evidence that separates the two populations is a CLAIM, and what
+# carries no claim is floored at the records.
 # --------------------------------------------------------------------------
 
 @pytest.fixture
@@ -1662,36 +1803,37 @@ def first_leg_burst(tmp_path):
 
 
 @pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
-def test_a_first_legs_unclaimed_commits_are_inside_the_window(first_leg_burst):
-    """The case the amendment was written about. All three of alpha's commits
-    predate the relay's earliest recorded event and all three are after the
-    branch point, so all three are this run's work by construction. The model
-    used to keep the one the baton claimed and floor the other two at the
-    earliest event - dropping in-window commits while leaving budget unspent.
-    """
+def test_a_first_legs_claimed_commit_reaches_back_past_the_records(first_leg_burst):
+    """The case the branch-point floor exists for. Alpha's third commit is
+    older than the relay's earliest recorded event - a runner commits before it
+    writes its baton - and the branch point is the only bound that admits it."""
     model = relay_model.build(first_leg_burst, now=NOW)
     steps = [e for e in entries_of(model, "commit") if "alpha: step" in e["m"]]
-    assert len(steps) == 3, [e["m"] for e in entries_of(model, "commit")]
-    earliest_event = min(e["t"] for e in relay_events(model))
-    assert all(e["t"] < earliest_event for e in steps)
-    # Exactly one of them is a claim; the other two ride in on the budget.
-    assert [e["leg"] for e in sorted(steps, key=lambda e: e["t"])] == \
-        [None, None, "alpha"]
+    assert len(steps) == 1, [e["m"] for e in entries_of(model, "commit")]
+    assert steps[0]["leg"] == "alpha"
+    assert steps[0]["t"] < min(e["t"] for e in relay_events(model))
 
 
 @pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
-def test_the_budget_is_spent_rather_than_left_unspent(first_leg_burst):
-    """The other half of the same defect: what the budget could not buy was
-    not left over, it was discarded. Four events, two attributed commits, so
-    two unattributed commits are affordable - and there are exactly two in the
-    window."""
+def test_a_first_legs_unclaimed_commits_do_not(first_leg_burst):
+    """The price of the correction, named rather than left implicit. Alpha's
+    first two commits are the run's own work and they are not in the log: no
+    baton claims them and they predate every record, which is what a long-lived
+    branch's pre-relay work also looks like.
+
+    Asserted with the budget WIDE OPEN, so what excludes them is the window: at
+    four events and two attributed commits the budget could buy two more, and
+    there are exactly two it is not buying."""
     model = relay_model.build(first_leg_burst, now=NOW)
     commits = entries_of(model, "commit")
     events = relay_events(model)
     assert len(events) == 4, [e["m"] for e in events]
-    assert len(commits) <= len(events)
     assert len([e for e in commits if e["leg"]]) == 2
-    assert len([e for e in commits if not e["leg"]]) == 2
+    assert [e for e in commits if not e["leg"]] == []
+    assert len(events) - len(commits) == 2      # budget left deliberately over
+    on_branch = _git(first_leg_burst, "log", "--format=%s", "HEAD",
+                     "--not", "refs/heads/main").stdout.splitlines()
+    assert len([s for s in on_branch if "alpha: step" in s]) == 3
 
 
 @pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
@@ -1970,3 +2112,261 @@ def test_the_window_opens_when_state_json_recorded_a_check_transition(tmp_path):
     assert commit_named(model, "work: done while the relay was running") \
         is not None, [e["m"] for e in entries_of(model, "commit")]
     assert commit_named(model, "before: long before the relay") is None
+
+
+# --------------------------------------------------------------------------
+# LOG_MAX_COMMITS bounds the WALK, and it is the last bound left over
+# attributed commits (ACC-DATA-009)
+#
+# With the two floors settled and the budget forbidden to buy attribution, the
+# git walk's own `--max-count` is the only cap still standing over a claimed
+# commit. It is spent newest-first, because newest-first from HEAD is the only
+# walk git bounds cheaply: asking for the OLDEST two hundred means walking all
+# of them, on every repaint. So a run whose branch carries more than
+# LOG_MAX_COMMITS commits loses the commit ENTRIES of its oldest, which are its
+# first legs'.
+#
+# That drop is the outer safety net's, and it is affordable for a reason worth
+# stating: a leg's landing entry names its own commit sha whatever the walk
+# returned, so what a dropped entry costs the log is the commit's SUBJECT LINE
+# and not the attribution. Both halves of the boundary are pinned below, and
+# the absence is proved to be the CAP's doing by raising the cap and watching
+# the commit appear.
+#
+# This fixture is the most expensive in the file - LOG_MAX_COMMITS + 5 commits,
+# one git process each - so it is built once for the module and only read.
+# --------------------------------------------------------------------------
+
+BEYOND_THE_WALK = 5
+
+
+@pytest.fixture(scope="module")
+def past_the_walk_bound(tmp_path_factory):
+    """A run whose branch carries five commits MORE than the walk returns.
+
+    Every baton lands BEFORE every commit, so the record floor admits the whole
+    branch and the walk's own bound is the only thing that can still drop one.
+    `first` claims the OLDEST commit on the branch, which the bounded walk
+    stops short of; `last` claims the newest, which it returns. Returns
+    `(relay_dir, oldest_sha, newest_sha)`.
+    """
+    project = tmp_path_factory.mktemp("past-the-bound") / "long-run"
+    relay_dir = project / ".relay"
+    (relay_dir / "batons").mkdir(parents=True)
+    (relay_dir / "legs.json").write_text(json.dumps(
+        {"relay": "long-run",
+         "stages": [{"id": "S1", "legs": ["first", "last"]}],
+         "legs": [{"id": "first", "stage": "S1", "status": "done"},
+                  {"id": "last", "stage": "S1", "status": "done"}]}))
+
+    _git(project, "init", "-q", "-b", "main")
+    _git(project, "add", "-A", when=NOW - 9000)
+    _git(project, "commit", "-q", "-m", "chore: the project existed first",
+         when=NOW - 9000)
+    _git(project, "checkout", "-q", "-b", "feat/the-long-run")
+    # One `git` process per commit is the cost here, not Python.
+    walked = relay_model.LOG_MAX_COMMITS + BEYOND_THE_WALK
+    script = ('set -e; i=0; while [ $i -lt %d ]; do '
+              'GIT_AUTHOR_DATE="$((BASE+i)) +0000" '
+              'GIT_COMMITTER_DATE="$((BASE+i)) +0000" '
+              'git commit -q --allow-empty -m "run work $i"; i=$((i+1)); done'
+              % walked)
+    env = dict(os.environ)
+    env.update({"BASE": str(int(NOW - 8000)),
+                "GIT_AUTHOR_NAME": "Relay Test", "GIT_AUTHOR_EMAIL": "t@example.com",
+                "GIT_COMMITTER_NAME": "Relay Test",
+                "GIT_COMMITTER_EMAIL": "t@example.com"})
+    out = subprocess.run(["sh", "-c", script], cwd=project, env=env,
+                         capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+
+    oldest = _short_sha(project, f"HEAD~{walked - 1}")
+    newest = _short_sha(project)
+    _land(relay_dir, "first", NOW - 8900, oldest)
+    _land(relay_dir, "last", NOW - 8800, newest)
+    return relay_dir, oldest, newest
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_the_fixture_really_does_reach_past_the_walk_bound(past_the_walk_bound):
+    """The premise of everything below, so none of it can pass for the wrong
+    reason: the claimed commit really is outside what the bounded walk
+    returns."""
+    relay_dir, oldest, _newest = past_the_walk_bound
+    on_branch = _git(relay_dir, "log", "--format=%h", "HEAD",
+                     "--not", "refs/heads/main").stdout.split()
+    assert len(on_branch) == relay_model.LOG_MAX_COMMITS + BEYOND_THE_WALK
+    assert oldest not in on_branch[:relay_model.LOG_MAX_COMMITS]
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_the_walk_stops_at_its_own_bound_and_keeps_the_newest(past_the_walk_bound):
+    """`_git_log` at its own seam: the cap is what it says it is, and the end
+    of the branch it keeps is the newest end."""
+    relay_dir, oldest, newest = past_the_walk_bound
+    walked = relay_model._git_log(relay_dir, exclude=["refs/heads/main"])
+    assert len(walked) == relay_model.LOG_MAX_COMMITS
+    shas = [sha for _when, sha, _subject in walked]
+    assert shas[0] == newest
+    assert oldest not in shas
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_claimed_commit_past_the_walk_bound_still_keeps_its_leg(
+        past_the_walk_bound):
+    """What the cap costs the log, stated exactly. `first`'s commit is past the
+    bound and has no commit entry - but its landing entry and its runner row
+    both still name the sha, so what was lost is the commit's subject line and
+    not the attribution."""
+    relay_dir, oldest, newest = past_the_walk_bound
+    model = relay_model.build(relay_dir, now=NOW)
+    assert oldest not in {e["commit"] for e in entries_of(model, "commit")}
+    assert newest in {e["commit"] for e in entries_of(model, "commit")}
+    landings = [e for e in model["log"]
+                if e["kind"] == "baton" and e["leg"] == "first"]
+    assert [e["commit"] for e in landings] == [oldest]
+    assert {r["leg"]: r["commit"] for r in model["runners"]}["first"] == oldest
+    assert len(model["log"]) <= relay_model.LOG_MAX_ENTRIES
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+@pytest.mark.parametrize("cap,admitted", [
+    (relay_model.LOG_MAX_COMMITS + BEYOND_THE_WALK - 1, False),
+    (relay_model.LOG_MAX_COMMITS + BEYOND_THE_WALK, True)])
+def test_the_walk_bound_is_what_drops_it_and_nothing_else(
+        past_the_walk_bound, monkeypatch, cap, admitted):
+    """The boundary itself, one commit either side of it, and the evidence that
+    neither floor nor budget is involved: the same relay, the same batons, the
+    same window - only the cap moves, and the commit appears with it."""
+    relay_dir, oldest, _newest = past_the_walk_bound
+    monkeypatch.setattr(relay_model, "LOG_MAX_COMMITS", cap)
+    model = relay_model.build(relay_dir, now=NOW)
+    named = {e["commit"] for e in entries_of(model, "commit")}
+    assert (oldest in named) is admitted, sorted(named)[:5]
+
+
+# --------------------------------------------------------------------------
+# `dashboard.json.path` is untrusted input like every other field the model
+# reads (ACC-DATA-009)
+#
+# The coach wrote `"path": "~/Documents/..."` into this repository's own
+# dashboard by hand. Nothing here expanded the `~`, so the value named a
+# directory called `~` under the process's working directory; `_in_a_repo`
+# clamped back to the relay directory, found no `.git`, and the relay was read
+# as one that owns no repository - no commit in the log, no baton's claim
+# settled, and not one word about any of it. The log looked merely quiet.
+# --------------------------------------------------------------------------
+
+@pytest.fixture
+def home_relay(tmp_path, monkeypatch):
+    """A live-shaped relay under a HOME of its own, so that `~` means something.
+
+    `<home>/proj` is the project and `<home>/proj/.relay` is the relay. Alpha
+    landed claiming the project's one commit, and that commit is what these
+    tests look for: it is in the log when the repository was read and absent
+    when it was not. Beta landed claiming `deadbee`, which this repository does
+    not have - the other read the path bounds, and the one that fails silently
+    in the opposite direction.
+    """
+    home = tmp_path / "home"
+    project = home / "proj"
+    relay_dir = project / ".relay"
+    (relay_dir / "batons").mkdir(parents=True)
+    (relay_dir / "legs.json").write_text(json.dumps(
+        {"relay": "proj",
+         "stages": [{"id": "S1", "legs": ["alpha", "beta"]}],
+         "legs": [{"id": "alpha", "stage": "S1", "status": "done"},
+                  {"id": "beta", "stage": "S1", "status": "done"}]}))
+    _git(project, "init", "-q", "-b", "main")
+    _git(project, "add", "-A", when=NOW - 4000)
+    _git(project, "commit", "-q", "-m", "alpha: the leg's work", when=NOW - 4000)
+    _land(relay_dir, "alpha", NOW - 5000, _short_sha(project))
+    _land(relay_dir, "beta", NOW - 3000, "deadbee")
+    monkeypatch.setenv("HOME", str(home))
+    return relay_dir
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_written_path_with_a_tilde_still_reads_the_repository(home_relay):
+    """The defect, end to end. A `~` is what a coach types, and both reads the
+    path bounds - the commit walk and the claim settlement - happen."""
+    (home_relay / "dashboard.json").write_text(json.dumps({"path": "~/proj"}))
+    model = relay_model.build(home_relay, now=NOW)
+    entry = commit_named(model, "alpha: the leg's work")
+    assert entry is not None, model["warnings"]
+    assert entry["leg"] == "alpha"
+    assert {r["leg"]: r["commit"] for r in model["runners"]}["alpha"] == \
+        entry["commit"]
+    assert [w for w in model["warnings"] if "`path`" in w] == []
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_written_path_with_a_tilde_settles_the_claims_too(home_relay):
+    """`path` bounds TWO reads, and the tilde silenced both. Beta claims a sha
+    this repository does not have; only a repository that can be ASKED can
+    refuse it, and an unexpanded `~` is a repository that cannot be asked -
+    which `_resolve_shas` reads, correctly, as "nothing here can check", so the
+    baton is believed and a pane credits a leg with an object that does not
+    exist. The commit walk going quiet is the visible half of that defect; this
+    is the half that speaks up and is wrong."""
+    (home_relay / "dashboard.json").write_text(json.dumps({"path": "~/proj"}))
+    model = relay_model.build(home_relay, now=NOW)
+    rows = {r["leg"]: r for r in model["runners"]}
+    assert rows["beta"]["commit"] is None, "deadbee is not an object here"
+    assert rows["alpha"]["commit"] == commit_named(
+        model, "alpha: the leg's work")["commit"]
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_written_path_is_still_quoted_as_the_coach_wrote_it(home_relay):
+    """Expanding it is a reading for the READ, and not a correction of the
+    coach: `relay.path` is the label a supervisor put on their own project and
+    it is reported back unchanged."""
+    (home_relay / "dashboard.json").write_text(json.dumps({"path": "~/proj"}))
+    model = relay_model.build(home_relay, now=NOW)
+    assert model["relay"]["path"] == "~/proj"
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+@pytest.mark.parametrize("kind", ["missing", "a file", "a tilde that expands to nothing"])
+def test_a_written_path_that_names_no_directory_is_warned_about(home_relay, kind):
+    """The other half of the same defect: a value that cannot be read from is
+    a coach's typo, and it is treated like every other malformed field here -
+    warned about and ignored, rather than silently disabling the read."""
+    written = {"missing": "/no/such/project/anywhere",
+               "a file": str(home_relay / "legs.json"),
+               "a tilde that expands to nothing": "~/not-here"}[kind]
+    (home_relay / "dashboard.json").write_text(json.dumps({"path": written}))
+    model = relay_model.build(home_relay, now=NOW)
+    said = [w for w in model["warnings"] if "`path`" in w]
+    assert len(said) == 1 and "not a directory" in said[0], model["warnings"]
+    assert model["relay"]["path"] == written        # still quoted as written
+    # Ignored, not obeyed: the read falls back to the relay's own project,
+    # which is the widest bound `_in_a_repo` would have allowed it anyway.
+    assert commit_named(model, "alpha: the leg's work") is not None
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_path_that_reads_fine_is_not_warned_about(home_relay):
+    """And nothing a coach can write correctly is warned about, or the warning
+    is noise a supervisor learns to skip."""
+    (home_relay / "dashboard.json").write_text(json.dumps(
+        {"path": str(home_relay.parent)}))
+    model = relay_model.build(home_relay, now=NOW)
+    assert [w for w in model["warnings"] if "`path`" in w] == []
+    assert commit_named(model, "alpha: the leg's work") is not None
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_tilde_path_cannot_widen_the_repository_bound(nested_relay, monkeypatch):
+    """Expanding it is a reading of what the coach wrote, never a licence.
+    `~` now names the HOST repository this relay merely sits inside, and the
+    walk still reaches the relay directory and its immediate parent and no
+    further: `path` may only NARROW the bound."""
+    host = nested_relay.parent.parent
+    monkeypatch.setenv("HOME", str(host))
+    (nested_relay / "dashboard.json").write_text(json.dumps({"path": "~"}))
+    model = relay_model.build(nested_relay, now=NOW)
+    assert os.path.expanduser("~") == str(host)     # the tilde really resolves
+    assert entries_of(model, "commit") == [], \
+        [e["m"] for e in entries_of(model, "commit")]
