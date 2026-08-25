@@ -401,10 +401,38 @@ def _metric_width(metrics):
         3 * max(0, len(metrics) - 1)
 
 
+def relay_title(model):
+    """What the header calls this relay: title, name, directory, then the app.
+
+    A relay with no `title` in `dashboard.json` and no `relay` in `legs.json`
+    still has a directory, and a supervisor with three of these open needs them
+    told apart. `Relay Control` is the *program's* name, so it is the last
+    resort and not the second: a header that reads `Relay Control` for two
+    different relays is a header that has stopped identifying anything.
+    """
+    relay = model.get("relay") or {}
+    return (relay.get("title") or relay.get("name")
+            or _directory_name(relay.get("relayDir")) or "Relay Control")
+
+
+def _directory_name(path):
+    """The last segment of `relayDir` that names *this* relay.
+
+    A relay directory is usually `<project>/.relay`, whose own basename names
+    every relay there has ever been, so dotted segments are stepped over and
+    the one above them is the answer. String work only — this asks the
+    filesystem nothing (ACC-TUI-007).
+    """
+    parts = [part for part in str(path or "").split("/") if part]
+    while parts and parts[-1].startswith("."):
+        parts.pop()
+    return parts[-1] if parts else None
+
+
 def draw_header(canvas, model):
     """Row 1: the relay's name and working path, and what it has cost so far."""
     relay = model.get("relay") or {}
-    title = relay.get("title") or relay.get("name") or "Relay Control"
+    title = relay_title(model)
     path = relay.get("path") or ""
     usable = canvas.width - 1
 
