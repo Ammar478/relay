@@ -470,6 +470,207 @@ def test_baton_status_becomes_runner_status(relay):
 
 
 # --------------------------------------------------------------------------
+# ACC-DATA-007 — one unsourced column at a time
+#
+# The fixtures happen to fill most columns in, which is why "the model never
+# invents a value" survived so long with nothing holding it: a column can only
+# be caught inventing when there is a row it has no source for. `unsourced`
+# below is a relay built so that each of the eight columns the check names has
+# at least one such row, and each test asserts that column's absence together
+# with a row where the column *is* sourced — so a mutation that blanks the
+# column everywhere fails just as loudly as one that fills it in everywhere.
+#
+# Each test is paired with a mutation of `scripts/relay_model.py` that invents
+# a value for exactly its column; the mutation table is in
+# `.relay/batons/evidence-that-bites.md`. A test that does not fail under its
+# own mutation is not evidence and is not finished.
+# --------------------------------------------------------------------------
+
+#: Baton landing times, stamped rather than left to the filesystem: `start` and
+#: `duration` are handoffs between them and a test of "60 seconds" needs to
+#: know it was 60 seconds.
+UNSOURCED_MTIMES = {"batoned": 1_000_000.0, "handoff": 1_000_060.0,
+                    "quiet": 1_000_120.0}
+
+
+@pytest.fixture
+def unsourced(tmp_path):
+    """A relay with a row missing a source for every column in `RUNNER_KEYS`.
+
+    * `batoned`  — the fully sourced row, and the first to land, so its own
+                   `start` and `duration` have no previous handoff.
+    * `handoff`  — lands 60s later: the row where `start` and `duration` are
+                   real, so a test can tell absence from erasure.
+    * `quiet`    — a baton with no `Status:` line and no commit claim.
+    * `batonless`— a completed leg whose runner left no baton at all.
+    * `stageless`— the same, and the coach gave it no `stage`.
+    * (no id)    — the same, and the coach gave it no `id` either.
+    * `live`     — the running leg: no baton yet, and no clock passed to
+                   `build()`, so its elapsed time is unknown too.
+    """
+    target = write_relay(
+        tmp_path, "unsourced",
+        legs={"relay": "unsourced",
+              "stages": [{"id": "S1", "name": "Stage One",
+                          "legs": ["batoned", "handoff", "batonless", "quiet"]}],
+              "legs": [{"id": "batoned", "stage": "S1", "status": "done"},
+                       {"id": "handoff", "stage": "S1", "status": "done"},
+                       {"id": "batonless", "stage": "S1", "status": "done"},
+                       {"id": "quiet", "stage": "S1", "status": "done"},
+                       {"id": "stageless", "status": "done"},
+                       {"status": "done", "goal": "a leg the coach left unnamed"},
+                       {"id": "live", "stage": "S1", "status": "running"}]})
+    batons = target / "batons"
+    batons.mkdir()
+    (batons / "batoned.md").write_text(
+        "# Baton: batoned\n\n**Status:** success\n**Commit:** 1a2b3c4\n")
+    (batons / "handoff.md").write_text(
+        "# Baton: handoff\n\n**Status:** success\n**Commit:** 2b3c4d5\n")
+    # No `Status:` line and no sentence that claims a commit: a runner who
+    # wrote prose and filled in none of the template's fields.
+    (batons / "quiet.md").write_text(
+        "# Baton: quiet\n\nI ran the leg and wrote this and nothing else.\n")
+    import os
+
+    for stem, mtime in UNSOURCED_MTIMES.items():
+        os.utime(batons / f"{stem}.md", (mtime, mtime))
+    return target
+
+
+@pytest.fixture
+def unsourced_rows(unsourced):
+    """`{leg id: row}` for the unsourced relay. The unnamed leg keys on ``""``."""
+    model = relay_model.build(unsourced)
+    rows = {r["leg"]: r for r in model["runners"]}
+    assert len(rows) == len(model["runners"]) == 7, model["runners"]
+    return rows
+
+
+def test_n_is_the_row_s_landing_position_not_a_fabricated_number(unsourced):
+    """`n` always has a source — the row's own position — so the way to invent
+    it is to emit something that is not that position."""
+    rows = relay_model.build(unsourced)["runners"]
+    assert [r["n"] for r in rows] == list(range(1, len(rows) + 1))
+    batoned = [r["leg"] for r in rows if r["leg"] in UNSOURCED_MTIMES]
+    assert batoned == sorted(batoned, key=UNSOURCED_MTIMES.get)
+    assert rows[-1]["leg"] == "live"          # the running runner is last
+
+
+def test_a_leg_with_no_id_gets_no_invented_name(unsourced_rows):
+    """The unnamed leg still earns a runner row — it is a leg the coach
+    planned and a runner completed — but the model does not name it."""
+    assert "" in unsourced_rows, sorted(unsourced_rows)
+    assert unsourced_rows[""]["status"] == "completed"
+    assert unsourced_rows["batoned"]["leg"] == "batoned"     # a real id survives
+
+
+def test_a_leg_with_no_stage_has_a_stage_of_none(unsourced_rows):
+    for leg in ("stageless", ""):
+        assert unsourced_rows[leg]["stage"] is None, leg
+        assert unsourced_rows[leg]["stageName"] is None, leg
+    assert unsourced_rows["batoned"]["stage"] == "S1"        # a real stage survives
+    assert unsourced_rows["batoned"]["stageName"] == "Stage One"
+
+
+def test_start_is_none_until_a_previous_baton_has_landed(unsourced_rows):
+    # The first runner to land: nothing handed off to it.
+    assert unsourced_rows["batoned"]["start"] is None
+    # No baton at all: nothing on disk says when it ran.
+    for leg in ("batonless", "stageless", ""):
+        assert unsourced_rows[leg]["start"] is None, leg
+    # A real handoff survives: the previous baton's landing time.
+    assert unsourced_rows["handoff"]["start"] == pytest.approx(
+        UNSOURCED_MTIMES["batoned"])
+    assert unsourced_rows["live"]["start"] == pytest.approx(
+        UNSOURCED_MTIMES["quiet"])
+
+
+def test_duration_is_none_unless_both_ends_are_known(unsourced_rows):
+    assert unsourced_rows["batoned"]["duration"] is None     # start unknown
+    assert unsourced_rows["live"]["duration"] is None        # no clock passed
+    for leg in ("batonless", "stageless", ""):
+        assert unsourced_rows[leg]["duration"] is None, leg
+        assert unsourced_rows[leg]["finished"] is None, leg
+    # Both ends known: 60 seconds, and not a zero standing in for absence.
+    assert unsourced_rows["handoff"]["duration"] == pytest.approx(60.0)
+
+
+def test_commit_is_none_when_no_baton_claims_one(unsourced_rows):
+    for leg in ("quiet", "batonless", "stageless", "", "live"):
+        assert unsourced_rows[leg]["commit"] is None, leg
+    assert unsourced_rows["batoned"]["commit"] == "1a2b3c4"
+
+
+def test_batonlines_is_none_without_a_baton_and_a_real_count_with_one(
+        unsourced_rows):
+    for leg in ("batonless", "stageless", "", "live"):
+        assert unsourced_rows[leg]["batonLines"] is None, leg
+        assert unsourced_rows[leg]["batonPath"] is None, leg
+    assert unsourced_rows["quiet"]["batonLines"] > 0          # not a zero
+    assert unsourced_rows["batoned"]["batonLines"] > 0
+
+
+def test_status_falls_back_to_the_leg_never_to_a_placeholder(unsourced_rows):
+    """`status` always has a source — the baton's word, or failing that the
+    leg's own state — so inventing here means answering with something outside
+    the vocabulary."""
+    known = {"completed", "running", "partial", "failed"}
+    # A baton with no `Status:` line: the leg's own state answers instead.
+    assert unsourced_rows["quiet"]["status"] == "completed"
+    assert unsourced_rows["batonless"]["status"] == "completed"
+    assert unsourced_rows["live"]["status"] == "running"
+    for leg, row in unsourced_rows.items():
+        assert row["status"] in known, (leg, row["status"])
+
+
+#: What a view prints for "no value". None of them belongs in the model.
+PLACEHOLDER_STRINGS = {EM_DASH, "-", "--", "N/A", "n/a", "NA", "undefined", "None",
+                       "null", "nil", "?", "TBD", "unknown", ""}
+
+
+def _assert_no_placeholder_columns(rows, label):
+    for row in rows:
+        for column in sorted(RUNNER_KEYS):
+            value = row[column]
+            if not isinstance(value, str):
+                continue
+            # `leg` is the one column whose empty string is meaningful: it is
+            # the id of a leg that has none, and the model refuses to make one
+            # up. Every other string column carrying a placeholder is an
+            # invention.
+            if column == "leg" and value == "":
+                continue
+            assert EM_DASH not in value, (label, row["n"], column, value)
+            assert value not in PLACEHOLDER_STRINGS, (label, row["n"], column, value)
+
+
+@pytest.mark.parametrize("name", ALL_FIXTURES)
+def test_no_runner_column_carries_a_display_placeholder(name, relay):
+    """The em-dash clause, over the columns it is about. An unsourced column
+    is `None`; it is never dressed as a value a view could print."""
+    _assert_no_placeholder_columns(relay_model.build(relay(name))["runners"], name)
+
+
+@pytest.mark.parametrize("name", ALL_FIXTURES)
+def test_no_runner_column_carries_a_display_placeholder_in_place(name):
+    """And with the fixture read where it lies, inside this repository, so the
+    commit-reading branch of `build()` runs. A commit *subject* quoted into a
+    log entry may legitimately contain an em-dash — that is a recorded
+    decision, and it is why this sweep is over the runner columns rather than
+    over every string in the model."""
+    _assert_no_placeholder_columns(
+        relay_model.build(FIXTURES / name)["runners"], f"{name} (in place)")
+
+
+def test_no_runner_column_carries_a_display_placeholder_when_unsourced(unsourced):
+    """The same sweep over the relay that actually has unsourced columns —
+    the fixtures fill most of them in, which is how an em-dash substitution
+    could hide from the sweep above."""
+    _assert_no_placeholder_columns(relay_model.build(unsourced)["runners"],
+                                   "unsourced")
+
+
+# --------------------------------------------------------------------------
 # ACC-DATA-008 — Token and time metrics are absent, not zero
 # --------------------------------------------------------------------------
 
@@ -934,6 +1135,18 @@ def test_kind_of_survives_a_leg_that_is_not_a_dict():
 def test_fuzz_over_malformed_relay_directories(tmp_path):
     """Every combination of a bad leg id, a bad claimedBy and a bad file body
     builds. One assertion, many shapes: the point is that none of them raise.
+
+    Every relay in the corpus also carries the two shapes ACC-DATA-003's
+    evidence names, because a corpus that cannot produce them cannot be
+    evidence for them:
+
+    * **a running leg with no usable id** — the third leg. Every member of
+      `BAD_IDS` is unidentifiable, so this leg is running and nameless in all
+      of them, and `activeLeg` must skip it.
+    * **duplicate leg ids across stages** — the last two legs. Both answer to
+      `real`, both run, and they differ only in the stage they belong to. The
+      runner row the model calls active must be the one built from the leg
+      `activeLeg` names, which `assert_active_agrees` compares field by field.
     """
     built = 0
     for i, bad_id in enumerate(BAD_IDS):
@@ -945,7 +1158,12 @@ def test_fuzz_over_malformed_relay_directories(tmp_path):
                       "legs": [{"id": bad_id, "status": bad_claim,
                                 "stage": bad_id, "goal": bad_claim,
                                 "fulfills": bad_claim, "kind": bad_claim},
-                               {"id": "real", "status": "running"}]},
+                               {"id": bad_id, "status": "running",
+                                "stage": "S1", "goal": bad_claim},
+                               {"id": "real", "status": "running",
+                                "stage": "S1"},
+                               {"id": "real", "status": "running",
+                                "stage": "S2"}]},
                 state={"currentLeg": bad_id, "currentStage": bad_id,
                        "phase": bad_claim,
                        "checks": {"ACC-A-001": {"status": bad_claim,
@@ -959,6 +1177,15 @@ def test_fuzz_over_malformed_relay_directories(tmp_path):
             assert isinstance(model, dict), (bad_id, bad_claim)
             json.dumps(model)
             assert_active_agrees(model, f"fuzz-{i}-{j}")
+
+            # The corpus is only evidence while it still contains the two
+            # cases, so it says so out loud rather than trusting the literal
+            # above to stay that way.
+            assert [r["leg"] for r in model["runners"]] == ["", "real", "real"], (
+                bad_id, bad_claim)
+            assert model["runners"][0]["status"] == "running"    # nameless, running
+            assert model["activeLeg"]["id"] == "real"            # and not chosen
+            assert model["activeLeg"]["stage"] == "S1"           # the first namesake
             built += 1
     assert built == len(BAD_IDS) * len(MISSING_OR_BAD)
 
@@ -982,20 +1209,37 @@ def test_fuzz_over_malformed_file_bodies(tmp_path):
 # ACC-DATA-003 — the invariant, asserted as the check words it
 # --------------------------------------------------------------------------
 
+#: Every runner-row field copied straight off the leg the row was built from.
+#: With duplicate ids these are the only fields that tell two rows apart, so
+#: they are what turns "a runner row" into "the active leg's runner row".
+LEG_DERIVED_RUNNER_FIELDS = ("leg", "stage", "stageName", "kind")
+
+
 def assert_active_agrees(model, label=""):
-    """`activeRunner.leg == activeLeg.id`, **or both are absent** — the whole
-    disjunction, which is what the check says and what a leg with an
+    """The active runner is the active leg's own row, **or both are absent**.
+
+    The whole disjunction, which is what the check says and what a leg with an
     unusable id used to break by satisfying neither half.
+
+    The identity half needs care. `any(row is runner for row in runners)` says
+    only that the runner is *a* row, and `runner["leg"] == leg["id"]` is the
+    string equality the amendment exists to replace: when two legs answer to
+    one id, two rows satisfy both and the wrong twin passes — which is the
+    original Mission Control defect wearing the guard that was meant to catch
+    it. So every field the row copies off its leg is compared as well. Two
+    rows carrying one id differ in their stage, their stage name and their
+    kind, and a row of the *other* twin fails here.
     """
     leg, runner = model["activeLeg"], model["activeRunner"]
     assert (leg is None) == (runner is None), (label, leg, runner)
     if leg is None:
         return
-    assert runner["leg"] == leg["id"], (label, runner["leg"], leg["id"])
-    # Identity, not just equality of ids: with duplicate ids in legs.json two
-    # different legs answer to the same string, and the runner row must be the
-    # one built from *this* leg.
     assert any(row is runner for row in model["runners"]), label
+    assert sum(1 for row in model["runners"] if row is runner) == 1, label
+    for field in LEG_DERIVED_RUNNER_FIELDS:
+        source = "id" if field == "leg" else field
+        assert runner[field] == leg[source], (
+            label, field, runner[field], leg[source])
     assert runner["status"] == "running", (label, runner["status"])
     assert leg["isActive"] is True, label
     assert leg["status"] == "running", (label, leg["status"])
@@ -1004,6 +1248,18 @@ def assert_active_agrees(model, label=""):
 @pytest.mark.parametrize("name", ALL_FIXTURES)
 def test_active_leg_and_active_runner_agree_on_every_fixture(name, relay):
     assert_active_agrees(relay_model.build(relay(name)), name)
+
+
+@pytest.mark.parametrize("name", ALL_FIXTURES)
+def test_active_leg_and_active_runner_agree_on_every_fixture_in_place(name):
+    """The same fixtures where they really live, inside this repository.
+
+    Every other reading of them is of a copy in `tmp_path`, which sits outside
+    any git repository — so the branch of `build()` that reads commits never
+    runs there. Neither half of this invariant depends on mtimes, so the
+    fixture needs no stamping and can be read where it lies.
+    """
+    assert_active_agrees(relay_model.build(FIXTURES / name), f"{name} (in place)")
 
 
 def test_duplicate_leg_ids_do_not_split_active_leg_from_active_runner(tmp_path):
@@ -1020,6 +1276,62 @@ def test_duplicate_leg_ids_do_not_split_active_leg_from_active_runner(tmp_path):
     assert_active_agrees(model, "duplicate ids")
     assert model["activeRunner"]["status"] == "running"
     assert any("twin" in w for w in model["warnings"]), model["warnings"]
+
+
+def test_two_running_twins_in_different_stages_cannot_split_the_two_panes(tmp_path):
+    """The shape the old guard could not see.
+
+    Both twins run, so both their rows carry `status: running` and the id
+    `twin`; the whole of the previous assertion held for either of them. Only
+    the leg-derived columns tell the rows apart, and the active runner must be
+    the row of the *first* running leg in plan order — the one `activeLeg`
+    names — not the namesake in the next stage.
+    """
+    target = write_relay(
+        tmp_path, "twins",
+        legs={"stages": [{"id": "S1", "name": "Stage One", "legs": ["twin"]},
+                         {"id": "S2", "name": "Stage Two", "legs": ["twin"]}],
+              "legs": [{"id": "twin", "stage": "S1", "status": "running",
+                        "kind": "impl"},
+                       {"id": "twin", "stage": "S2", "status": "running",
+                        "kind": "judge"}]})
+    model = relay_model.build(target)
+
+    # The case is genuinely ambiguous by id: two rows answer to `twin`, and
+    # both are running, so neither string equality nor a status check can pick
+    # between them.
+    twins = [row for row in model["runners"] if row["leg"] == "twin"]
+    assert len(twins) == 2 and all(r["status"] == "running" for r in twins)
+    assert {r["stage"] for r in twins} == {"S1", "S2"}
+
+    assert_active_agrees(model, "two running twins")
+    assert model["activeLeg"]["stage"] == "S1"
+    assert model["activeRunner"]["stage"] == "S1"
+    assert model["activeRunner"]["stageName"] == "Stage One"
+    assert model["activeRunner"]["kind"] == "impl"
+    assert any("twin" in w for w in model["warnings"]), model["warnings"]
+
+
+def test_a_nameless_running_leg_beside_duplicate_ids_still_cannot_split_them(tmp_path):
+    """Both cases the evidence names, in one relay: a running leg with no
+    usable id sits ahead of two running namesakes in plan order. The nameless
+    leg is not a candidate, and the pair behind it must not be confused."""
+    target = write_relay(
+        tmp_path, "nameless-and-twins",
+        legs={"stages": [{"id": "S1", "name": "One", "legs": ["twin"]},
+                         {"id": "S2", "name": "Two", "legs": ["twin"]}],
+              "legs": [{"status": "running", "stage": "S1", "goal": "no id"},
+                       {"id": "twin", "stage": "S1", "status": "running"},
+                       {"id": "twin", "stage": "S2", "status": "running"}]})
+    model = relay_model.build(target)
+    assert_active_agrees(model, "nameless beside twins")
+    assert model["legCounts"]["running"] == 3
+    assert model["activeLeg"]["stage"] == "S1"
+    assert model["activeRunner"]["stage"] == "S1"
+    # The nameless leg still gets its own runner row; it is simply never the
+    # active one.
+    assert sorted(r["leg"] for r in model["runners"]) == ["", "twin", "twin"]
+    assert all(r["status"] == "running" for r in model["runners"])
 
 
 def test_a_running_leg_that_cannot_be_identified_is_not_the_active_leg(tmp_path):
