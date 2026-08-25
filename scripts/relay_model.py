@@ -1064,9 +1064,20 @@ def _in_a_repo(path, project):
     at `<project>`, so it still finds its own repository; a relay that merely
     happens to sit inside some other repository (every fixture under
     `tests/fixtures/`) finds nothing, instead of reporting that repository's
-    commits as its own. When `project` is not on the walk at all - a coach can
-    write any `dashboard.json.path` they like - the relay directory itself is
-    the only honest bound left.
+    commits as its own.
+
+    RULE: `project` may only NARROW the walk, never widen it. It comes from
+    `dashboard.json.path`, which is a string a coach wrote into a JSON file and
+    is untrusted like every other field the model reads. The two shapes a relay
+    actually has are `<project>/.relay` (the live shape, `.git` at the parent)
+    and a relay directory that is its own project (every fixture under
+    `tests/fixtures/`), so the walk is allowed to reach the relay directory and
+    its immediate parent and nowhere else. Anything else a coach writes -
+    `"/"`, the host repository's root, a grandparent - clamps back to the relay
+    directory, which is the only honest bound left. Without this clamp the
+    filesystem bound this function exists to hold is defeated by editing a JSON
+    file, and a relay reporting no commits starts reporting the host
+    repository's.
     """
     try:
         current = pathlib.Path(path).resolve()
@@ -1076,7 +1087,7 @@ def _in_a_repo(path, project):
         limit = pathlib.Path(project).resolve()
     except (OSError, TypeError, ValueError):
         limit = current
-    if limit != current and limit not in current.parents:
+    if limit != current and limit != current.parent:
         limit = current
     for candidate in [current, *current.parents]:
         if (candidate / ".git").exists():
@@ -1195,12 +1206,94 @@ def _default_branch_refs(relay_dir):
     return [line.strip() for line in (out or "").splitlines() if line.strip()]
 
 
-def _relay_commits(relay_dir, project, own):
-    """(commits, since, branched) for this run, newest first (ACC-DATA-009).
+def _mtime(path):
+    """The mtime of the regular file at `path`, or None when there is none.
+
+    A record that carries no timestamp of its own is timed by the file that
+    holds it, and this is the only way to ask. Never raises: the file may be
+    gone, may be a directory, may be unreadable - each of those means the same
+    thing here, which is that this record cannot be timed.
+    """
+    try:
+        st = os.stat(path)
+    except (OSError, TypeError, ValueError):
+        return None
+    return st.st_mtime if stat.S_ISREG(st.st_mode) else None
+
+
+def _relay_records(relay_dir, runners, batons, checks, events):
+    """What the relay has RECORDED about itself: `(has_records, floor)`.
+
+    THE INVARIANT (ACC-DATA-009): the commit window is a property of what the
+    relay has recorded on disk, and never a property of what the log derivation
+    has so far produced. `events` is one input here and never the deciding one.
+
+    That distinction is the whole reason this function exists. A relay one leg
+    in - a single `running` leg holding the only baton - derives no entry at
+    all: its baton is skipped as a landing because the leg has not landed, and
+    its start is unknown because there is no previous baton to hand off from.
+    Deriving the window from the entry list therefore gave it NO window, and
+    every commit in the repository it happens to sit in became one of its own.
+    Four fixes to that class landed and the class stayed open, because each was
+    written against the shape in front of it rather than against the rule.
+
+    `has_records` is the contract's degenerate carve-out read backwards. A
+    relay has no window only when it has no baton, no running leg and no judged
+    check - and there, showing recent commits is the only story there is. Every
+    other relay has a window, INCLUDING one whose records have produced no
+    visible entry yet.
+
+    `floor` is the earliest of those records, or None when none of them can be
+    timed - a relay can have a record whose time is unreadable, and a window
+    with no floor is still a window: the branch point and the budget both still
+    apply. Three sources, in decreasing order of how well they date themselves:
+
+    * a baton's mtime is when its runner landed. Every baton counts, including
+      the running leg's, which is exactly the one the entry list drops.
+    * `legs.json` marks a leg `running`. That record carries no timestamp, so
+      the file that holds it is the record and its mtime is when the relay last
+      wrote it.
+    * `state.json` records that a check was judged. Same reasoning, same file
+      mtime.
+
+    Derived event times join the union because the contract names them, but
+    they can only ever agree with it: every entry the log derives is timed by a
+    baton mtime already in the set, so including them can lower the floor and
+    never raise it, and they never decide whether there is a floor at all.
+    """
+    running = any(row["status"] == "running" for row in runners)
+    judged = any(_is_judged(check) for check in checks)
+    has_records = bool(batons) or running or judged
+
+    times = [baton["mtime"] for baton in batons.values()]
+    if running:
+        times.append(_mtime(relay_dir / "legs.json"))
+    if judged:
+        times.append(_mtime(relay_dir / "state.json"))
+    times.extend(entry["t"] for entry in events)
+    times = [t for t in times if t is not None]
+    return has_records, (min(times) if times else None)
+
+
+def _is_judged(check):
+    """True when a judge has been over this check.
+
+    A check nobody has judged is a plan, not a record: `pending`, no round, no
+    fix leg, no judge. Any one of the four says the relay recorded something.
+    """
+    return (isinstance(check["round"], int)
+            or check["status"] != "pending"
+            or bool(check["fixLeg"])
+            or bool(check["judgedBy"]))
+
+
+def _relay_commits(relay_dir, project):
+    """(commits, branched) for this run, newest first (ACC-DATA-009).
 
     A project's history is far longer and far busier than the relay that
     supervises one slice of it, so a window decides which commits are the run's
-    at all. Two bounds make it, and both are returned for the caller to apply:
+    at all. Two bounds make it, and this function applies neither: it reports
+    what each one has to say and the caller composes them.
 
     * `commits` is already bounded by TOPOLOGY. When the relay runs on a branch
       of its own, the walk excludes everything reachable from the default
@@ -1208,44 +1301,55 @@ def _relay_commits(relay_dir, project, own):
       point. `branched` says so. A commit from before the branch point is not
       this run's work however loudly a baton talks about it, so no claim can
       reach back past this bound.
-    * `since` is the relay's EARLIEST RECORDED EVENT, or None when it has
-      recorded none. It is the second bound and the caller applies it: a
-      project's history from before the relay started is not part of this run
-      (ACC-DATA-009), whether it sits on the branch or before it.
+    * the second bound is the floor of the relay's own RECORDS, which
+      `_relay_records` derives from disk rather than from the log being built.
+      It is not read here at all - it is why `branched` is worth reporting.
+      A project's history from before the relay started is not part of this run
+      (ACC-DATA-009), and the caller needs both answers to know which of the
+      two floors is in force.
 
-    The one commit that legitimately predates `since` is a leg's own: a runner
-    commits *before* it writes its baton, so the first leg's commit is older
-    than the earliest event the relay ever recorded - measured in this
-    repository, by 46.7 seconds. That is why `branched` is reported rather than
-    folded into `since` here: inside a branch of the run's own, a commit a
-    baton claims is admitted at the branch point, and nowhere else is.
+    The two bounds do not stack. Where the run owns a branch the branch point
+    is the floor for EVERY commit on it, attributed or not (ACC-DATA-009, as
+    amended 2026-08-25): everything after a branch point is this run's work by
+    construction, and the record floor cannot tighten that without dropping
+    commits the budget was willing to buy. A runner commits *before* it writes its baton,
+    so a first leg's commits are all older than any event the relay recorded;
+    flooring them at the record floor lost every one of them but the claimed
+    one. That is why `branched` is reported rather than folded in here.
 
-    A relay that has recorded no event at all has neither bound. It has no
-    window and nothing to count against, and the outer `--max-count` walk is
-    all that is left; showing a fresh relay its recent commits is better than
-    showing it nothing.
+    A relay with no records at all has neither bound. It has no window and
+    nothing to count against, and the outer `--max-count` walk is all that is
+    left; showing a fresh relay its recent commits is better than showing it
+    nothing.
 
     Two git invocations in the common case, both bounded by `GIT_TIMEOUT`: the
     ref probe walks nothing, and a walk that comes back empty means HEAD is the
     default branch, which is the unbranched case.
     """
     if not _in_a_repo(relay_dir, project):
-        return [], None, False
-    since = min(entry["t"] for entry in own) if own else None
+        return [], False
     defaults = _default_branch_refs(relay_dir)
     if defaults:
         branch = _git_log(relay_dir, exclude=defaults)
         if branch:
-            return branch, since, True
-    return _git_log(relay_dir), since, False
+            return branch, True
+    return _git_log(relay_dir), False
 
 
-def _commit_entries(relay_dir, project, batons, own, budget, now):
+def _commit_entries(relay_dir, project, batons, records, budget, now):
     """Commit entries for the log: the run's own commits first (ACC-DATA-009).
 
-    `own` is every entry the relay's own records produced - landings, handoffs
-    and check transitions. It decides the window (see `_relay_commits`), and
-    `budget` is how many commits may sit beside it.
+    `records` is `(has_records, floor)` from `_relay_records`: what the relay
+    has recorded about itself, read off disk. It decides the window (see
+    `_relay_commits`), and `budget` is how many unattributed commits may sit
+    beside the relay's own events.
+
+    RULE: `has_records` decides whether there is a window, and it is NOT
+    "did the derivation produce an entry". A relay whose only records are a
+    running leg and its baton derives no entry at all and still has a window -
+    it is a relay one leg in, not a relay that has done nothing (ACC-DATA-009,
+    as amended 2026-08-25). Gating on the entry list is how a run one leg in
+    came to report forty of its project's unrelated commits as its own.
 
     WHICH commits the budget buys is the property, not how many. A relay's own
     commits are the *oldest* inside its own window, so a budget spent newest
@@ -1260,23 +1364,27 @@ def _commit_entries(relay_dir, project, batons, own, budget, now):
     first, which above 150 relay events starts discarding attributed commits
     oldest-first and re-inverts the property at scale.
 
-    RULE: the time bound applies to attributed commits too, with exactly one
-    exception - a commit a baton claims, inside a branch the run owns, is
-    admitted at the branch point. That is where a first leg's commit sits: a
-    runner commits before it writes its baton, so its commit is older than the
-    relay's earliest event. Exempting attributed commits from the bound
-    *entirely*, which is what the previous fix did, let a merge dated a day
-    before the relay began back into the live relay's log on the strength of a
-    baton that only mentioned it. Where there is no branch of the run's own
-    there is no branch point either, and the earliest event bounds everything.
+    RULE: one floor for every commit, attributed or not. Where the run owns a
+    branch that floor is the BRANCH POINT, already applied topologically by the
+    walk; where it does not, it is the relay's earliest record. Attribution
+    decides what the budget buys, never what the window admits. The two used to
+    be tangled - attributed commits were exempt from the time bound inside a
+    branch and unattributed ones were not - and the two halves were not
+    composable: a first leg that commits twice before writing its baton had one
+    commit admitted and the other silently dropped, with budget left unspent.
+    Exempting attributed commits from the bound where there is NO branch is a
+    different matter and is still refused; that is what let a merge dated a day
+    before the relay began into the live relay's log on the strength of a baton
+    that only mentioned it.
 
     Only commits are budgeted. A baton, a handoff or a check transition is
     never dropped to make room: they are the events a supervisor came to the
-    pane for. And a relay that has recorded no event at all has neither a
-    window nor anything to budget against, so the walk comes through as it
-    came: see `_relay_commits`.
+    pane for. And a relay with no records at all has neither a window nor
+    anything to budget against, so the walk comes through as it came: see
+    `_relay_commits`.
     """
-    commits, since, branched = _relay_commits(relay_dir, project, own)
+    has_records, since = records
+    commits, branched = _relay_commits(relay_dir, project)
     commits = sorted(commits, key=lambda c: -c[0])
     # Attribution comes from the batons rather than from the runner rows, for
     # the same reason the landings above do: a baton is what happened, and a
@@ -1293,16 +1401,17 @@ def _commit_entries(relay_dir, project, batons, own, budget, now):
     for leg, baton in sorted(batons.items(), key=lambda kv: (kv[1]["mtime"], kv[0])):
         if baton["commit"]:
             by_commit.setdefault(baton["commit"], leg)
-    if own:
-        def in_window(commit, claimed):
-            if since is None:
-                return True
-            return commit[0] >= since or (claimed and branched)
-
-        attributed = [c for c in commits
-                      if by_commit.get(c[1]) and in_window(c, True)]
-        rest = [c for c in commits
-                if not by_commit.get(c[1]) and in_window(c, False)]
+    if has_records:
+        # The walk is ALREADY floored at the branch point when the run owns a
+        # branch, and that is the whole window there: `since` may not tighten
+        # it. Only where there is no branch to bound by does the time bound do
+        # any work, and there it applies to every commit alike.
+        if branched or since is None:
+            in_window = commits
+        else:
+            in_window = [c for c in commits if c[0] >= since]
+        attributed = [c for c in in_window if by_commit.get(c[1])]
+        rest = [c for c in in_window if not by_commit.get(c[1])]
         kept = attributed + rest[:max(0, budget - len(attributed))]
         # `git log` already yields newest first; sorting states the intent and
         # is stable, so equal commit times keep git's own order and the merge
@@ -1392,28 +1501,42 @@ def _derived_log(relay_dir, project, runners, batons, checks, now):
     # module and it stays the last word rather than a second opinion on which
     # commits belong.
     events = sorted(entries, key=lambda e: -e["t"])
+    # THE INVARIANT: the window comes from the relay's records on disk, not
+    # from `events`. `events` is what this function has so far DERIVED, and a
+    # relay one leg in derives nothing while holding two records.
+    records = _relay_records(relay_dir, runners, batons, checks, events)
+    has_records = records[0]
     commits = _commit_entries(
-        relay_dir, project, batons, events, len(events), now)
+        relay_dir, project, batons, records, len(events), now)
 
     # The outer entry bound, applied once and last. It decides how much of the
     # log fits in a pane, and it must not decide which commits belong: that is
     # settled above. So it is spent in the order the pane is worth reading in.
     #
-    # 1. Attributed commits: the run's own work, and never dropped to make room
-    #    for anything else. They are bounded by half the entry bound, and only
-    #    by it - past 150 of them the log cannot hold both a run's landings and
-    #    its commits, and squeezing the landings out to keep commits would
-    #    invert the count bound rather than honour it.
+    # 1. Attributed commits: the run's own work, kept UNCONDITIONALLY. There
+    #    used to be a `[:LOG_MAX_ENTRIES // 2]` here, and being newest-first it
+    #    dropped the OLDEST attributed commits - a run's first legs, which is
+    #    precisely the property this check exists to protect. At 160 legs each
+    #    landing a commit it silently lost 24 of them. The contract says every
+    #    commit attributable to a leg is kept, without a cap, and the git walk's
+    #    own `LOG_MAX_COMMITS` (200, below the 300-entry bound) is what keeps
+    #    the sum inside the log: at worst the log is 200 attributed commits and
+    #    the 100 newest events, which is a full accounting of the run's work
+    #    rather than a truncated one. Attributed commits cannot outnumber the
+    #    relay's recorded events either way - each one is claimed by a baton,
+    #    and every baton is an event.
     # 2. The relay's own events, newest first, in whatever room is left.
     # 3. Unattributed commits, with what remains, and never more of them than
-    #    there are events to bury - unless the relay has recorded no event at
-    #    all, which has nothing to bury and nothing to count against
-    #    (ACC-DATA-009).
-    attributed = [e for e in commits if e["leg"]][:LOG_MAX_ENTRIES // 2]
+    #    there are events to bury - unless the relay has no records at all,
+    #    which has nothing to bury and nothing to count against (ACC-DATA-009).
+    #    The predicate is the relay's records, not this function's output: a
+    #    relay one leg in has records and no entries, and it is not the
+    #    degenerate case.
+    attributed = [e for e in commits if e["leg"]]
     room = LOG_MAX_ENTRIES - len(attributed)
     kept = events[:room]
     spare = room - len(kept)
-    if events:
+    if has_records:
         spare = min(spare, max(0, len(kept) - len(attributed)))
     entries = kept + attributed + [e for e in commits if not e["leg"]][:spare]
 

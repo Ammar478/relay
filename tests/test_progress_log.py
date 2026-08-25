@@ -222,11 +222,69 @@ def test_no_git_repository_still_yields_a_log(relay):
 # test here copies first, in order to stamp baton mtimes, and that copy lands
 # outside any repository - which is exactly why no test could see the log
 # walking up out of the fixture and reporting THIS repository's commits as the
-# fixture relay's own. Assertions below must not depend on mtimes, since a
-# fresh clone stamps them all to checkout time.
+# fixture relay's own.
+#
+# WHAT BITES AND WHAT DOES NOT. The three log assertions below - no commit
+# entries, no host subject, ten entries of the relay's own kinds - are true
+# statements, but they are NOT the guard on the repository bound. They pass on
+# a fresh checkout whether or not the bound exists: git does not preserve
+# mtimes, so a clone stamps every baton to checkout time, the window opens
+# later than every host commit, and the host's history is excluded by the CLOCK
+# rather than by the bound. A judge deleted the bound in a `cp -R` clone and
+# the suite stayed green at 568.
+#
+# The two tests immediately below carry the guard instead, and neither reads a
+# clock: the walk stops at the relay's own project, and a relay that is not in
+# a repository of its own is never asked a git question at all. Add assertions
+# here in that shape, not in the shape of the three that follow them.
 # --------------------------------------------------------------------------
 
 FIXTURES = REPO / "tests" / "fixtures"
+
+
+def test_a_relay_inside_a_repository_it_does_not_own_finds_no_repository(tmp_path):
+    """The bound itself, with no clock anywhere near it. `tests/fixtures/*` is
+    this shape: a relay directory that is its own project, sitting inside a
+    repository that belongs to somebody else. The parent walk must stop at the
+    project and report no repository, however many `.git` directories sit above
+    it."""
+    host = tmp_path / "host"
+    (host / ".git").mkdir(parents=True)
+    relay_dir = host / "nested" / "standalone"
+    relay_dir.mkdir(parents=True)
+
+    assert relay_model._in_a_repo(relay_dir, relay_dir) is False
+    # One directory of slack - the live `<project>/.relay` shape - and still
+    # not the host's `.git` two levels up.
+    assert relay_model._in_a_repo(relay_dir, relay_dir.parent) is False
+    # The other side of the bound: a relay whose project really does hold the
+    # repository still finds it, or bounding the walk would cost every live
+    # relay its own history.
+    live = host / ".relay"
+    live.mkdir()
+    assert relay_model._in_a_repo(live, host) is True
+
+
+def test_the_fixture_in_place_is_asked_no_git_question_at_all():
+    """`_in_a_repo` is checked BEFORE git is spawned, so a relay that is not in
+    a repository of its own runs no git process. That is observable without a
+    clock, which is what makes it the guard: it holds on a fresh checkout,
+    where every baton mtime is checkout time and the window would have hidden a
+    broken bound behind it."""
+    asked = []
+    real = relay_model._git
+
+    def spy(relay_dir, *args, **kwargs):
+        asked.append((str(relay_dir), args))
+        return real(relay_dir, *args, **kwargs)
+
+    relay_model._git = spy
+    try:
+        model = relay_model.build(FIXTURES / "agent-service", now=NOW)
+    finally:
+        relay_model._git = real
+    assert asked == [], asked
+    assert entries_of(model, "commit") == []
 
 
 def _host_repo_subjects():
@@ -996,6 +1054,16 @@ CORPUS_OWN = {
 # leg whose baton mentions it is reporting the repository, not the run.
 CORPUS_QUOTED = ("7f8690c", "2d6c125", "378d178", "ac8b835")
 
+# Of those four, `7f8690c` is the commit the run's branch forked FROM -
+# `reconcile-develop`'s own baton says so in as many words - so it sits on
+# `main`, BEFORE the branch point, and not on the run's branch. Where the run
+# owns a branch the branch point is the floor for every commit on it,
+# attributed or not (ACC-DATA-009, amended 2026-08-25); a fork point grafted
+# onto the branch would therefore be inside the run's window, which the real
+# one is not. The topology is what excludes it, and the graft has to model the
+# topology to say so.
+CORPUS_FORK_POINT = "7f8690c"
+
 # Batons that name no commit anywhere. Three of ten: honest absence is the
 # common case in the real corpus, and it must stay absence.
 CORPUS_SILENT = ("chat-session-ownership", "credential-parity", "mask-shape-coverage")
@@ -1050,12 +1118,20 @@ def corpus_relay(tmp_path, relay):
     _git(project, "add", "README", when=_EARLIEST_BATON - 20000)
     _git(project, "commit", "-q", "-m", "chore: the project existed first",
          when=_EARLIEST_BATON - 20000)
-    _git(project, "checkout", "-q", "-b", "feat/wave2-cutover-reconciled")
-
     sha_of = {}
-    for token, when, subject in sorted(CORPUS_COMMITS, key=lambda c: c[1]):
+
+    def land(token, when, subject):
         _git(project, "commit", "-q", "--allow-empty", "-m", subject, when=when)
         sha_of[token] = _git(project, "rev-parse", "--short=7", "HEAD").stdout.strip()
+
+    ordered = sorted(CORPUS_COMMITS, key=lambda c: c[1])
+    for token, when, subject in ordered:
+        if token == CORPUS_FORK_POINT:
+            land(token, when, subject)
+    _git(project, "checkout", "-q", "-b", "feat/wave2-cutover-reconciled")
+    for token, when, subject in ordered:
+        if token != CORPUS_FORK_POINT:
+            land(token, when, subject)
 
     for path in sorted((relay_dir / "batons").glob("*.md")):
         text = original = path.read_text()
@@ -1144,16 +1220,22 @@ def test_a_corpus_baton_that_claims_nothing_names_nothing(corpus_relay):
 
 @pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
 def test_no_commit_from_before_the_relay_began_survives(corpus_relay):
-    """ACC-DATA-009's first sentence. `7f8690c` is dated hours before the
-    relay's earliest event and no baton claims it; it is not this run's work
-    however loudly `reconcile-develop.md` mentions it."""
+    """ACC-DATA-009's first sentence, on a run that owns a branch: the window
+    opens at the BRANCH POINT, so what excludes `7f8690c` is that it sits
+    before that point, not that it is dated hours before the relay's earliest
+    event. It is the commit the branch forked from and no baton claims it; it
+    is not this run's work however loudly `reconcile-develop.md` mentions it."""
     relay_dir, sha_of = corpus_relay
     model = relay_model.build(relay_dir, now=NOW)
-    assert sha_of["7f8690c"] not in {e["commit"] for e in model["log"]}
-    earliest = min(e["t"] for e in relay_events(model))
-    early = [(e["commit"], e["m"]) for e in entries_of(model, "commit")
-             if e["t"] < earliest and not e["leg"]]
-    assert early == [], early
+    assert sha_of[CORPUS_FORK_POINT] not in {e["commit"] for e in model["log"]}
+    # And it is the topology that says so, not a count and not a clock: the
+    # commit is a real object in this repository, older than every commit that
+    # did survive, and it is off the branch.
+    on_branch = _git(relay_dir, "log", "--format=%h",
+                     "HEAD", "--not", "refs/heads/main").stdout.split()
+    assert sha_of[CORPUS_FORK_POINT] not in on_branch
+    assert _git(relay_dir, "cat-file", "-t",
+                sha_of[CORPUS_FORK_POINT]).stdout.strip() == "commit"
 
 
 @pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
@@ -1330,3 +1412,561 @@ def test_the_budget_never_discards_an_attributed_commit(tmp_path):
         sorted(set(claimed.values()) - set(credited))
     assert len(commits) <= len(events), (len(commits), len(events))
     assert len(model["log"]) <= relay_model.LOG_MAX_ENTRIES
+
+
+# --------------------------------------------------------------------------
+# the window is a property of the RECORDS, never of the derived log
+# (ACC-DATA-009, amended 2026-08-25)
+#
+# THE INVARIANT: the window is a property of what the relay has RECORDED -
+# baton mtimes, recorded events, state transitions - and never of what the log
+# derivation has so far produced.
+#
+# Four fixes to this check landed against the shape in front of them and the
+# class stayed open, because the deciding value was the derived entry list.
+# Two rules empty it for a relay one leg in: a baton whose leg is still marked
+# `running` is skipped as a landing, and the running leg's start entry needs a
+# previous baton to hand off from. So a relay ONE LEG IN derived nothing, was
+# read as a relay that had recorded nothing, and every commit in the repository
+# it happened to sit in became one of its own.
+#
+# These tests enumerate the ways the derived list can be empty or wrong while
+# records exist. Each of them is a door into the same room. A fix that closes
+# one shape and not the predicate closes none of them.
+# --------------------------------------------------------------------------
+
+def _one_leg_in(project, status="running", baton=True, branch="main",
+                commits=40, subject="old project commit"):
+    """A relay ONE LEG IN inside a project with unrelated history.
+
+    `git init` in `project`, `commits` commits that are nobody's leg, then a
+    relay whose only leg carries `status` - and a baton, unless `baton` is
+    False. The relay's records are written LAST, so every commit predates
+    every record and no commit is this run's by any reading.
+    """
+    relay_dir = project / ".relay"
+    (relay_dir / "batons").mkdir(parents=True)
+    _git(project, "init", "-q", "-b", branch)
+    _git(project, "commit", "-q", "--allow-empty", "--allow-empty-message",
+         "-m", f"{subject} 0", when=NOW - 9000)
+    for n in range(1, commits):
+        _git(project, "commit", "-q", "--allow-empty",
+             "-m", f"{subject} {n}", when=NOW - 9000 + n)
+    (relay_dir / "legs.json").write_text(json.dumps(
+        {"relay": "one-leg-in",
+         "stages": [{"id": "S1", "legs": ["alpha"]}],
+         "legs": [{"id": "alpha", "stage": "S1", "status": status}]}))
+    (relay_dir / "state.json").write_text(json.dumps({}))
+    if baton:
+        _land(relay_dir, "alpha", NOW - 10)
+    return relay_dir
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_relay_one_leg_in_reports_none_of_its_projects_history(tmp_path):
+    """The reproduction, exactly. A single `running` leg holding the only
+    baton, inside a repository with forty unrelated commits. Before the fix
+    the log was those forty commits and nothing else: `own` was empty, so
+    `since` was None, so the window and the budget were both skipped and every
+    commit in the walk became an entry."""
+    relay_dir = _one_leg_in(tmp_path / "proj")
+    model = relay_model.build(relay_dir, now=NOW)
+    assert entries_of(model, "commit") == [], \
+        [e["m"] for e in entries_of(model, "commit")]
+    assert not [e for e in model["log"] if "old project commit" in e["m"]]
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_relay_one_leg_in_has_a_window_though_it_has_derived_no_entry(tmp_path):
+    """The invariant itself, asserted on the predicate rather than through it.
+    This relay derives NO entry - its baton has not landed and its start is
+    unknown - and it still has records, and therefore a window. The contract's
+    carve-out is 'no batons, no running leg, no judged checks', and this relay
+    fails it twice over."""
+    relay_dir = _one_leg_in(tmp_path / "proj")
+    model = relay_model.build(relay_dir, now=NOW)
+    assert relay_events(model) == []          # nothing derived...
+    batons = relay_model._read_batons(relay_dir, [])
+    has_records, floor = relay_model._relay_records(
+        relay_dir, model["runners"], batons, model["checks"], [])
+    assert has_records is True                # ...and records all the same
+    assert floor == batons["alpha"]["mtime"]
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_running_first_leg_with_no_baton_still_bounds_the_commits(tmp_path):
+    """The second door a judge found. No baton at all, so not even a baton
+    mtime is available: the record is `legs.json` saying a leg is running, and
+    the file that holds it is what dates it."""
+    relay_dir = _one_leg_in(tmp_path / "proj", baton=False, commits=15)
+    model = relay_model.build(relay_dir, now=NOW)
+    assert list((relay_dir / "batons").glob("*.md")) == []
+    assert relay_events(model) == []
+    assert entries_of(model, "commit") == [], \
+        [e["m"] for e in entries_of(model, "commit")]
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_branch_with_no_default_branch_and_a_running_first_leg(tmp_path):
+    """The third door. `trunk`, with no `main`, no `master` and no `origin/*`,
+    so there is no branch point to floor at either - the records are the only
+    bound left, and they have to be enough on their own."""
+    relay_dir = _one_leg_in(tmp_path / "proj", branch="trunk")
+    project = relay_dir.parent
+    assert _git(project, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == "trunk"
+    assert relay_model._default_branch_refs(relay_dir) == []
+    model = relay_model.build(relay_dir, now=NOW)
+    assert entries_of(model, "commit") == [], \
+        [e["m"] for e in entries_of(model, "commit")]
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_leg_with_an_unparseable_status_is_still_a_record(tmp_path):
+    """A status no coach word maps to normalises to `pending`, so the leg is
+    neither running nor completed and derives no entry of its own. Its BATON
+    is still a record and still opens a window."""
+    relay_dir = _one_leg_in(tmp_path / "proj", status={"not": "a status"})
+    model = relay_model.build(relay_dir, now=NOW)
+    assert [r["status"] for r in model["legs"]] == ["pending"]
+    assert entries_of(model, "commit") == [], \
+        [e["m"] for e in entries_of(model, "commit")]
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_relay_with_no_legs_at_all_is_still_bounded_by_its_batons(tmp_path):
+    """`legs.json` lists nothing, so there are no runner rows, no running leg
+    and no start entry. The baton on disk is a record regardless - the log
+    reports what happened, not what was planned - and it carries the window."""
+    project = tmp_path / "proj"
+    relay_dir = _one_leg_in(project, commits=20)
+    (relay_dir / "legs.json").write_text(json.dumps({"relay": "empty", "legs": []}))
+    model = relay_model.build(relay_dir, now=NOW)
+    assert model["runners"] == []
+    assert entries_of(model, "commit") == [], \
+        [e["m"] for e in entries_of(model, "commit")]
+    # The baton still lands as an entry - it has a leg nobody planned.
+    assert [e["leg"] for e in entries_of(model, "baton")] == ["alpha"]
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_relay_whose_only_record_is_a_judged_check_has_a_window(tmp_path):
+    """No baton and no running leg: the only thing the relay has recorded is
+    that a check was judged, in `state.json`. That transition produces no log
+    entry either - it has no baton to be pinned to - and it is still a record,
+    so the carve-out does not apply."""
+    project = tmp_path / "proj"
+    relay_dir = _one_leg_in(project, status="done", baton=False, commits=12)
+    (relay_dir / "state.json").write_text(json.dumps(
+        {"checks": {"ACC-X-001": {"status": "failed", "round": 2,
+                                  "claimedBy": "alpha", "fixLeg": "fix-it"}}}))
+    model = relay_model.build(relay_dir, now=NOW)
+    assert relay_events(model) == []          # no baton to pin the check to
+    assert [c["status"] for c in model["checks"]] == ["failed"]
+    assert entries_of(model, "commit") == [], \
+        [e["m"] for e in entries_of(model, "commit")]
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_an_unjudged_check_is_a_plan_and_not_a_record(tmp_path):
+    """The other side of the same predicate, so that 'has a check' does not
+    quietly become 'has a record'. A check nobody has judged - pending, no
+    round, no fix leg, no judge - is a plan, and a relay carrying only plans is
+    the degenerate case the contract carves out: recent commits are the only
+    story it has."""
+    project = tmp_path / "proj"
+    relay_dir = _one_leg_in(project, status="pending", baton=False, commits=3)
+    (relay_dir / "state.json").write_text(json.dumps(
+        {"checks": {"ACC-X-001": {"status": "pending", "claimedBy": "alpha"}}}))
+    model = relay_model.build(relay_dir, now=NOW)
+    assert relay_events(model) == []
+    assert len(entries_of(model, "commit")) == 3
+    assert model["logSource"] == "derived"
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_baton_mtimes_in_the_future_close_the_window_rather_than_opening_it(
+        tmp_path):
+    """A clock skew, a touched file, an archive restored with tomorrow's
+    stamps. The floor is the earliest record whatever that record says, so a
+    relay whose records are all in the future has a window that no commit in
+    the past is inside - which is the safe direction to be wrong in."""
+    project = tmp_path / "proj"
+    relay_dir = _one_leg_in(project, status="done", commits=10)
+    _land(relay_dir, "alpha", NOW + 100000)
+    model = relay_model.build(relay_dir, now=NOW)
+    assert entries_of(model, "commit") == [], \
+        [e["m"] for e in entries_of(model, "commit")]
+    assert [e["leg"] for e in entries_of(model, "baton")] == ["alpha"]
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_detached_head_is_bounded_by_the_records_like_any_other(tmp_path):
+    """HEAD on no branch at all. `for-each-ref` still finds `main`, and the
+    walk excluding it comes back empty because HEAD is an ancestor of it - so
+    there is no branch of the run's own and the records are the whole window.
+    """
+    project = tmp_path / "proj"
+    relay_dir = _one_leg_in(project, status="done", commits=8)
+    _git(project, "checkout", "-q", "--detach", "HEAD~2")
+    assert _git(project, "rev-parse", "--abbrev-ref",
+                "HEAD").stdout.strip() == "HEAD"
+    model = relay_model.build(relay_dir, now=NOW)
+    assert entries_of(model, "commit") == [], \
+        [e["m"] for e in entries_of(model, "commit")]
+
+
+# --------------------------------------------------------------------------
+# the branch point is the floor for EVERY commit, attributed or not
+# (ACC-DATA-009, amended 2026-08-25 at the S1 gate round 3)
+#
+# "The window opens at the branch point" and "the remaining budget goes to the
+# newest unattributed ones" were not composable while the model floored
+# UNATTRIBUTED commits at the earliest recorded event: an unattributed commit
+# after the branch point was eligible by one clause and excluded by the other,
+# and the budget went unspent while in-window commits were dropped.
+# --------------------------------------------------------------------------
+
+@pytest.fixture
+def first_leg_burst(tmp_path):
+    """A first leg that commits THREE times before it writes its baton.
+
+    Every one of the three is after the branch point and every one is older
+    than the relay's earliest recorded event, because a runner commits and
+    then writes its baton. The baton claims only the last of them.
+    """
+    project = tmp_path / "burst"
+    relay_dir = project / ".relay"
+    (relay_dir / "batons").mkdir(parents=True)
+    (relay_dir / "legs.json").write_text(json.dumps({
+        "relay": "burst",
+        "stages": [{"id": "S1", "legs": ["alpha", "beta", "delta", "gamma"]}],
+        "legs": [{"id": "alpha", "stage": "S1", "status": "done"},
+                 {"id": "beta", "stage": "S1", "status": "done"},
+                 {"id": "delta", "stage": "S1", "status": "done"},
+                 {"id": "gamma", "stage": "S1", "status": "running"}],
+    }))
+    _git(project, "init", "-q", "-b", "main")
+    _git(project, "add", "-A", when=NOW - 9000)
+    _git(project, "commit", "-q", "-m", "before: the project existed first",
+         when=NOW - 9000)
+    _git(project, "checkout", "-q", "-b", "feat/the-run")
+    for n in range(3):
+        _git(project, "commit", "-q", "--allow-empty",
+             "-m", f"alpha: step {n} of the first leg's work", when=NOW - 5300 + n)
+    _land(relay_dir, "alpha", NOW - 5000, _short_sha(project))
+    _git(project, "commit", "-q", "--allow-empty",
+         "-m", "beta: the second leg's work", when=NOW - 4100)
+    _land(relay_dir, "beta", NOW - 4000, _short_sha(project))
+    _land(relay_dir, "delta", NOW - 3000)     # landed, committed nothing
+    return relay_dir
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_first_legs_unclaimed_commits_are_inside_the_window(first_leg_burst):
+    """The case the amendment was written about. All three of alpha's commits
+    predate the relay's earliest recorded event and all three are after the
+    branch point, so all three are this run's work by construction. The model
+    used to keep the one the baton claimed and floor the other two at the
+    earliest event - dropping in-window commits while leaving budget unspent.
+    """
+    model = relay_model.build(first_leg_burst, now=NOW)
+    steps = [e for e in entries_of(model, "commit") if "alpha: step" in e["m"]]
+    assert len(steps) == 3, [e["m"] for e in entries_of(model, "commit")]
+    earliest_event = min(e["t"] for e in relay_events(model))
+    assert all(e["t"] < earliest_event for e in steps)
+    # Exactly one of them is a claim; the other two ride in on the budget.
+    assert [e["leg"] for e in sorted(steps, key=lambda e: e["t"])] == \
+        [None, None, "alpha"]
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_the_budget_is_spent_rather_than_left_unspent(first_leg_burst):
+    """The other half of the same defect: what the budget could not buy was
+    not left over, it was discarded. Four events, two attributed commits, so
+    two unattributed commits are affordable - and there are exactly two in the
+    window."""
+    model = relay_model.build(first_leg_burst, now=NOW)
+    commits = entries_of(model, "commit")
+    events = relay_events(model)
+    assert len(events) == 4, [e["m"] for e in events]
+    assert len(commits) <= len(events)
+    assert len([e for e in commits if e["leg"]]) == 2
+    assert len([e for e in commits if not e["leg"]]) == 2
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_the_branch_point_is_still_the_floor(first_leg_burst):
+    """Widening the window to the branch point does not widen it past the
+    branch point: the project's own history is still not this run's."""
+    model = relay_model.build(first_leg_burst, now=NOW)
+    assert not [e["m"] for e in entries_of(model, "commit") if "before:" in e["m"]]
+
+
+# --------------------------------------------------------------------------
+# attribution has no cap (ACC-DATA-009)
+#
+# `attributed[:LOG_MAX_ENTRIES // 2]` was newest-first, so it dropped the
+# OLDEST attributed commits - a run's first legs, which is the exact property
+# the check exists to protect. 160 legs each landing a commit gave 136 entries
+# and lost 24 of them, silently.
+# --------------------------------------------------------------------------
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_no_attributed_commit_is_dropped_above_the_entry_half_bound(tmp_path):
+    """Past `LOG_MAX_ENTRIES // 2` attributed commits. The contract says every
+    commit attributable to a leg is kept, without a cap; the first legs' are
+    the ones a newest-first cap removes, and they are the ones a supervisor
+    scrolled back for."""
+    count = 160
+    assert count > relay_model.LOG_MAX_ENTRIES // 2
+    project = tmp_path / "many"
+    relay_dir = project / ".relay"
+    (relay_dir / "batons").mkdir(parents=True)
+    legs = [{"id": f"leg-{i:03d}", "stage": "S1", "status": "done"}
+            for i in range(count)]
+    (relay_dir / "legs.json").write_text(json.dumps(
+        {"relay": "many", "stages": [{"id": "S1", "legs": [l["id"] for l in legs]}],
+         "legs": legs}))
+
+    _git(project, "init", "-q", "-b", "main")
+    _git(project, "add", "-A", when=NOW - 9000)
+    _git(project, "commit", "-q", "-m", "chore: the project existed first",
+         when=NOW - 9000)
+    _git(project, "checkout", "-q", "-b", "feat/the-long-run")
+    # One `git` process per commit is the cost here, not Python.
+    script = ('set -e; i=0; while [ $i -lt %d ]; do '
+              'GIT_AUTHOR_DATE="$((BASE+i*10)) +0000" '
+              'GIT_COMMITTER_DATE="$((BASE+i*10)) +0000" '
+              'git commit -q --allow-empty -m "leg work $i"; i=$((i+1)); done'
+              % count)
+    env = dict(os.environ)
+    env.update({"BASE": str(int(NOW - 5000)),
+                "GIT_AUTHOR_NAME": "Relay Test", "GIT_AUTHOR_EMAIL": "t@example.com",
+                "GIT_COMMITTER_NAME": "Relay Test",
+                "GIT_COMMITTER_EMAIL": "t@example.com"})
+    out = subprocess.run(["sh", "-c", script], cwd=project, env=env,
+                         capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+
+    claimed = {}
+    for i, leg in enumerate(legs):
+        sha = _short_sha(project, f"HEAD~{count - 1 - i}")
+        claimed[leg["id"]] = sha
+        _land(relay_dir, leg["id"], NOW - 4000 + i * 10, sha)
+
+    model = relay_model.build(relay_dir, now=NOW)
+    credited = {e["commit"]: e["leg"] for e in entries_of(model, "commit")
+                if e["leg"]}
+    assert credited == {sha: leg for leg, sha in claimed.items()}, \
+        f"{len(claimed) - len(credited)} attributed commits were dropped"
+    assert len(model["log"]) <= relay_model.LOG_MAX_ENTRIES
+    # The oldest legs are the ones a newest-first cap removes first, so name
+    # them rather than trusting the count.
+    assert credited[claimed["leg-000"]] == "leg-000"
+    assert credited[claimed["leg-023"]] == "leg-023"
+
+
+# --------------------------------------------------------------------------
+# `dashboard.json.path` may narrow the repository bound, never widen it
+# (ACC-DATA-009)
+#
+# `path` is a string a coach wrote into a JSON file and is untrusted like every
+# other field the model reads. The filesystem bound that keeps a host
+# repository's history out of a relay's log is defeated by writing an ancestor
+# there - the same boundary, walked in through a different input.
+# --------------------------------------------------------------------------
+
+@pytest.fixture
+def nested_relay(tmp_path):
+    """A relay that is its own project, inside a repository that is not its.
+
+    The host's commits are NEWER than the relay's only record, so nothing but
+    the repository bound can keep them out: a broken bound shows them all.
+    That is deliberate - the mtimes here are stamped rather than inherited, so
+    the test says the same thing on a fresh checkout as on a developer's tree.
+    """
+    host = tmp_path / "host"
+    (host / "nested").mkdir(parents=True)
+    _git(host, "init", "-q", "-b", "main")
+    (host / "README").write_text("the host repository\n")
+    _git(host, "add", "README", when=NOW - 200)
+    _git(host, "commit", "-q", "-m", "host: not the relay's work 0",
+         when=NOW - 200)
+    for n in range(1, 5):
+        _git(host, "commit", "-q", "--allow-empty",
+             "-m", f"host: not the relay's work {n}", when=NOW - 200 + n)
+
+    relay_dir = host / "nested" / "standalone"
+    (relay_dir / "batons").mkdir(parents=True)
+    (relay_dir / "legs.json").write_text(json.dumps(
+        {"relay": "standalone",
+         "stages": [{"id": "S1", "legs": ["alpha"]}],
+         "legs": [{"id": "alpha", "stage": "S1", "status": "done"}]}))
+    _land(relay_dir, "alpha", NOW - 9000)      # older than every host commit
+    return relay_dir
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_relay_that_owns_no_repository_reports_no_commits(nested_relay):
+    """The fixture shape, end to end and independent of any clock: the host's
+    commits are all INSIDE this relay's window, so only the repository bound
+    keeps them out of its log."""
+    model = relay_model.build(nested_relay, now=NOW)
+    assert model["relay"]["path"] == str(nested_relay.resolve())
+    assert entries_of(model, "commit") == [], \
+        [e["m"] for e in entries_of(model, "commit")]
+    assert not [e for e in model["log"] if "host: not the relay's work" in e["m"]]
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+@pytest.mark.parametrize("where", ["host", "root", "grandparent"])
+def test_a_written_path_cannot_widen_the_repository_bound(nested_relay, where):
+    """A coach writes an ancestor into `dashboard.json.path` and the walk is
+    supposed to follow it. It must not: the walk reaches the relay directory
+    and its immediate parent, and anything else clamps back to the relay
+    directory. Three ancestors, one rule."""
+    host = nested_relay.parent.parent
+    path = {"host": str(host), "root": "/",
+            "grandparent": str(host.parent)}[where]
+    (nested_relay / "dashboard.json").write_text(json.dumps({"path": path}))
+    model = relay_model.build(nested_relay, now=NOW)
+    assert model["relay"]["path"] == path         # reported, and not obeyed
+    assert entries_of(model, "commit") == [], \
+        [e["m"] for e in entries_of(model, "commit")]
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_written_path_cannot_widen_the_claim_check_either(nested_relay):
+    """The same bound on the other read, and on the cheapest observation of
+    it. `_in_a_repo` is checked before git is spawned at all - by the log AND
+    by `_resolve_shas`, which asks the relay's own repository whether a claimed
+    sha is a commit in it. A relay that owns no repository asks nothing; a
+    widened walk starts asking the host's, which is how a baton comes to be
+    credited with a foreign object. No clock is involved in observing it."""
+    host = nested_relay.parent.parent
+    sha = _git(host, "rev-parse", "--short=7", "HEAD").stdout.strip()
+    _land(nested_relay, "alpha", NOW - 9000, sha)
+    (nested_relay / "dashboard.json").write_text(json.dumps({"path": str(host)}))
+
+    asked = []
+    real = relay_model._git
+    relay_model._git = lambda d, *a, **k: (asked.append(a), real(d, *a, **k))[1]
+    try:
+        model = relay_model.build(nested_relay, now=NOW)
+    finally:
+        relay_model._git = real
+    assert asked == [], asked
+    assert entries_of(model, "commit") == []
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_the_live_relay_shape_still_finds_its_own_repository(repo_relay):
+    """The clamp narrows the walk, so the shape it must not break is asserted
+    beside it: a live relay is `<project>/.relay`, its `.git` is at the parent,
+    and `path` naming that parent is the one ancestor the walk may follow."""
+    (repo_relay / "dashboard.json").write_text(json.dumps(
+        {"path": str(repo_relay.parent)}))
+    model = relay_model.build(repo_relay, now=NOW)
+    assert [e["m"] for e in entries_of(model, "commit")], "its own history"
+
+
+# --------------------------------------------------------------------------
+# the window is applied where it is derived, not only where it shows
+# (ACC-DATA-009)
+#
+# The window is enforced in two places - `_commit_entries` decides which
+# commits are the run's, and `_derived_log` decides how many of them fit. The
+# ORIGINAL defect needed both of them to be gated on the derived entry list,
+# and reverting either one alone leaves the other masking it. So the first test
+# here reads `_commit_entries` directly: a gate that has stopped working is
+# worth seeing at the boundary it guards rather than only where it shows.
+# --------------------------------------------------------------------------
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_the_window_is_applied_though_the_derivation_produced_no_entry(tmp_path):
+    """`_commit_entries` at its own boundary, on the relay one leg in. There
+    are forty commits in the walk and no derived entry to bound them with, and
+    the answer is still none of them."""
+    relay_dir = _one_leg_in(tmp_path / "proj")
+    project = str(relay_dir.parent)
+    batons = relay_model._read_batons(relay_dir, [])
+    runners = [{"leg": "alpha", "status": "running"}]
+    records = relay_model._relay_records(relay_dir, runners, batons, [], [])
+
+    # The walk really does have forty commits to bound - otherwise the
+    # assertion below would pass for the wrong reason.
+    commits, branched = relay_model._relay_commits(relay_dir, project)
+    assert len(commits) == 40 and branched is False
+
+    assert records[0] is True                       # records...
+    assert relay_model._commit_entries(
+        relay_dir, project, batons, records, 0, NOW) == []
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_the_window_opens_when_legs_json_recorded_the_running_leg(tmp_path):
+    """`legs.json` marks a leg running and carries no timestamp of its own, so
+    the file that holds that record is what dates it - and a relay is planned
+    BEFORE its first runner lands, so that mtime is earlier than every baton.
+    A first leg's own commits sit in exactly that gap. Without the record there
+    is no floor below the first baton, and an unbranched run loses them."""
+    project = tmp_path / "planned"
+    relay_dir = project / ".relay"
+    (relay_dir / "batons").mkdir(parents=True)
+    _git(project, "init", "-q", "-b", "main")
+    (project / "README").write_text("the project\n")
+    _git(project, "add", "README", when=NOW - 9000)
+    _git(project, "commit", "-q", "-m", "before: long before the relay",
+         when=NOW - 9000)
+    _git(project, "commit", "-q", "--allow-empty",
+         "-m", "alpha: the first leg's own work", when=NOW - 5500)
+
+    legs = relay_dir / "legs.json"
+    legs.write_text(json.dumps({
+        "relay": "planned",
+        "stages": [{"id": "S1", "legs": ["alpha", "beta"]}],
+        "legs": [{"id": "alpha", "stage": "S1", "status": "done"},
+                 {"id": "beta", "stage": "S1", "status": "running"}]}))
+    os.utime(legs, (NOW - 6000, NOW - 6000))       # when the relay was planned
+    _land(relay_dir, "alpha", NOW - 5000)          # claims no commit
+
+    model = relay_model.build(relay_dir, now=NOW)
+    assert relay_model._default_branch_refs(relay_dir), "main exists"
+    assert len(relay_events(model)) == 2            # alpha landed, beta started
+    assert commit_named(model, "alpha: the first leg's own work") is not None, \
+        [e["m"] for e in entries_of(model, "commit")]
+    assert commit_named(model, "before: long before the relay") is None
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_the_window_opens_when_state_json_recorded_a_check_transition(tmp_path):
+    """The same reasoning on the other file. A judged check is a state
+    transition the contract names as a record, `state.json` carries no
+    timestamp for it, and the file's mtime is the only honest date it has."""
+    project = tmp_path / "judged"
+    relay_dir = project / ".relay"
+    (relay_dir / "batons").mkdir(parents=True)
+    _git(project, "init", "-q", "-b", "main")
+    (project / "README").write_text("the project\n")
+    _git(project, "add", "README", when=NOW - 9000)
+    _git(project, "commit", "-q", "-m", "before: long before the relay",
+         when=NOW - 9000)
+    _git(project, "commit", "-q", "--allow-empty",
+         "-m", "work: done while the relay was running", when=NOW - 5500)
+
+    (relay_dir / "legs.json").write_text(json.dumps({
+        "relay": "judged",
+        "stages": [{"id": "S1", "legs": ["alpha"]}],
+        "legs": [{"id": "alpha", "stage": "S1", "status": "done"}]}))
+    state = relay_dir / "state.json"
+    state.write_text(json.dumps(
+        {"checks": {"ACC-X-001": {"status": "failed", "round": 2,
+                                  "claimedBy": "alpha", "fixLeg": "fix-it"}}}))
+    os.utime(state, (NOW - 6000, NOW - 6000))
+    _land(relay_dir, "alpha", NOW - 5000)
+
+    model = relay_model.build(relay_dir, now=NOW)
+    assert len(relay_events(model)) == 3    # a landing and two check transitions
+    assert commit_named(model, "work: done while the relay was running") \
+        is not None, [e["m"] for e in entries_of(model, "commit")]
+    assert commit_named(model, "before: long before the relay") is None
