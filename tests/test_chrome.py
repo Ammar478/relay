@@ -1353,7 +1353,12 @@ VIEW_KEYS = {
     "overview": (None, "Active Runner"),
     "legs": ("F", "Esc Overview"),
     "runners": ("W", "Esc Overview"),
-    "models": ("M", "Read-only: edit dashboard.json to change these."),
+    # The keybar phrase, exactly as the three views beside it use it: the
+    # Overview's own keybar has no `Esc Overview`, so it is introduced by the
+    # repaint. It replaced a sentence copied out of `models.py`, which pinned
+    # this table to one view's prose and went stale the moment that view grew
+    # past its stub (`models-view`, S3).
+    "models": ("M", "Esc Overview"),
     "contract": ("C", "Esc Overview"),
 }
 

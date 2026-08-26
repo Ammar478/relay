@@ -1,0 +1,11 @@
+{
+  "stages": [
+    { "id": "S1", "name": "Foundations" }
+  ],
+  "legs": [
+    { "id": "pin-the-models", "stage": "S1", "kind": "impl",
+      "goal": "Pin a model to every role.", "status": "done" },
+    { "id": "read-the-models", "stage": "S1", "kind": "impl",
+      "goal": "Render the pinned models.", "status": "running" }
+  ]
+}
