@@ -121,8 +121,8 @@ def runners_from_state(mdir, leg_rows):
     bdir = mdir / "batons"
     batons = {p.stem: read_baton(p) for p in bdir.glob("*.md")} if bdir.is_dir() else {}
 
-    done = [l for l in leg_rows if l["status"] == "completed"]
-    done.sort(key=lambda l: batons.get(l["id"], {}).get("mtime", 0))
+    done = [row for row in leg_rows if row["status"] == "completed"]
+    done.sort(key=lambda row: batons.get(row["id"], {}).get("mtime", 0))
 
     rows, prev = [], None
     for n, leg in enumerate(done, 1):

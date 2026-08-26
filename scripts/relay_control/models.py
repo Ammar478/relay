@@ -11,7 +11,6 @@ The data is untrusted coach input under `model["extras"]["models"]`, shaped
 and states a documented default where a role is absent.
 """
 
-from . import chrome
 from . import theme as theme_tokens
 
 TITLE = "Models"
