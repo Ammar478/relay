@@ -244,6 +244,20 @@ def test_colon_and_semicolon_extended_colour_agree():
     semi = feed("\x1b[38;5;214mX").frame().attrs_at(0, 0)
     colon = feed("\x1b[38:5:214mX").frame().attrs_at(0, 0)
     assert semi.fg == colon.fg == (38, 5, 214)
+
+
+def test_colour_index_zero_is_a_colour_and_not_an_absent_parameter():
+    """`0` is the number zero, everywhere a parameter is read.
+
+    Palette entry 0 is a colour a pane background is plausibly drawn with, and
+    an all-zero parameter treated as "no parameter" drops it out of the tuple —
+    `(38, 5)` instead of `(38, 5, 0)` — so the cell records a colour nobody
+    could have asked for.
+    """
+    assert feed("\x1b[38:5:0mX").frame().attrs_at(0, 0).fg == (38, 5, 0)
+    assert feed("\x1b[48:5:0mX").frame().attrs_at(0, 0).bg == (48, 5, 0)
+    assert feed("\x1b[38;5;0mX").frame().attrs_at(0, 0).fg == (38, 5, 0)
+    assert feed("\x1b[38:2:0:0:0mX").frame().attrs_at(0, 0).fg == (38, 2, 0, 0, 0)
     itu = feed("\x1b[38:2::10:20:30mX").frame().attrs_at(0, 0)
     assert itu.fg == (38, 2, 10, 20, 30)
 

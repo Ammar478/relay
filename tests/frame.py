@@ -22,7 +22,8 @@ Quick start
         frame = term.send("<Down><Down><Enter>")   # waits for the program to act
         assert frame.find("cutover-flip") is not None
 
-        frame = term.send("<Enter>", expect="Leg detail")   # the sound form
+        frame = term.send("<Enter>", expect="Leg detail")   # the strongest
+        frame.assert_finished()                # ...and this demands the proof
 
         frame = term.resize(48, 160)           # SIGWINCH, then recapture
         frame.dump(".relay/evidence/legs-160x48.txt")
@@ -82,16 +83,46 @@ there; it waits, on two positive signals:
 * **The answer.** Then the program's answer is waited for: the first byte it
   writes after delivery, and the repaint settling after that, bounded by
   `redraw` (0.75s) so a keystroke that legitimately draws nothing stays cheap.
-  `send(keys, expect="...")` names text the repaint must show and is the sound
-  form — it fails loudly with the frame instead of returning a stale one, and
-  the frame it returns is one the program had *finished* writing: the needle
-  triggers the capture rather than being it, and the wait runs on until the
-  program has been quiet for `paint` (0.2s). Without that, a program painting a
-  screen region by region hands back a frame that passes on the needle and
-  shows the previous screen everywhere else, and text that survives a repaint
-  (a pane heading) ends the wait before the program has drawn anything at all.
+  `send(keys, expect="...")` names text the repaint must show and is the
+  strongest form available — it fails loudly with the frame instead of
+  returning a stale one, and the needle triggers the capture rather than being
+  it: the wait runs on past the needle until the repaint ends. Without that, a
+  program painting a screen region by region hands back a frame that passes on
+  the needle and shows the previous screen everywhere else, and text that
+  survives a repaint (a pane heading) ends the wait before the program has
+  drawn anything at all.
 
-Two residual failure modes, stated plainly:
+When is a repaint over?
+-----------------------
+
+Two answers are proof and one is a guess, so every frame `expect=` returns
+carries `frame.paint_end` saying which it was:
+
+* `"synchronised"` — the program bracketed the repaint in **DEC private mode
+  2026**: `ESC [ ? 2026 h` before it, `ESC [ ? 2026 l` after. That closing
+  sequence *is* the program saying "the screen is whole", which is the only
+  statement about its own painting a terminal can read. The wait ends there.
+* `"exited"` — the program is gone, so nothing can be added to the screen.
+* `"quiet"` — it stopped writing for `paint` (0.2s). **This is a heuristic and
+  the API does not pretend otherwise.** A program that pauses longer than that
+  inside one repaint — clear the screen, draw the title, pause, draw the body —
+  is quiet and half-painted at the same instant, and the frame then shows
+  neither the old body nor the new one. Every negative assertion passes on such
+  a frame for the wrong reason. There is no observation a terminal can make
+  that separates a pause from an ending: `FIONREAD` answers for input, not
+  output, and a byte the program has not written yet is not visible anywhere.
+
+What to do about the third one, in order of preference: have the program
+bracket its repaints in 2026; call `frame.assert_finished()`, which refuses
+anything but the two proofs; raise the window for a call with `quiet=` (or for
+a session with `paint=`) past the longest pause the program takes; and assert
+on what the screen *should say*, never only on what it should not.
+
+A program still writing when `redraw` runs out is the one case a terminal can
+be certain about — that screen is definitely partial — so `expect=` raises with
+the frame instead of returning it.
+
+Two residual failure modes in the synchronisation itself, stated plainly:
 
 * A keystroke whose repaint *starts* later than `redraw`, with no `expect`
   given, still yields the pre-repaint frame — a terminal cannot tell "still
@@ -117,10 +148,13 @@ that the sequences mutate, so the captured text is what a human would see:
 cursor addressing (CUP/HVP, CUU/CUD/CUF/CUB, CHA/VPA, CNL/CPL), erases (ED, EL,
 ECH), insert/delete of lines and characters (IL/DL, ICH/DCH, IRM), scroll
 regions (DECSTBM) and scrolling (IND, RI, NEL, SU/SD), repeat (REP), tab stops,
-the alternate screen (`?1049`), autowrap (`?7`), save/restore cursor, the
-alternate character set and UTF-8 decoding across read boundaries. Escape bytes
-never reach the text: frames carry what a human would see, never the sequences
-that put it there.
+the alternate screen (`?1049`), autowrap (`?7`), synchronized output (`?2026`),
+save/restore cursor, the alternate character set and UTF-8 decoding across read
+boundaries. Escape bytes never reach the text: frames carry what a human would
+see, never the sequences that put it there. A sequence the emulator does not
+model leaves *nothing* behind — an escape with an intermediate byte
+(`ESC # 8`, `ESC SP F`) is swallowed whole rather than dropping its final
+character into the text plane as content.
 
 That includes the box drawing. `curses.border()` on `xterm-256color` does not
 send `┌` and `│`; it sends `ESC ( 0`, then the letters `l q k x m j`, then
@@ -137,8 +171,16 @@ its deadline only *between* reads, so one twelve-byte sequence would otherwise
 hang the harness with no exception and no timeout. A hung judge is
 indistinguishable from a slow one.
 
-Known limits, on purpose: no scrollback (only the visible screen), no origin
-mode (`?6`), and no reply to cursor-position queries.
+Known limits, on purpose: no scrollback (only the visible screen, so `ED 3`
+has nothing to erase and does nothing), no origin mode (`?6`), and no reply to
+cursor-position queries.
+
+What a program left on the alternate screen is kept when it gives the screen
+back, and `TerminalSession.last_alt_frame()` returns it. A curses program's
+exit path runs `endwin()`, which sends `?1049l` and restores the primary
+screen, so after a crash or a SIGTERM `frame()` shows the shell line and not
+the screen the program died holding — which is precisely the evidence a judge
+wants.
 
 The attribute plane
 -------------------
@@ -200,6 +242,9 @@ Gotchas worth knowing before you debug something
 * `lines` are right-stripped; use `raw_lines` when a column position matters.
 * Width is *display* width: wide (East Asian W/F) characters count as two cells,
   combining marks as zero.
+* A row that wrapped stops being a wrapped row when the screen is made wider
+  than the width it wrapped at: the grid is not reflowed, so what is on screen
+  afterwards is two short rows, not one long one.
 
 Catching content that is too wide
 ---------------------------------
@@ -243,6 +288,12 @@ from typing import NamedTuple
 
 __all__ = [
     "DEFAULT_ATTRS",
+    "PAINT_ENDS",
+    "PAINT_EXITED",
+    "PAINT_PROVED",
+    "PAINT_QUIET",
+    "PAINT_SYNCHRONISED",
+    "PAINT_UNFINISHED",
     "AttrRun",
     "CellAttrs",
     "Frame",
@@ -257,6 +308,27 @@ __all__ = [
 DEFAULT_ROWS = 24
 DEFAULT_COLS = 80
 DEFAULT_TERM = "xterm-256color"
+
+# How a wait for the end of a repaint ended — recorded on the frame, because
+# only two of these are proof that the program had finished the screen.
+#
+#   synchronised  the program closed a DEC 2026 bracket around the repaint.
+#                 It said, in a sequence a terminal reads, "that is the whole
+#                 screen". Proof.
+#   exited        the program is gone, so nothing further can arrive. Proof.
+#   quiet         it stopped writing for `paint` seconds. *Not* proof: a
+#                 program pausing mid-repaint for longer than that is quiet
+#                 and half-painted at the same time, and no observation a
+#                 terminal can make tells the two apart.
+#   unfinished    it was still writing when the window ran out. That is the
+#                 one case a terminal can be certain *is* a partial screen,
+#                 so `expect=` refuses it rather than handing it over.
+PAINT_SYNCHRONISED = "synchronised"
+PAINT_EXITED = "exited"
+PAINT_QUIET = "quiet"
+PAINT_UNFINISHED = "unfinished"
+PAINT_ENDS = (PAINT_SYNCHRONISED, PAINT_EXITED, PAINT_QUIET, PAINT_UNFINISHED)
+PAINT_PROVED = frozenset({PAINT_SYNCHRONISED, PAINT_EXITED})
 
 # The DEC Special Graphics set: what `ESC ( 0` turns the ASCII range 0x5F-0x7E
 # into until `ESC ( B` turns it back. ncurses draws every box, rule and arrow
@@ -291,14 +363,23 @@ _MAX_PARAM_DIGITS = 7
 def _param(text):
     """One CSI parameter as a number, or None when it is not one.
 
-    Seven digits or fewer is at most `_MAX_PARAM`, so the length guard is the
-    whole cap: nothing else here decides anything.
+    Leading zeros are stripped before the length is looked at, because they
+    carry no value and a terminal reads `01` as 1. Counting them made a
+    zero-padded parameter longer than seven characters — `ESC[00000001;1H` —
+    arrive as `_MAX_PARAM` and address the last row instead of the first: a
+    padded number resolved to the wrong cell, which is the one thing this
+    function exists to get right. What is left after the strip is at most
+    `_MAX_PARAM` when it is seven digits or fewer, so the length guard is
+    still the whole cap.
     """
     if not text.isdigit():
         return None
-    if len(text) > _MAX_PARAM_DIGITS:
+    digits = text.lstrip("0")
+    if not digits:
+        return 0
+    if len(digits) > _MAX_PARAM_DIGITS:
         return _MAX_PARAM
-    return int(text)
+    return int(digits)
 
 
 # ---------------------------------------------------------------------------
@@ -603,7 +684,7 @@ class Frame:
     """
 
     def __init__(self, lines, rows=None, cols=None, wrapped=(), label=None,
-                 attrs=None, cells=None, overflow=None):
+                 attrs=None, cells=None, overflow=None, paint_end=None):
         self.lines = [line.rstrip() for line in lines]
         self.rows = rows if rows is not None else len(self.lines)
         self.cols = cols if cols is not None else max(
@@ -621,6 +702,11 @@ class Frame:
                 for row in range(len(self.lines))
             ]
         self.label = label
+        # How the wait that captured this frame ended — one of PAINT_ENDS, or
+        # None for a frame nobody waited for the end of a repaint to take.
+        # It is not compared by __eq__: it describes the capture, not the
+        # screen.
+        self.paint_end = paint_end
         # Taken as given: Screen.frame() hands over fresh copies.
         self.attrs = attrs
         self.cells = cells
@@ -661,6 +747,47 @@ class Frame:
             return self.lines == other.lines and self.attrs == other.attrs
         return NotImplemented
 
+    @property
+    def paint_finished(self) -> bool:
+        """Whether the program was *proved* to have finished this screen.
+
+        True only for a repaint the program bracketed with DEC 2026 or one it
+        could no longer add to because it had exited. A frame captured on
+        silence alone answers False: silence is the strongest signal available
+        without the program's cooperation, and it is still a guess.
+        """
+        return self.paint_end in PAINT_PROVED
+
+    def assert_finished(self):
+        """Fail unless the program was proved to have finished this screen.
+
+        Use it where a *negative* assertion carries the weight — "the error
+        pane is gone", "no traceback" — because those pass on a half-painted
+        screen for the wrong reason. It is the caller's way of demanding the
+        guarantee that `expect=` alone cannot give.
+        """
+        if self.paint_finished:
+            return self
+        if self.paint_end is None:
+            reason = (
+                "this frame was not captured by waiting for the end of a "
+                "repaint at all"
+            )
+        else:
+            reason = (
+                "this frame was captured on %s, which is not proof the "
+                "program had finished the screen" % self.paint_end
+            )
+        raise AssertionError(
+            self._message(
+                reason
+                + ". A program proves it by bracketing the repaint in DEC 2026"
+                " (ESC[?2026h ... ESC[?2026l) or by exiting; short of that,"
+                " raise the quiet window with quiet=/paint= and assert on what"
+                " the screen should say rather than on what it should not."
+            )
+        )
+
     # -- searching -------------------------------------------------------
 
     def find(self, needle: str, start: int = 0):
@@ -681,6 +808,12 @@ class Frame:
         that next row, so a search line by line cannot see a needle that
         straddles the break. Rows that merely sit next to each other are never
         joined: joining those would invent text nobody wrote.
+
+        A continued row is cut at the width it *continued* at, not at the
+        width the screen is now. After a widening resize the grid is not
+        reflowed, so the row still holds its old content followed by fresh
+        blanks — pasting the padded row in would have spliced a run of spaces
+        into the middle of a line the program wrote without one.
         """
         joined = []
         raw = self.raw_lines
@@ -689,7 +822,7 @@ class Frame:
             start = row
             text = ""
             while row in self.wrapped and row < len(self.lines) - 1:
-                text += raw[row]
+                text += raw[row][:self._overflow_at(row).continued]
                 row += 1
             joined.append((start, text + self.lines[row]))
             row += 1
@@ -987,7 +1120,10 @@ class Frame:
         * the row wrapped onto the next one — the width reported is the sum of
           the widths those rows were *drawn* at, never a width recomputed from
           the current size, which is how a resize used to report 360 cells of
-          content that were only ever 200;
+          content that were only ever 200. A wrapped run still has to be wider
+          than the screen to count: a row that wrapped at 10 cells is not too
+          wide for the 40-column screen it was resized onto, and reporting it
+          made `assert_within_width()` fail on a frame where every row fits;
         * cells were destroyed at the right margin because autowrap was off —
           the width reported is what the program drew, including what the
           screen never showed.
@@ -1006,7 +1142,8 @@ class Frame:
                     width += self._overflow_at(row).continued
                     row += 1
                 width += display_width(self.lines[row]) + self._overflow_at(row).lost
-                violations.append((start, width))
+                if width > self.cols:
+                    violations.append((start, width))
             else:
                 width = display_width(self.lines[row]) + record.lost
                 if width > self.cols:
@@ -1089,7 +1226,12 @@ class Frame:
         return path
 
     def _message(self, reason: str) -> str:
-        header = "%s (%dx%d)" % (self.label or "frame", self.rows, self.cols)
+        header = "%s (%dx%d%s)" % (
+            self.label or "frame",
+            self.rows,
+            self.cols,
+            "" if self.paint_end is None else ", captured on %s" % self.paint_end,
+        )
         rule = "-" * max(len(header), min(self.cols, 100))
         numbered = "\n".join(
             "%3d|%s" % (i, line) for i, line in enumerate(self.lines)
@@ -1129,12 +1271,19 @@ class Screen:
         self.rows = rows
         self.cols = cols
         self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        # Survives reset(): a program that issues RIS after drawing has not
+        # made what it drew on the alternate screen any less evidence.
+        self._retired_alt = None
         self.reset()
 
     # -- state -----------------------------------------------------------
 
     def reset(self):
         self._attrs = DEFAULT_ATTRS
+        # DEC 2026: True between the program's own "here comes one repaint"
+        # and "that repaint is complete"; the counter is how many it closed.
+        self.synchronized_update = False
+        self.synchronized_updates = 0
         self._grid = [self._blank_row() for _ in range(self.rows)]
         self._attr_grid = [self._blank_attr_row() for _ in range(self.rows)]
         self._overflow = [_NO_OVERFLOW] * self.rows
@@ -1187,6 +1336,10 @@ class Screen:
         # when narrowing manufactured a clean bill of health for a screen that
         # had one, and keeping a bare flag while widening reported a width
         # that was never on the screen.
+        # Both readers of these records — `overlong_lines()` and
+        # `logical_lines()` — measure against the width the row *continued* at
+        # rather than the width the screen happens to be now, which is what
+        # keeps a resize from turning a kept record into a wrong answer.
         overflow = [_NO_OVERFLOW] * rows
         for r in range(min(rows, self.rows)):
             for c in range(min(cols, self.cols)):
@@ -1249,6 +1402,27 @@ class Screen:
         """How every cell was drawn, row by row."""
         return [row[:] for row in self._attr_grid]
 
+    def last_alt_frame(self, label: str = None):
+        """The alternate screen as it stood when the program gave it back.
+
+        None until a program has taken the alternate screen and left it. This
+        is what a crashed or terminated TUI drew before it died: `?1049l`
+        replaces that screen with the primary one, so `frame()` afterwards
+        shows the shell, not the program.
+        """
+        if self._retired_alt is None:
+            return None
+        grid, attr_grid, overflow, rows, cols = self._retired_alt
+        return Frame(
+            ["".join(row) for row in grid],
+            rows=rows,
+            cols=cols,
+            label=label or "last alternate screen",
+            attrs=[row[:] for row in attr_grid],
+            cells=[row[:] for row in grid],
+            overflow=list(overflow),
+        )
+
     def wrapped_rows(self):
         """Rows whose content continued onto the following row."""
         return [i for i, record in enumerate(self._overflow) if record.continued]
@@ -1257,7 +1431,7 @@ class Screen:
         """What ran past the right margin, row by row."""
         return self._overflow[:]
 
-    def frame(self, label: str = None) -> Frame:
+    def frame(self, label: str = None, paint_end: str = None) -> Frame:
         return Frame(
             self.lines(),
             rows=self.rows,
@@ -1267,6 +1441,7 @@ class Screen:
             attrs=self.attrs(),
             cells=self.cells(),
             overflow=self.overflow(),
+            paint_end=paint_end,
         )
 
     # -- input -----------------------------------------------------------
@@ -1290,6 +1465,8 @@ class Screen:
             self._string_char(ch)
         elif state == "charset":
             self._charset(ch)
+        elif state == "esc_intermediate":
+            self._esc_intermediate(ch)
 
     # -- ground ----------------------------------------------------------
 
@@ -1400,6 +1577,13 @@ class Screen:
         elif ch in _CHARSET_SLOTS:
             self._charset_slot = _CHARSET_SLOTS[ch]
             self._state = "charset"
+        elif 0x20 <= ord(ch) <= 0x2F:
+            # An intermediate byte: the sequence continues until a final byte
+            # in 0x30-0x7E. Dropping the intermediate and returning to ground
+            # printed that final byte as text — `ESC # 8` (DECALN) put a "8"
+            # on the screen, `ESC SP F` an "F" — so a sequence this harness
+            # does not implement became content in a frame handed to a judge.
+            self._state = "esc_intermediate"
         elif ch == "7":
             self._save_cursor()
         elif ch == "8":
@@ -1420,6 +1604,17 @@ class Screen:
         elif ch == ">":
             self.application_keypad = False
         # anything else: a one-character escape we do not need
+
+    def _esc_intermediate(self, ch):
+        """Swallow the rest of an escape sequence this harness does not model.
+
+        Further intermediates (0x20-0x2F) keep the sequence open; a final byte
+        (0x30-0x7E) ends it. Either way nothing is drawn — an unhandled
+        sequence leaves no glyph behind.
+        """
+        if 0x20 <= ord(ch) <= 0x2F:
+            return
+        self._state = "ground"
 
     def _charset(self, ch):
         """The character after `ESC ( ` designates a set into that slot.
@@ -1479,7 +1674,15 @@ class Screen:
             params = [None]
 
         def p(index, default=1):
-            if index < len(params) and params[index] is not None:
+            """One parameter, with zero meaning "the default" — as it does.
+
+            A count of zero is not a count of zero: VT-style sequences read
+            `CSI 0 A` as one row, `CSI 0 P` as one character. Reading it
+            literally made `CSI 0 A` move nothing at all. The sequences whose
+            parameter really is a mode ask for `p(index, 0)`, so zero and the
+            default are the same value there and this changes nothing for them.
+            """
+            if index < len(params) and params[index]:
                 return params[index]
             return default
 
@@ -1571,8 +1774,31 @@ class Screen:
                 self.autowrap = on
             elif mode == 25:
                 self.cursor_visible = on
+            elif mode == 2026:
+                self._synchronized_update(on)
             elif mode in (47, 1047, 1049):
                 self._switch_screen(on, save_cursor=(mode == 1049))
+
+    def _synchronized_update(self, on):
+        """DEC private mode 2026: the program brackets one whole repaint.
+
+        This is the only thing a program can say about its own painting that a
+        terminal is able to *observe*: between `ESC [ ? 2026 h` and
+        `ESC [ ? 2026 l` the screen is by construction unfinished, and at the
+        closing sequence it is by construction finished. Everything else a
+        terminal can measure — silence, a settled burst — is a guess about a
+        program that might simply be slow.
+
+        Reopening an update that is already open is not a second update, and a
+        close with nothing open is ignored, so the completed count only ever
+        counts brackets the program actually closed.
+        """
+        if on:
+            self.synchronized_update = True
+            return
+        if self.synchronized_update:
+            self.synchronized_update = False
+            self.synchronized_updates += 1
 
     def _switch_screen(self, to_alt, save_cursor):
         if to_alt:
@@ -1593,6 +1819,19 @@ class Screen:
             if not self.in_alt_screen:
                 return
             self.in_alt_screen = False
+            # What the program drew on the alternate screen is about to be
+            # replaced by the primary screen it was given. A terminal throws
+            # that away; a judge needs it, because a TUI's exit path — endwin
+            # on SIGTERM, endwin from curses.wrapper on a crash — runs
+            # `?1049l` and would otherwise leave a blank frame as the only
+            # evidence of what the program had on screen when it died.
+            self._retired_alt = (
+                [row[:] for row in self._grid],
+                [row[:] for row in self._attr_grid],
+                self._overflow[:],
+                self.rows,
+                self.cols,
+            )
             if self._saved_screen is None:
                 return
             grid, attr_grid, overflow, row, col = self._fit_saved_screen(
@@ -1732,9 +1971,16 @@ class Screen:
             self._clear_row(self.cursor_row, 0, self.cursor_col + 1)
             for row in range(0, self.cursor_row):
                 self._clear_row(row)
-        else:
+        elif mode == 2:
             for row in range(self.rows):
                 self._clear_row(row)
+        else:
+            # ED 3 erases the *scrollback*, which this screen does not model,
+            # and any other parameter is not an erase at all. Blanking the
+            # visible screen for either was a repaint nobody asked for: a TUI
+            # that clears its scrollback on start-up lost the screen it had
+            # just drawn.
+            return
         self._pending_wrap = False
 
     def _erase_line(self, mode):
@@ -2117,9 +2363,22 @@ class TerminalSession:
 
     # -- capture ---------------------------------------------------------
 
-    def frame(self, label: str = None) -> Frame:
+    def frame(self, label: str = None, paint_end: str = None) -> Frame:
         """The current screen, without waiting for more output."""
-        return self.screen.frame(label=label or " ".join(self.argv[-1:]))
+        return self.screen.frame(
+            label=label or " ".join(self.argv[-1:]), paint_end=paint_end
+        )
+
+    def last_alt_frame(self, label: str = None):
+        """What the program had on the alternate screen when it gave it back.
+
+        A curses program's exit path — endwin on SIGTERM, endwin from
+        `curses.wrapper` on a crash — sends `?1049l`, which puts the primary
+        screen back. `frame()` then shows the shell line, or nothing at all,
+        and the screen the program died holding is gone. This returns that
+        screen, or None if the program never took the alternate screen.
+        """
+        return self.screen.last_alt_frame(label)
 
     def read(self, settle: float = None, timeout: float = None) -> Frame:
         """Drain pending output and return the resulting frame."""
@@ -2127,7 +2386,8 @@ class TerminalSession:
         return self.frame()
 
     def send(self, keys, settle: float = None, expect: str = None,
-             timeout: float = None, regex: bool = False) -> Frame:
+             timeout: float = None, regex: bool = False,
+             quiet: float = None) -> Frame:
         """Send a key script, wait for the program to act on it, return the frame.
 
         The returned frame is the screen *after* the keystroke, not before it:
@@ -2136,32 +2396,59 @@ class TerminalSession:
            is how the program reading them becomes an observation rather than an
            assumption — see `_await_delivery`;
         2. the program's answer is waited for. `expect` names text the repaint
-           must show and is the sound form — the wait ends when it appears *and*
-           the program has stopped writing, so the frame is a whole screen and
-           not a half-painted one, and it fails loudly with the frame if the
-           text never appears. Without `expect` the wait ends at the first byte
-           the program writes and the repaint settling after it, bounded by
-           `redraw` for a keystroke that draws nothing at all.
+           must show and is the strongest form available — the wait ends when
+           it appears *and* the repaint has ended, and it fails loudly with the
+           frame if the text never appears. Without `expect` the wait ends at
+           the first byte the program writes and the repaint settling after it,
+           bounded by `redraw` for a keystroke that draws nothing at all.
 
-        `settle` overrides that bound for one call; `timeout` bounds both the
-        delivery barrier and `expect`.
+        What `expect` does *not* claim, and the reason `Frame.paint_end`
+        exists: unless the program brackets its repaint in DEC 2026 or exits,
+        "it stopped writing for `paint` seconds" is the end of the wait, and a
+        program that pauses longer than that inside one repaint is quiet and
+        half-painted at the same instant. `quiet=` raises that window for one
+        call; `frame.assert_finished()` refuses a frame that was not proved.
+
+        `settle` overrides the silent bound for one call; `timeout` bounds both
+        the delivery barrier and `expect`.
         """
         text = encode_keys(keys, self.screen.application_cursor_keys)
         return self.send_bytes(
             text.encode("utf-8"), settle=settle, expect=expect, timeout=timeout,
-            regex=regex,
+            regex=regex, quiet=quiet,
         )
 
     def send_bytes(self, data, settle: float = None, expect: str = None,
-                   timeout: float = None, regex: bool = False) -> Frame:
+                   timeout: float = None, regex: bool = False,
+                   quiet: float = None) -> Frame:
         if self.master_fd is None:
             raise RuntimeError("session is not running")
         if isinstance(data, str):
             data = data.encode("utf-8")
-        os.write(self.master_fd, data)
+        try:
+            os.write(self.master_fd, data)
+        except OSError as error:
+            # Every other failure path in this module hands over the screen;
+            # a write that failed because the program died mid-test is
+            # unreadable without it.
+            raise AssertionError(
+                self.frame()._message(
+                    "could not write %r to the program: %s%s"
+                    % (
+                        data,
+                        error,
+                        "" if self.is_running else " (the program has exited)",
+                    )
+                )
+            ) from error
         self._await_delivery(data, timeout=timeout)
         if expect is not None:
-            return self.wait_for(expect, timeout=timeout, regex=regex)
+            # `wait_for` takes its DEC 2026 baseline here, *after* the delivery
+            # barrier: a bracket the program closed while the keys were still
+            # queued was written before it read them, so it is not this
+            # repaint and must not end the wait for it.
+            return self.wait_for(expect, timeout=timeout, regex=regex,
+                                 quiet=quiet)
         window = self.redraw if settle is None else settle
         self._await_response(window)
         return self.frame()
@@ -2245,6 +2532,22 @@ class TerminalSession:
             return False
         if not ready or not self._input_pending():
             return False
+        return self._read_ready()
+
+    def _read_once(self, budget: float) -> bool:
+        """One select-and-read of whatever the program has written."""
+        if self.master_fd is None:
+            return False
+        try:
+            ready, _, _ = select.select([self.master_fd], [], [], max(budget, 0.0))
+        except (OSError, ValueError, TypeError):
+            return False
+        if not ready:
+            return False
+        return self._read_ready()
+
+    def _read_ready(self) -> bool:
+        """Take what is readable on the master and feed it to the screen."""
         try:
             data = os.read(self.master_fd, 65536)
         except BlockingIOError:
@@ -2277,23 +2580,67 @@ class TerminalSession:
             if time.monotonic() >= deadline:
                 return False
 
-    def _await_paint_end(self, window: float = None) -> Frame:
-        """Read until the program stops writing; return the finished frame.
+    def _await_paint_end(self, window: float = None, quiet: float = None,
+                         since: int = None) -> Frame:
+        """Read until the program has finished the screen; return that frame.
 
-        The same bounded positive wait as `_await_response`, run to the *end* of
-        a repaint instead of the start of it: read until the program has been
-        quiet for `paint`, which is what "it has finished the screen" reduces to
-        for a terminal. A pause shorter than that counts as part of the same
-        screen; `redraw` caps the whole wait, so a program that never stops
-        writing cannot hang the capture — it only makes the frame the last
-        thing this could see, which is the best a terminal can do for a screen
-        that never settles.
+        Three endings, and the frame records which one it was, because they do
+        not carry the same weight:
+
+        * the program **closed a DEC 2026 bracket** it opened after `since`
+          updates had completed. That sequence means "this repaint is whole",
+          so the wait ends the instant it arrives and the frame is proof;
+        * the program **exited**. Nothing further can arrive, so the screen is
+          whatever it left, and that is proof too;
+        * the program **went quiet** for `quiet` (default `paint`, 0.2s). This
+          is the strongest signal available without the program's cooperation
+          and it is *not* proof: a program that pauses longer than `quiet`
+          inside one repaint is quiet and half-painted at the same instant,
+          and nothing a terminal can observe separates the two. `quiet=` moves
+          the boundary; it does not remove it.
+
+        The fourth outcome is a failure, not a frame: a program still writing
+        when `window` (default `redraw`) runs out is *known* to have handed
+        over a partial screen, and returning it as though the repaint had
+        finished is exactly the false pass this wait exists to prevent. Raise
+        `redraw=` for a program that legitimately paints for that long.
         """
-        self._drain(settle=self.paint, idle=self.paint,
-                    timeout=self.redraw if window is None else window)
-        return self.frame()
+        quiet = self.paint if quiet is None else quiet
+        window = self.redraw if window is None else window
+        since = self.screen.synchronized_updates if since is None else since
+        started = time.monotonic()
+        deadline = started + window
+        last = started
+        while True:
+            now = time.monotonic()
+            if not self.screen.synchronized_update:
+                if self.screen.synchronized_updates > since:
+                    return self.frame(paint_end=PAINT_SYNCHRONISED)
+                if now - last >= quiet:
+                    return self.frame(paint_end=PAINT_QUIET)
+            if not self.is_running:
+                # Nothing more can come; take whatever the exit path wrote.
+                self._drain(settle=0.02, idle=0.02)
+                return self.frame(paint_end=PAINT_EXITED)
+            if now >= deadline:
+                break
+            if self._read_once(min(quiet, deadline - now)):
+                last = time.monotonic()
+        raise AssertionError(
+            self.frame(paint_end=PAINT_UNFINISHED)._message(
+                "the program was still writing after %.2fs, so this screen is "
+                "part of a repaint it had not finished%s. Raise redraw= past "
+                "the time it takes to paint, or have it bracket the repaint in "
+                "DEC 2026."
+                % (
+                    window,
+                    " (it never stopped for the %.2fs quiet window)" % quiet,
+                )
+            )
+        )
 
-    def wait_for(self, needle: str, timeout: float = None, regex: bool = False) -> Frame:
+    def wait_for(self, needle: str, timeout: float = None, regex: bool = False,
+                 quiet: float = None) -> Frame:
         """Wait until the screen shows `needle`; return the frame it finished.
 
         The needle triggers the capture; it is not the capture. A program paints
@@ -2304,16 +2651,28 @@ class TerminalSession:
         the program has stopped writing, and the frame returned is the one it
         finished. See `_await_paint_end`.
 
+        "Finished" is the program's word where it gives one and the harness's
+        guess where it does not — see `_await_paint_end`, and read
+        `frame.paint_end` when it matters which. `quiet=` widens the guess for
+        one call.
+
+        The DEC 2026 baseline is taken here, at the top of the wait, so that a
+        bracket the program had already closed cannot end it: only an update
+        it completes from now on says anything about the repaint being waited
+        for. Taking it any later would miss a whole bracketed repaint the
+        needle poll had already read in.
+
         Fails with the last frame in the message if the needle never appears.
         """
         timeout = self.timeout if timeout is None else timeout
+        since = self.screen.synchronized_updates
         deadline = time.monotonic() + timeout
         rx = re.compile(needle) if regex else None
         while True:
             frame = self.frame()
             found = frame.search(needle) is not None if rx else frame.contains(needle)
             if found:
-                return self._await_paint_end()
+                return self._await_paint_end(quiet=quiet, since=since)
             if time.monotonic() >= deadline:
                 raise AssertionError(
                     frame._message(
@@ -2329,7 +2688,7 @@ class TerminalSession:
 
     def resize(self, rows: int, cols: int, settle: float = None,
                expect: str = None, timeout: float = None,
-               regex: bool = False) -> Frame:
+               regex: bool = False, quiet: float = None) -> Frame:
         """Resize the pty and deliver SIGWINCH, then wait for the redraw.
 
         A signal leaves nothing in the input queue, so there is no delivery
@@ -2348,7 +2707,8 @@ class TerminalSession:
         self.screen.resize(rows, cols)
         self.signal(signal.SIGWINCH)
         if expect is not None:
-            return self.wait_for(expect, timeout=timeout, regex=regex)
+            return self.wait_for(expect, timeout=timeout, regex=regex,
+                                 quiet=quiet)
         self._await_response(self.redraw if settle is None else settle)
         return self.frame()
 
@@ -2431,7 +2791,8 @@ def run_frames(
 
     Every step is synchronised the way `TerminalSession.send()` is. A step given
     as `(keys, expect)` waits for `expect` to appear before its frame is taken,
-    which is the sound form for a transition the program is slow to paint.
+    which is the strongest form available for a transition the program is slow
+    to paint — read `frame.paint_end` for what the wait it ended on is worth.
     """
     frames = []
     with TerminalSession(argv, rows=rows, cols=cols, **kwargs) as term:

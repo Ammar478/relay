@@ -21,6 +21,9 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from frame import (  # noqa: E402
+    PAINT_EXITED,
+    PAINT_QUIET,
+    PAINT_SYNCHRONISED,
     Frame,
     Screen,
     TerminalSession,
@@ -255,6 +258,16 @@ finally:
 #                read and the rest of it after.
 #   title        a repaint under a heading that never changes, so text a caller
 #                names with `expect=` is already on screen before the keystroke.
+#   sync-regions the same region-by-region repaint, bracketed in DEC 2026. The
+#                program says where the repaint begins and ends, so no pause
+#                inside it can be mistaken for the end of it.
+#   chatty       a program that starts a repaint and never stops writing. There
+#                is no quiet window to find, and the screen at the end of the
+#                wait is definitely partial.
+#   sync-stale   a *complete* bracketed repaint flushed while the key is still
+#                queued, and then an unbracketed answer. The bracket closed
+#                before the program read the key, so it says nothing about the
+#                repaint that answers it.
 #
 # The first two synchronise on TIOCOUTQ — the count of this program's output the
 # terminal has not taken yet — rather than on a sleep: "the harness has seen
@@ -302,6 +315,40 @@ try:
         time.sleep(delay)
         sys.stdout.write("\x1b[3;1HBODY two")
         sys.stdout.flush()
+    elif mode == "sync-regions":
+        sys.stdout.write("\x1b[2J\x1b[HREADY")
+        flushed()
+        select.select([fd], [], [], 5)
+        sys.stdout.write("\x1b[?2026h\x1b[2J\x1b[1;1HPANE header")
+        flushed()
+        os.read(fd, 64)
+        time.sleep(delay)
+        sys.stdout.write("\x1b[3;1HBODY middle")
+        flushed()
+        time.sleep(delay)
+        sys.stdout.write("\x1b[5;1HFOOT bottom\x1b[?2026l")
+        sys.stdout.flush()
+    elif mode == "sync-stale":
+        sys.stdout.write("\x1b[2J\x1b[HREADY")
+        flushed()
+        select.select([fd], [], [], 5)
+        sys.stdout.write("\x1b[?2026h\x1b[2J\x1b[1;1HPANE header\x1b[?2026l")
+        flushed()
+        os.read(fd, 64)
+        time.sleep(delay)
+        sys.stdout.write("\x1b[3;1HBODY middle")
+        sys.stdout.flush()
+    elif mode == "chatty":
+        sys.stdout.write("\x1b[2J\x1b[HREADY")
+        flushed()
+        os.read(fd, 64)
+        sys.stdout.write("\x1b[2J\x1b[1;1HPANE header")
+        sys.stdout.flush()
+        stop = time.monotonic() + 5
+        while time.monotonic() < stop:
+            time.sleep(delay)
+            sys.stdout.write("\x1b[9;1Htick")
+            sys.stdout.flush()
     else:
         sys.stdout.write("\x1b[2J\x1b[HREADY")
         flushed()
@@ -418,6 +465,64 @@ def main(stdscr):
     while True:
         if stdscr.getch() in (ord("q"), ord("Q")):
             break
+
+
+curses.wrapper(main)
+sys.exit(0)
+'''
+
+# A program whose SIGWINCH redraw pauses in the middle. A resize has no
+# delivery barrier to lean on — a signal leaves nothing in the input queue —
+# so `expect=` is the only signal there, and this is the shape that makes the
+# quiet window behind it visible.
+DEMO_SLOW_RESIZE = r'''
+import os
+import signal
+import sys
+import termios
+import time
+import tty
+
+delay = float(sys.argv[1])
+fd = sys.stdin.fileno()
+old = termios.tcgetattr(fd)
+tty.setraw(fd)
+
+
+def redraw(signum, unused):
+    # os.write, not sys.stdout: a second SIGWINCH landing inside this handler
+    # is a reentrant call on the BufferedWriter, which raises.
+    os.write(1, b"\x1b[2J\x1b[1;1HSIZE pane")
+    time.sleep(delay)
+    os.write(1, b"\x1b[3;1HBODY resized")
+
+
+signal.signal(signal.SIGWINCH, redraw)
+try:
+    os.write(1, b"\x1b[2J\x1b[HREADY")
+    while not os.read(fd, 1):
+        pass
+finally:
+    termios.tcsetattr(fd, termios.TCSADRAIN, old)
+'''
+
+# A curses program that draws a screen and then dies on it. `curses.wrapper`
+# runs endwin() on the way out, which sends `?1049l` and puts the primary
+# screen back — so the frame after the crash is the traceback on an otherwise
+# empty screen, and what the program had drawn is gone from it.
+DEMO_CRASH = r'''
+import curses
+import sys
+
+
+def main(stdscr):
+    curses.curs_set(0)
+    stdscr.keypad(True)
+    stdscr.addstr(0, 0, "PANE the app drew")
+    stdscr.addstr(1, 0, "STATUS running")
+    stdscr.refresh()
+    stdscr.getch()
+    raise RuntimeError("the app fell over")
 
 
 curses.wrapper(main)
@@ -683,6 +788,104 @@ def test_a_saved_screen_wider_than_the_new_size_is_clipped_not_lost():
     assert len(screen.lines()) == 3
 
 
+def test_a_zero_padded_parameter_addresses_the_cell_it_names():
+    """Leading zeros carry no value; counting them addressed the wrong cell.
+
+    The parameter cap is a guard against CPython refusing `int()` on a very
+    long digit run, and it counted *characters*. A padded parameter longer
+    than the cap therefore arrived as the maximum and clamped to the far edge
+    of the screen: `ESC[00000002;00000003H` put its text in the last cell
+    instead of row 2, column 3.
+    """
+    assert feed("\x1b[01;01HA").lines()[0][0] == "A"
+    assert feed("\x1b[003;005HB").lines()[2][4] == "B"
+    padded = feed("\x1b[00000002;00000003HC")
+    assert padded.lines()[1][2] == "C"
+    assert padded.lines()[-1].strip() == ""
+    # zero itself still means "the default", not "the last row"
+    assert feed("\x1b[0;0HD").lines()[0][0] == "D"
+
+
+def test_a_zero_count_means_one_and_a_zero_mode_means_zero():
+    """`CSI 0 A` is one row, not none — but `CSI 0 J` is still mode 0.
+
+    A count read literally as zero made every one of these a no-op, and a
+    no-op is the shape of a defect that never shows up in a frame: the screen
+    simply stays as it was.
+    """
+    assert feed("\x1b[3;3HX\x1b[0AY").lines()[1][3] == "Y"      # CUU 0 -> 1
+    assert feed("\x1b[1;3HX\x1b[0BY").lines()[1][3] == "Y"      # CUD 0 -> 1
+    assert feed("abcdef\x1b[1;2H\x1b[0P").lines()[0].rstrip() == "acdef"
+    assert feed("abcdef\x1b[1;2H\x1b[0X").lines()[0].rstrip() == "a cdef"
+    assert feed("ab\x1b[0b").lines()[0].rstrip() == "abb"        # REP 0 -> 1
+    # ...while a parameter that names a mode keeps meaning mode zero
+    assert feed("abc\x1b[1;2H\x1b[0J").lines()[0].rstrip() == "a"
+    assert feed("abc\x1b[1;2H\x1b[0K").lines()[0].rstrip() == "a"
+    assert feed("\x1b[31m\x1b[0mP").frame().attrs_at(0, 0).fg is None
+
+
+def test_ed_3_clears_the_scrollback_and_leaves_the_screen_alone():
+    """`ESC[3J` erases scrollback. This screen has none, so it erases nothing.
+
+    Treating it as ED 2 blanked the visible screen: a program that clears its
+    scrollback on start-up — which many do, right after drawing — lost the
+    screen it had just painted, and the frame handed to a judge was empty.
+    """
+    screen = feed("hello\x1b[3J")
+    assert screen.lines()[0].rstrip() == "hello"
+    # and an erase parameter that is not an erase at all does nothing either
+    assert feed("hello\x1b[9J").lines()[0].rstrip() == "hello"
+    # ED 2 still clears, so this is not "J does nothing"
+    assert feed("hello\x1b[2J").lines()[0].rstrip() == ""
+
+
+def test_an_escape_with_an_intermediate_byte_leaves_no_glyph():
+    """An unmodelled escape must be swallowed whole, not half.
+
+    Dropping the intermediate and returning to ground printed the sequence's
+    *final* byte as text: `ESC # 8` left an "8", `ESC SP F` an "F". A frame
+    then carried a character no program ever asked to be drawn.
+    """
+    assert feed("\x1b#8AB").lines()[0].rstrip() == "AB"       # DECALN
+    assert feed("\x1b F" + "XY").lines()[0].rstrip() == "XY"  # S7C1T
+    assert feed("\x1b%GZZ").lines()[0].rstrip() == "ZZ"       # select UTF-8
+    assert feed("\x1b#!8TOP").lines()[0].rstrip() == "TOP"   # two intermediates
+    assert feed("\x1b#3TOP").lines()[0].rstrip() == "TOP"    # DECDHL
+    # the charset designators are intermediates too, and still designate
+    assert feed("\x1b(0lqk\x1b(BX").lines()[0].rstrip() == "┌─┐X"
+
+
+def test_synchronized_output_brackets_are_tracked():
+    """DEC 2026 is the one thing a program can say about its own painting."""
+    screen = Screen(5, 20)
+    assert screen.synchronized_update is False
+    assert screen.synchronized_updates == 0
+    screen.feed("\x1b[?2026hHALF")
+    assert screen.synchronized_update is True
+    assert screen.synchronized_updates == 0
+    screen.feed(" DONE\x1b[?2026l")
+    assert screen.synchronized_update is False
+    assert screen.synchronized_updates == 1
+    assert screen.lines()[0].rstrip() == "HALF DONE"
+    # a close with nothing open is not an update, and neither is a re-open
+    screen.feed("\x1b[?2026l\x1b[?2026h\x1b[?2026h")
+    assert screen.synchronized_updates == 1
+    screen.feed("\x1b[?2026l")
+    assert screen.synchronized_updates == 2
+
+
+def test_the_alternate_screen_is_kept_when_the_program_gives_it_back():
+    """What a TUI drew before it died is evidence; `?1049l` throws it away."""
+    screen = feed("shell text\x1b[?1049h\x1b[2J\x1b[1;1Happ text")
+    assert screen.last_alt_frame() is None      # nothing given back yet
+    screen.feed("\x1b[?1049l")
+    assert screen.lines()[0].rstrip() == "shell text"
+    kept = screen.last_alt_frame()
+    assert kept is not None
+    assert kept.lines[0] == "app text"
+    assert kept.rows == 5 and kept.cols == 20
+
+
 def test_osc_title_is_consumed():
     screen = feed("\x1b]0;a window title\x07VISIBLE")
     assert screen.lines()[0].rstrip() == "VISIBLE"
@@ -895,6 +1098,42 @@ def test_a_widening_resize_does_not_inflate_the_width():
     # 50 cells of content: not 90, which is what recomputing from the new width
     # invents
     assert screen.frame().overlong_lines() == [(0, 50)]
+
+
+def test_a_wrap_that_fits_the_new_width_is_not_a_violation():
+    """A row that wrapped at 10 cells is not too wide for a 40-column screen.
+
+    The record is kept — it says the row continued at 10 — but the reader has
+    to measure it against the screen it is being asked about. Reporting it
+    unconditionally made `assert_within_width()` fail on a frame where every
+    row fits, which is the mirror image of the defect it was written for.
+    """
+    screen = Screen(4, 10)
+    screen.feed("A" * 15)
+    assert screen.frame().overlong_lines() == [(0, 15)]
+    screen.resize(4, 40)
+    assert screen.frame().overlong_lines() == []
+    screen.frame().assert_within_width()
+    # narrowing back is still a violation: 15 cells do not fit in 10
+    screen.resize(4, 10)
+    assert screen.frame().overlong_lines() == [(0, 15)]
+
+
+def test_a_widened_row_is_not_joined_through_its_padding():
+    """A continued row is cut at the width it continued at, not the new one.
+
+    The grid is not reflowed by a resize, so a row that wrapped at 10 now
+    holds 10 characters and 30 fresh blanks. Pasting the padded row in spliced
+    a run of spaces into the middle of a line the program wrote without one.
+    """
+    screen = Screen(4, 10)
+    screen.feed("SPLIT-WORD")     # exactly 10, no wrap yet
+    screen.feed("S")              # the eleventh cell wraps the row
+    screen.resize(4, 40)
+    frame = screen.frame()
+    assert frame.logical_lines()[0] == (0, "SPLIT-WORDS")
+    assert frame.contains("SPLIT-WORDS")
+    assert not frame.contains("SPLIT-WORD ")
 
 
 def test_a_row_rewritten_after_it_wrapped_is_no_longer_continued():
@@ -1341,8 +1580,9 @@ def test_send_waits_for_a_repaint_that_starts_late(slow):
 
 
 def test_send_takes_the_text_to_wait_for(slow):
-    """`expect=` is the sound form: a positive signal with no time limit but its
-    own, and a loud failure instead of a stale frame."""
+    """`expect=` is the strongest form: a positive signal with no time limit but
+    its own, and a loud failure instead of a stale frame. What it is *not* is a
+    guarantee the screen was finished — see the paint-end tests below."""
     with session(slow, "late-paint", "0.9", rows=10, cols=60) as term:
         term.wait_for("READY")
         frame = term.send("x", expect="AFTER-KEY")
@@ -1447,6 +1687,216 @@ def test_expect_does_not_return_the_pre_keystroke_screen(noisy):
             "expect= returned the pre-keystroke screen:\n%s" % frame.text
         )
         assert not frame.contains("BODY one")
+
+
+# --------------------------------------------------------------------------
+# When is a repaint over?
+#
+# `expect=` used to be documented as "the sound form" on the strength of a
+# quiet window: wait until the program has not written for `paint` seconds and
+# call the screen finished. A program that pauses longer than that inside one
+# repaint is quiet and half-painted at the same instant, and the frame then
+# shows neither the screen it had nor the screen it is drawing — every
+# *negative* assertion passes on it for the wrong reason.
+#
+# No observation a terminal can make separates a pause from an ending. So the
+# tests below pin three things instead: the two endings that *are* proof, the
+# one that is a guess and is labelled as one, and where the guess's boundary
+# is — the boundary, not the constant, so that moving `paint` moves it.
+# --------------------------------------------------------------------------
+
+
+def test_a_pause_longer_than_the_quiet_window_is_not_claimed_as_the_end(noisy):
+    """The judge's reproduction, at the defaults, with nothing hidden.
+
+    Clear the screen, draw the surviving title, paint the body half a second
+    later: the frame `expect=` hands back has neither the old body nor the new
+    one. The screen really was like that — a terminal draws what it is sent —
+    so what has to be true is that the harness does not *claim* the program
+    had finished it.
+    """
+    with session(noisy, "regions", "0.5", rows=10, cols=60) as term:
+        term.wait_for("READY")
+        frame = term.send("x", expect="PANE header")
+        assert frame.contains("PANE header")
+        assert not frame.contains("BODY middle")        # torn, and admitted
+        assert frame.paint_end == PAINT_QUIET
+        assert frame.paint_finished is False
+        with pytest.raises(AssertionError) as excinfo:
+            frame.assert_finished()
+        message = str(excinfo.value)
+        assert "not proof" in message
+        assert "PANE header" in message                 # the screen came too
+        # and the provenance travels with every other failure it reports
+        with pytest.raises(AssertionError) as other:
+            frame.assert_contains("BODY middle")
+        assert "captured on quiet" in str(other.value)
+
+
+def test_the_quiet_window_is_a_boundary_and_it_moves(noisy):
+    """One child, two windows: the pause is short or long *relative to* it.
+
+    Pinning the boundary rather than the constant is the point. The same
+    program, pausing the same 0.3s inside its repaint, is torn under a 0.1s
+    window and whole under a 0.6s one — so a caller whose TUI pauses knows
+    which knob to turn, and a later change to the default cannot make this
+    test pass for a new reason.
+    """
+    with session(noisy, "regions", "0.3", rows=10, cols=60,
+                 paint=0.1, redraw=3.0) as term:
+        term.wait_for("READY")
+        torn = term.send("x", expect="PANE header")
+    assert not torn.contains("BODY middle")
+
+    with session(noisy, "regions", "0.3", rows=10, cols=60,
+                 paint=0.1, redraw=3.0) as term:
+        term.wait_for("READY")
+        whole = term.send("x", expect="PANE header", quiet=0.6)
+    assert whole.contains("BODY middle"), whole.text
+    assert whole.contains("FOOT bottom"), whole.text
+    assert whole.paint_end == PAINT_QUIET       # still a guess, just a wider one
+    assert whole.paint_finished is False
+
+
+def test_a_bracketed_repaint_is_waited_out_however_long_it_pauses(noisy):
+    """DEC 2026 turns the guess into a statement, and the wait obeys it.
+
+    The same region-by-region repaint, pausing 0.3s twice, under a 0.05s quiet
+    window that would end the wait five times over. The program said where the
+    repaint ends, so that — not the silence — is where it ends.
+    """
+    with session(noisy, "sync-regions", "0.3", rows=10, cols=60,
+                 paint=0.05, redraw=3.0) as term:
+        term.wait_for("READY")
+        frame = term.send("x", expect="PANE header")
+    assert frame.contains("BODY middle"), frame.text
+    assert frame.contains("FOOT bottom"), frame.text
+    assert frame.paint_end == PAINT_SYNCHRONISED
+    assert frame.paint_finished is True
+    frame.assert_finished()
+
+
+def test_a_bracket_closed_before_the_key_was_read_does_not_end_the_wait(noisy):
+    """Proof of what, exactly? A 2026 bracket is proof about *one* repaint.
+
+    This program closes a whole bracketed repaint while the key is still in
+    the input queue — so, by the same argument the delivery barrier rests on,
+    that repaint cannot be the answer to the key. Crediting it would end the
+    wait before the program had drawn anything and stamp the frame with the
+    strongest label the harness has.
+    """
+    with session(noisy, "sync-stale", "0.3", rows=10, cols=60,
+                 redraw=3.0) as term:
+        term.wait_for("READY")
+        frame = term.send("x", expect="PANE header", quiet=0.5)
+    assert frame.paint_end == PAINT_QUIET, (
+        "a bracket that closed before the key was read was taken for the "
+        "answer to it"
+    )
+    assert frame.contains("BODY middle"), frame.text
+
+
+def test_a_resize_carries_the_same_boundary_and_the_same_knob(program):
+    """A signal leaves nothing in the input queue, so `expect=` is all there is.
+
+    Which makes the quiet window behind `expect=` load-bearing here in a way it
+    is not for a keystroke, and the knob has to reach it.
+    """
+    path = program("slowresize", DEMO_SLOW_RESIZE)
+    with session(path, "0.3", rows=10, cols=60, paint=0.1, redraw=3.0) as term:
+        term.wait_for("READY")
+        torn = term.resize(12, 70, expect="SIZE pane")
+        assert not torn.contains("BODY resized")
+        assert torn.paint_end == PAINT_QUIET
+        term.read(settle=0.6)          # let that repaint finish before the next
+        whole = term.resize(14, 72, expect="SIZE pane", quiet=0.6)
+        assert whole.contains("BODY resized"), whole.text
+
+
+def test_expect_refuses_a_screen_the_program_had_not_stopped_writing(noisy):
+    """The one case a terminal is certain about is a failure, not a frame.
+
+    A program still writing when the window runs out has definitely handed
+    over part of a repaint. Returning it as the finished screen was the same
+    false pass by another route.
+    """
+    with session(noisy, "chatty", "0.05", rows=10, cols=60,
+                 redraw=0.6) as term:
+        term.wait_for("READY")
+        with pytest.raises(AssertionError) as excinfo:
+            term.send("x", expect="PANE header")
+        message = str(excinfo.value)
+        assert "still writing" in message
+        assert "PANE header" in message              # with the screen it got
+        assert "redraw=" in message                  # and what to do about it
+
+
+def test_a_program_that_has_exited_proves_the_screen_it_left(program):
+    """Nothing more can arrive, so the screen is whatever it left behind."""
+    path = program("refuses", DEMO_REFUSES)
+    with session(path, rows=10, cols=80) as term:
+        frame = term.wait_for("relay-control")
+        assert frame.paint_end == PAINT_EXITED
+        assert frame.paint_finished is True
+        frame.assert_finished()
+
+
+def test_a_frame_nobody_waited_on_makes_no_claim(menu):
+    """A frame taken without waiting for the end of a repaint says so."""
+    with session(menu, rows=24, cols=80) as term:
+        term.wait_for("alpha")
+        assert term.frame().paint_end is None
+        moved = term.send("<Down>")               # no expect=, no claim
+        assert moved.paint_end is None
+        assert moved.paint_finished is False
+        with pytest.raises(AssertionError) as excinfo:
+            moved.assert_finished()
+        assert "not captured by waiting" in str(excinfo.value)
+
+
+def test_a_crashed_program_leaves_the_screen_it_drew(program):
+    """`?1049l` on the way out is not allowed to be the end of the evidence.
+
+    curses.wrapper runs endwin() before it re-raises, which restores the
+    primary screen. The traceback is on the frame; the screen the program was
+    showing when it fell over is not, and that is the half a judge needs.
+    """
+    path = program("crash", DEMO_CRASH)
+    with session(path, rows=10, cols=60) as term:
+        term.wait_for("PANE the app drew")
+        term.send_bytes(b"x")
+        assert term.wait(timeout=5) == 1
+        after = term.frame()
+        assert after.contains("the app fell over")   # the traceback is there
+        assert not after.contains("PANE the app drew")
+        drew = term.last_alt_frame()
+        assert drew is not None
+        assert drew.contains("PANE the app drew")
+        assert drew.contains("STATUS running")
+        assert drew.rows == 10 and drew.cols == 60
+
+
+def test_a_write_that_fails_comes_with_the_screen(slow):
+    """A failure without the screen is nearly unusable in a judge's report.
+
+    Every other failure path here attaches the frame; the write did not, and a
+    bare OSError says nothing about what the program was showing.
+    """
+    with session(slow, "late-read", "0.1", rows=10, cols=60) as term:
+        frame = term.wait_for("READY")
+        assert frame.contains("READY")
+        real = term.master_fd
+        unwritable = os.open(os.devnull, os.O_RDONLY)
+        term.master_fd = unwritable
+        try:
+            with pytest.raises(AssertionError) as excinfo:
+                term.send("x")
+        finally:
+            term.master_fd = real
+            os.close(unwritable)
+        message = str(excinfo.value)
+        assert "could not write" in message
+        assert "READY" in message
 
 
 def test_synchronising_does_not_slow_a_program_that_answers_at_once(menu):
