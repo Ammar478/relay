@@ -1064,19 +1064,22 @@ LOG_MAX_COMMITS = 200
 LOG_MAX_ENTRIES = 300
 GIT_TIMEOUT = 3.0
 
-# The names a repository's default branch goes by, as full refs so nothing has
-# to be resolved from a shorthand that could mean two things. A commit
-# reachable from one of these was in the project before the relay's branch
-# existed, so a walk that excludes them looks back no further than the branch
-# point. That is ALL the branch point is now (ACC-DATA-009, simplified
-# 2026-08-26): a bound on the walk, never a decision about what belongs.
-GIT_DEFAULT_REFS = (
-    "refs/heads/main",
-    "refs/heads/master",
-    "refs/remotes/origin/HEAD",
-    "refs/remotes/origin/main",
-    "refs/remotes/origin/master",
-)
+# THERE IS NO BRANCH POINT IN THIS MODULE, IN ANY ROLE (ACC-DATA-009, corrected
+# 2026-08-26). A tuple of default-branch ref names used to live here, and
+# `_relay_commits` narrowed its walk with `git log HEAD --not <those refs>`.
+# That was the sixth instance of deciding by topology, and the contract's own
+# wording had permitted it: it asked for "a performance bound on how far back
+# to look, never a decision about what belongs", and `--not <ref>` cannot be
+# that. `--not` excludes commits REACHABLE FROM another ref, so after a trunk
+# is merged into the run's branch an unclaimed commit above the record floor
+# and reachable from HEAD was dropped from the log solely because `main` also
+# reached it.
+#
+# The walk is bounded by DEPTH and by the record floor, and by nothing else:
+# `--max-count` says how far back to look and `_floored` says what is inside
+# the window. Both are properties of this run; neither can be changed by where
+# some other ref happens to point. The cost is one walk that is sometimes
+# longer than it needs to be, which is the trade the contract asks for.
 
 # Deterministic tie-break when two events share a timestamp. A check transition
 # is pinned to the landing it was claimed at, so it reads just above it; the
@@ -1113,120 +1116,150 @@ def _log_entry(t, exact, kind, level, message, now,
     }
 
 
-def _in_a_repo(path, project):
-    """True when `path`, or a parent of it no higher than `project`, holds a `.git`.
+def _repo_dir(relay_dir):
+    """The work tree the relay's repository is READ from, or None.
 
-    Checked before spawning git at all: most relay directories a view opens are
-    inside a repo, but a fixture or a copied relay is not, and a process spawn
-    per repaint for a guaranteed failure is not free.
+    ASK GIT (ACC-DATA-009, amended 2026-08-26). This used to walk parents for
+    a `.git` and stop at the relay directory's immediate parent, which encoded
+    a guess - that a relay sits beside its repository root. `<repo>/services/
+    <svc>/.relay` is an ordinary monorepo shape and the guess is simply wrong
+    there: a relay one directory down found no `.git` within its bound and was
+    read as owning no repository, so every leg-claimed commit left the log
+    while the runner rows went on naming them. Git answers this correctly from
+    any subdirectory of a work tree, so the answer is git's and no longer a
+    walk's.
 
-    RULE: the search stops at `project` - the same `relay.path` the model
-    reports, so what the dashboard calls the project and where commits are read
-    from cannot drift apart. A live relay is `<project>/.relay` with its `.git`
-    at `<project>`, so it still finds its own repository; a relay that merely
-    happens to sit inside some other repository (every fixture under
-    `tests/fixtures/`) finds nothing, instead of reporting that repository's
-    commits as its own.
+    WHAT REMAINS A BOUND is the relay's own SHAPE, which is not repository
+    topology and is the same split `_project_dir` derives the project label
+    from:
 
-    RULE: `project` may only NARROW the walk, never widen it. It comes from
-    `dashboard.json.path`, which is a string a coach wrote into a JSON file and
-    is untrusted like every other field the model reads. The two shapes a relay
-    actually has are `<project>/.relay` (the live shape, `.git` at the parent)
-    and a relay directory that is its own project (every fixture under
-    `tests/fixtures/`), so the walk is allowed to reach the relay directory and
-    its immediate parent and nowhere else. Anything else a coach writes -
-    `"/"`, the host repository's root, a grandparent - clamps back to the relay
-    directory, which is the only honest bound left. Without this clamp the
-    filesystem bound this function exists to hold is defeated by editing a JSON
-    file, and a relay reporting no commits starts reporting the host
-    repository's.
+    * a relay directory called `.relay` sits INSIDE its project, so the project
+      is whatever work tree contains it, at any depth. This is the live shape.
+    * a relay directory called anything else IS its project - every fixture
+      under `tests/fixtures/`, and any copied relay. Its repository is the one
+      ROOTED AT IT, and a repository it merely happens to sit inside is not
+      its: without this, every fixture in this repository would report this
+      repository's commits as its own.
+
+    THE SHAPE IS ONE LIST (`_repo_roots`) and it is consulted twice, for two
+    different jobs. It skips the process spawn where no candidate holds a
+    `.git` at all - most relay directories a view opens are inside a
+    repository, but a fixture or a copied relay is not, and a spawn per repaint
+    for a guaranteed failure is not free. Then it checks GIT'S ANSWER, which is
+    the bound itself: a `.git` that git does not accept - an empty directory, a
+    copy that lost its objects - makes git report the HOST work tree instead,
+    and a fixture would inherit the host repository's commits on the strength
+    of a directory that is not a repository at all. The precondition says
+    whether to ask; only the answer decides.
+
+    Never raises: `relay_dir` may be unreadable, git may be absent, and each of
+    those means the same thing here.
     """
     try:
-        current = pathlib.Path(path).resolve()
+        resolved = pathlib.Path(relay_dir).resolve()
+    except OSError:
+        return None
+    roots = _repo_roots(resolved)
+    if not any(_has_git(root) for root in roots):
+        return None
+    out = _git(resolved, "rev-parse", "--show-toplevel")
+    # GIT'S ANSWER, compared as it arrives. `--show-toplevel` prints the work
+    # tree's REAL path - absolute and symlink-resolved even where
+    # `core.worktree` names a symlink - and the question was asked from a
+    # resolved directory, so there is nothing left here to resolve.
+    #
+    # Where git could not answer at all - no work tree, a `.git` it will not
+    # accept, no git installed - the text is empty and `pathlib.Path("")` is
+    # `pathlib.Path(".")`: relative, and every candidate root is absolute, so
+    # no answer matches nothing. That is deliberate and is why it is not
+    # resolved: `Path("").resolve()` is the PROCESS'S working directory, and a
+    # dashboard is opened from wherever a supervisor's shell happens to be,
+    # which is very often inside some other project's repository.
+    top = pathlib.Path((out or "").strip())
+    return top if top in roots else None
+
+
+def _repo_roots(resolved):
+    """The directories this relay's repository may be rooted at, nearest first.
+
+    THE ONE BOUND LEFT, written once. It is a property of the relay's SHAPE and
+    says nothing about any repository:
+
+    * a relay directory called `.relay` sits INSIDE its project, so its
+      repository may be rooted at any ancestor - `<repo>/.relay` and
+      `<repo>/services/<svc>/.relay` are the same shape at two depths, and the
+      guess that it was always the immediate parent is what lost a monorepo
+      relay its whole history.
+    * a relay directory called anything else IS its project, so its repository
+      is the one rooted at it and nothing above it.
+
+    `resolved.parents` runs to the filesystem root deliberately: depth is not
+    bounded, because a monorepo's is not.
+    """
+    if resolved.name == ".relay":
+        return [resolved, *resolved.parents]
+    return [resolved]
+
+
+def _has_git(path):
+    """Whether `path` holds a `.git`. A refusal is not an answer, and not fatal.
+
+    `pathlib`'s `exists()` swallows the errors that mean "nothing is there" -
+    ENOENT, ENOTDIR, ELOOP, EBADF - and lets EACCES through, because "I may not
+    look" is not "there is nothing here". A relay directory with no search bit
+    is still a directory, so `build()` is well past its RelayNotFound guard by
+    the time this runs; an exception escaping here is an uncaught traceback
+    inside a 2 s repaint loop, which ACC-DATA-001 forbids as plainly as any
+    other. Answering False lets the caller go on to the next candidate: the
+    directory that could not answer is the one whose parent may hold the
+    repository, and giving up at the first refusal would cost a chmod'd live
+    relay its own history.
+    """
+    try:
+        return (path / ".git").exists()
     except OSError:
         return False
-    try:
-        limit = pathlib.Path(project).resolve()
-    except (OSError, TypeError, ValueError):
-        limit = current
-    if limit != current and limit != current.parent:
-        limit = current
-    for candidate in [current, *current.parents]:
-        # RULE: a candidate that cannot answer is skipped, not fatal, and not
-        # an answer. `pathlib`'s `exists()` swallows the errors that mean
-        # "nothing is there" - ENOENT, ENOTDIR, ELOOP, EBADF - and lets EACCES
-        # through, because "I may not look" is not "there is nothing here". A
-        # relay directory with no search bit is still a directory, so `build()`
-        # is well past its RelayNotFound guard and `_load` has already degraded
-        # to permission warnings by the time this runs; an exception escaping
-        # here is an uncaught traceback inside a 2 s repaint loop, which
-        # ACC-DATA-001 forbids as plainly as any other.
-        #
-        # The walk CONTINUES rather than stopping, because the live relay shape
-        # is `<project>/.relay` with the `.git` at `<project>`: the directory
-        # that could not answer is the one whose parent holds the repository,
-        # and giving up at the first refusal would cost a chmod'd live relay
-        # its own history. The bound is unchanged - `limit` still ends it.
-        try:
-            found = (candidate / ".git").exists()
-        except OSError:
-            found = False
-        if found:
-            return True
-        if candidate == limit:
-            break
-    return False
 
 
-def _project_dir(written, relay_dir, warnings):
-    """The directory the relay's repository is READ from.
+def _project_dir(written, relay_dir, warnings, repo):
+    """The relay's project as a LABEL, plus a warning for a `path` it is not.
 
     `written` is `dashboard.json.path` as the coach typed it, or None. That
     string is quoted back verbatim as `relay.path` - a supervisor's label for
-    their own project is theirs - but a read needs a directory, and the two are
-    not the same thing.
+    their own project is theirs - and this function answers the label to fall
+    back to when there is none. It no longer decides where a commit is READ
+    from: `_repo_dir` asks git that, and git is right at every depth
+    (ACC-DATA-009, amended 2026-08-26). A correct `path` used to fail to rescue
+    a relay below the repository root, and was warned about into the bargain;
+    an untrusted string cannot redirect a read it no longer bounds.
 
-    RULE: `~` is expanded. A coach writes a shell path by hand and nothing else
-    in this module expands one, so `~/dev/thing` names a directory called `~`
-    under the process's working directory. `_in_a_repo` then clamps back to the
-    relay directory, finds no `.git`, and the relay is read as one that owns no
-    repository: not a commit in the log, not a baton's claim settled, and not
-    one word about any of it. This repository's own `dashboard.json` was in
-    exactly that state and the log looked merely quiet.
+    RULE: a value that names no directory is a coach's typo, and it is handled
+    the way every other malformed field here is (`_text_or_warn`) - warned
+    about and ignored. `~` is expanded first, because a coach writes a shell
+    path by hand and nothing else in this module expands one; this repository's
+    own `dashboard.json` said `~/Documents/...` and was read as a directory
+    called `~` under the process's working directory.
 
-    RULE: a value that still names no directory is a coach's typo, and it is
-    handled the way every other malformed field here is (`_text_or_warn`) -
-    warned about and ignored, so the read falls back to the relay's own
-    project. Ignoring it cannot widen anything: the fallback is the derived
-    project, which is the widest bound `_in_a_repo` allows a written path
-    anyway. `path` may only NARROW that walk, and expanding a `~` is a reading
-    of what the coach wrote rather than a licence to leave the relay's own
-    tree - a `~` that resolves to the host repository is clamped like any other
-    ancestor.
+    RULE: a value that names a directory that is not this relay's project is
+    warned about on the same terms (ACC-DATA-009). Silence is not an acceptable
+    answer to "I could not use what you wrote" - a clone of a relay's own
+    repository inherits its coach's `path`, naming the source project, and
+    `relay.path` reports it all the while as though it were in use.
 
-    RULE: a value that names a directory the read may not USE is warned about
-    on the same terms (ACC-DATA-009). `_in_a_repo` reaches the relay directory
-    and its immediate parent and nowhere else, so an ancestor, a `~`, or a
-    different real repository that happens to hold every claimed commit each
-    clamped back to the relay directory - which found no `.git`, and the relay
-    was read as one that owns no repository: no commit in the log, no baton's
-    claim settled, and `relay.path` reporting the value all the while as though
-    it were in use. Silence is not an acceptable answer to "I could not use
-    what you wrote". A clone of a relay's own repository inherits its coach's
-    `path` and is exactly this case, which is why it is warned about rather
-    than merely clamped.
-
-    The two shapes a relay actually has decide what is usable, and they are the
-    two `_in_a_repo` allows: the relay directory itself (a fixture relay, which
-    is its own project) and its immediate parent (the live `<project>/.relay`).
+    WHAT COUNTS AS THE PROJECT is every directory from the repository root down
+    to the relay's own container: `<repo>` and `<repo>/services/<svc>` are both
+    honest labels for a relay at `<repo>/services/<svc>/.relay`, and an
+    ancestor of the root, a different repository, a `~` that expands to
+    neither, and the relay directory itself are none of them. Where git reports
+    no repository the container is all there is.
 
     Never raises: `written` is untrusted, and every shape of it that cannot be
-    read from is the same answer here.
+    read is the same answer here.
     """
     resolved = relay_dir.resolve()
-    derived = str(resolved.parent if resolved.name == ".relay" else resolved)
+    container = resolved.parent if resolved.name == ".relay" else resolved
     if written is None:
-        return derived
+        return str(container)
     try:
         expanded = os.path.expanduser(written)
         usable = os.path.isdir(expanded)
@@ -1236,17 +1269,30 @@ def _project_dir(written, relay_dir, warnings):
         warnings.append(f"dashboard.json: `path` {written!r} is not a directory; "
                         "commits are being read from the relay's own project "
                         "instead")
-        return derived
+        return str(container)
     try:
         target = pathlib.Path(expanded).resolve()
     except (OSError, ValueError):
         target = None
-    if target not in (resolved, resolved.parent):
+    if target not in _project_labels(container, repo):
         warnings.append(f"dashboard.json: `path` {written!r} does not name this "
                         "relay's own project; commits are being read from "
-                        f"{derived!r} instead")
-        return derived
-    return expanded
+                        f"{str(container)!r} instead")
+    return str(container)
+
+
+def _project_labels(container, repo):
+    """Every directory that honestly names the relay's project.
+
+    The relay's own container and everything between it and the repository root
+    git reported, inclusive. At depth 0 that is one directory; in a monorepo it
+    is the service directory, the repository root, and each step between.
+    """
+    labels = [container]
+    if repo is not None and repo != container:
+        labels.extend(p for p in container.parents
+                      if p == repo or repo in p.parents)
+    return labels
 
 
 def _git(relay_dir, *args, stdin=None):
@@ -1262,8 +1308,10 @@ def _git(relay_dir, *args, stdin=None):
     `GIT_WORK_TREE`, `GIT_COMMON_DIR`, `GIT_OBJECT_DIRECTORY` and the
     `GIT_CONFIG_*` overrides each redirect a read in their own way - so a
     dashboard opened from a shell that exports one would report a foreign
-    repository's commits as this relay's. That is the defect `_in_a_repo`
-    bounds away on the filesystem, walked back in through the environment.
+    repository's commits as this relay's. That is the defect `_repo_dir`
+    bounds away by asking git, walked back in through the environment - and
+    `_repo_dir` asks git through this function, so the scrub bounds its own
+    answer too.
     Every `GIT_*` name goes, rather than the handful that redirect today.
     """
     # A list argv, never a shell: `relay_dir` is a path from the caller and is
@@ -1278,8 +1326,10 @@ def _git(relay_dir, *args, stdin=None):
     return out.stdout if out.returncode == 0 else None
 
 
-def _resolve_shas(relay_dir, project, shas):
+def _resolve_shas(repo, shas):
     """Which of `shas` name a commit in the relay's own repository.
+
+    `repo` is the work tree git reported for the relay (`_repo_dir`), or None.
 
     Returns None when the question cannot be asked at all - the relay is not
     in a repository of its own, or git could not answer - so a caller can tell
@@ -1293,9 +1343,9 @@ def _resolve_shas(relay_dir, project, shas):
     unresolved, which is the honest reading of it.
     """
     order = sorted(shas)
-    if not order or not _in_a_repo(relay_dir, project):
+    if not order or repo is None:
         return None
-    out = _git(relay_dir, "cat-file", "--batch-check=%(objectname) %(objecttype)",
+    out = _git(repo, "cat-file", "--batch-check=%(objectname) %(objecttype)",
                stdin="\n".join(order) + "\n")
     if out is None:
         return None
@@ -1306,7 +1356,7 @@ def _resolve_shas(relay_dir, project, shas):
             if line.rsplit(" ", 1)[-1:] == ["commit"]}
 
 
-def _settle_commits(relay_dir, project, batons):
+def _settle_commits(repo, batons):
     """Settle every baton's claimed commit against the relay's own repository.
 
     A leg is credited with a commit only when its baton claims the sha as its
@@ -1316,7 +1366,7 @@ def _settle_commits(relay_dir, project, batons):
     shas are not objects here.
     """
     resolved = _resolve_shas(
-        relay_dir, project, {sha for b in batons.values() for sha in b["claims"]})
+        repo, {sha for b in batons.values() for sha in b["claims"]})
     if resolved is None:
         return
     for baton in batons.values():
@@ -1354,23 +1404,21 @@ def _parse_commits(out):
     return commits
 
 
-def _git_log(relay_dir, exclude=()):
+def _git_log(repo):
     """[(epoch, short sha, subject)] for HEAD, newest first.
 
-    `exclude` is refs the walk need not look past: git stops at every commit
-    reachable from one of them, so a walk excluding the default branch comes
-    back with what this branch adds on top of its branch point. That is a bound
-    on the WALK and never a decision about what belongs (ACC-DATA-009, as
-    simplified 2026-08-26) - see `_relay_commits`, which throws a narrowed walk
-    away when it does not reach the window the caller has to fill.
+    ONE BOUND, AND IT IS A DEPTH (ACC-DATA-009, corrected 2026-08-26):
+    `--max-count` says how far back to look. There is deliberately no `--not`,
+    no `^ref` and no `a..b` here. Each of those excludes what another ref can
+    REACH, which is a decision about what belongs wearing a bound's clothes,
+    and it is how the sixth topology defect got in - see `_relay_commits`.
     """
     return _parse_commits(_git(
-        relay_dir, "log", "--no-color", f"--max-count={LOG_MAX_COMMITS}",
-        "--format=%ct%x1f%h%x1f%s", "HEAD",
-        *(("--not", *exclude) if exclude else ())))
+        repo, "log", "--no-color", f"--max-count={LOG_MAX_COMMITS}",
+        "--format=%ct%x1f%h%x1f%s", "HEAD"))
 
 
-def _claimed_commits(relay_dir, shas):
+def _claimed_commits(repo, shas):
     """The commits `shas` names, whatever the walk did or did not reach.
 
     THE RULE ACC-DATA-009 WAS SIMPLIFIED TO (2026-08-26): a commit a baton
@@ -1396,25 +1444,8 @@ def _claimed_commits(relay_dir, shas):
     if not shas:
         return []
     return _parse_commits(_git(
-        relay_dir, "log", "--no-color", "--no-walk",
+        repo, "log", "--no-color", "--no-walk",
         "--format=%ct%x1f%h%x1f%s", *shas, "--"))
-
-
-def _default_branch_refs(relay_dir):
-    """The default-branch refs this repository actually has, in full form.
-
-    ALL THAT IS LEFT OF THE BRANCH POINT (ACC-DATA-009, simplified 2026-08-26).
-    Five legs failed this check with a branch point that DECIDED what belonged,
-    and each fix was falsified by a repository topology the last one had not
-    seen. The deciding is gone; what survives is a bound on how far back the
-    walk looks, so getting it wrong costs a `git log` and never a commit.
-
-    `for-each-ref` resolves the patterns and prints only what exists, so a
-    repository with no `main` yields an empty list rather than an error, and no
-    history is walked to find out - it is the cheapest question git answers.
-    """
-    out = _git(relay_dir, "for-each-ref", "--format=%(refname)", *GIT_DEFAULT_REFS)
-    return [line.strip() for line in (out or "").splitlines() if line.strip()]
 
 
 def _mtime(path):
@@ -1499,46 +1530,37 @@ def _is_judged(check):
             or bool(check["judgedBy"]))
 
 
-def _relay_commits(relay_dir, project, floor, claimed):
+def _relay_commits(repo, claimed):
     """Every commit the log may DRAW ON, newest first (ACC-DATA-009).
 
+    `repo` is the work tree git reported for the relay (`_repo_dir`), or None
+    where the relay owns no repository and there is nothing to draw on.
+
     This function makes both populations reachable; `_commit_entries` decides
-    which of them belongs. Nothing about the repository's topology is decided
-    here any more - that is the whole of the 2026-08-26 simplification, and the
-    reason five previous fixes each died to a topology the last had not seen.
+    which of them belongs. NOTHING about the repository's topology is decided
+    here, and after 2026-08-26 nothing about it is even asked:
 
     * every sha in `claimed` the repository confirms, fetched BY NAME so that
       no walk, and therefore no topology, can lose it (`_claimed_commits`).
-    * the walk back from HEAD, which is where the commits nobody claims come
-      from. `--max-count` bounds it, and the default-branch refs narrow it to
-      what the run's branch adds on top of its branch point when that
-      narrowing is free.
+    * one walk back from HEAD, bounded by `--max-count` and by nothing else.
+      That is where the commits nobody claims come from, and the record floor
+      in `_commit_entries` is what bounds them.
 
-    RULE: the narrowed walk is kept only when it REACHES `floor` - the relay's
-    earliest record, which is where the unclaimed population is bounded. A
-    narrowed walk that stops above the floor is deciding what belongs, which is
-    exactly what the branch point may no longer do, so it is thrown away and
-    the full walk is used instead. A walk hitting `LOG_MAX_COMMITS` reaches as
-    far back as any walk here ever does and counts as covering the window.
-
-    `floor` is None where nothing bounds the unclaimed population - a relay
-    with no records at all - and there the walk is not narrowed either:
-    everything it can reach is eligible, so nothing may narrow it.
+    THE WALK IS BOUNDED BY DEPTH, NEVER BY REACHABILITY. This function used to
+    try `git log HEAD --not <default branch refs>` first and keep the result
+    when it reached the floor. `--not` is not a depth bound - it drops every
+    commit REACHABLE FROM another ref - so a trunk merged into the run's branch
+    took unclaimed commits out of the log that HEAD carried and the floor
+    admitted, for no reason a supervisor could read off the pane. Five legs
+    died to a branch point that decided what belonged; the sixth died to one
+    that was only supposed to bound a walk. There is no branch point here now.
     """
-    if not _in_a_repo(relay_dir, project):
+    if repo is None:
         return []
-    commits = []
-    refs = _default_branch_refs(relay_dir) if floor is not None else []
-    if refs:
-        narrowed = _git_log(relay_dir, exclude=refs)
-        if narrowed and (len(narrowed) >= LOG_MAX_COMMITS
-                         or narrowed[-1][0] <= floor):
-            commits = narrowed
-    if not commits:
-        commits = _git_log(relay_dir)
+    commits = _git_log(repo)
     walked = {sha for _, sha, _ in commits}
     return commits + _claimed_commits(
-        relay_dir, [sha for sha in sorted(claimed) if sha not in walked])
+        repo, [sha for sha in sorted(claimed) if sha not in walked])
 
 
 def _floored(commits, floor):
@@ -1553,7 +1575,7 @@ def _floored(commits, floor):
     return [c for c in commits if c[0] >= floor]
 
 
-def _commit_entries(relay_dir, project, batons, records, budget, now):
+def _commit_entries(repo, batons, records, budget, now):
     """Commit entries for the log: the run's own commits first (ACC-DATA-009).
 
     `records` is `(has_records, floor)` from `_relay_records`: what the relay
@@ -1627,10 +1649,7 @@ def _commit_entries(relay_dir, project, batons, records, budget, now):
     # The claims are handed to the walk, not filtered out of it afterwards: a
     # claimed commit no walk on this topology would have reached is fetched by
     # name, which is what makes the rule above hold on ANY topology.
-    commits = sorted(
-        _relay_commits(relay_dir, project, since if has_records else None,
-                       by_commit),
-        key=lambda c: -c[0])
+    commits = sorted(_relay_commits(repo, by_commit), key=lambda c: -c[0])
     if has_records:
         # One floor, one population. A claim carries its own evidence and is
         # kept unconditionally; the record floor bounds everything else.
@@ -1650,7 +1669,7 @@ def _commit_entries(relay_dir, project, batons, records, budget, now):
     ]
 
 
-def _derived_log(relay_dir, project, runners, batons, checks, now):
+def _derived_log(relay_dir, repo, runners, batons, checks, now):
     """The story of the run, from the three records that carry a real order.
 
     1. A baton's mtime is when that leg landed, and its STATUS says how. Every
@@ -1731,8 +1750,7 @@ def _derived_log(relay_dir, project, runners, batons, checks, now):
     # relay one leg in derives nothing while holding two records.
     records = _relay_records(relay_dir, runners, batons, checks, events)
     has_records = records[0]
-    commits = _commit_entries(
-        relay_dir, project, batons, records, len(events), now)
+    commits = _commit_entries(repo, batons, records, len(events), now)
 
     # The outer entry bound, applied once and last. It decides how much of the
     # log fits in a pane, and it must not decide which commits belong: that is
@@ -1769,7 +1787,7 @@ def _derived_log(relay_dir, project, runners, batons, checks, now):
     return entries[:LOG_MAX_ENTRIES]
 
 
-def _log(extras, relay_dir, project, runners, batons, checks, now, warnings):
+def _log(extras, relay_dir, repo, runners, batons, checks, now, warnings):
     """The Progress Log, and where it came from.
 
     ACC-DATA-006: a coach who writes `dashboard.json.log` is quoted verbatim,
@@ -1816,7 +1834,7 @@ def _log(extras, relay_dir, project, runners, batons, checks, now, warnings):
             })
         return entries, "dashboard"
 
-    entries = _derived_log(relay_dir, project, runners, batons, checks, now)
+    entries = _derived_log(relay_dir, repo, runners, batons, checks, now)
     return (entries, "derived") if entries else ([], None)
 
 
@@ -1904,29 +1922,29 @@ def build(relay_dir, now=_NO_CLOCK):
     if active_leg is not None:
         active_leg["isActive"] = True
 
-    # RULE: `path` is the project the relay supervises. A relay directory called
-    # `.relay` sits inside its project, so the project is its parent; a
-    # directory called anything else (a fixture, a copy) is its own path.
+    # RULE: what is REPORTED and what is READ FROM are two answers, and they
+    # come from two places. `relay.path` is the coach's own label for the
+    # project, quoted as written - a label is not a directory (`~` is a shell
+    # convention, and a path can name nothing at all). `repo` is the work tree
+    # to read a repository from, and GIT answers that: `git rev-parse
+    # --show-toplevel` is right from any subdirectory of a work tree, so
+    # `<repo>/services/<svc>/.relay` reads its repository exactly as
+    # `<repo>/.relay` does (ACC-DATA-009, amended 2026-08-26). An untrusted
+    # string in a JSON file no longer redirects that read at all; where it
+    # names something else, it is warned about.
     #
-    # Derived before the batons are read, because it is also the bound on where
-    # a commit may be read from, and a baton's claimed commit is settled
-    # against that repository before either the runner rows or the log quotes
-    # it. Two panes naming different commits for one leg is the class of defect
-    # this module exists to remove.
-    #
-    # RULE: what is REPORTED and what is READ FROM are two answers. `relay.path`
-    # is the coach's own label for the project, quoted as written; `project` is
-    # a directory to read a repository from, which a label is not (`~` is a
-    # shell convention, and a path can name nothing at all). They differ only
-    # where the written value cannot be read from, and each pane wants a
-    # different one of the two.
+    # Resolved before the batons are read, because a baton's claimed commit is
+    # settled against that repository before either the runner rows or the log
+    # quotes it. Two panes naming different commits for one leg is the class of
+    # defect this module exists to remove.
+    repo = _repo_dir(relay_dir)
     written = _text_or_warn(extras.get("path"), "dashboard.json: `path`",
                             warnings)
-    project = _project_dir(written, relay_dir, warnings)
+    project = _project_dir(written, relay_dir, warnings, repo)
     path = written if written is not None else project
 
     batons = _read_batons(relay_dir, warnings)
-    _settle_commits(relay_dir, project, batons)
+    _settle_commits(repo, batons)
     runners, runner_counts, active_runner = _runner_rows(
         batons, leg_rows, active_leg, now, warnings)
 
@@ -1973,7 +1991,7 @@ def build(relay_dir, now=_NO_CLOCK):
     elif tokens is not None:
         warnings.append("dashboard.json: `tokens` is not an object; ignored")
 
-    log, log_source = _log(extras, relay_dir, project, runners, batons, checks,
+    log, log_source = _log(extras, relay_dir, repo, runners, batons, checks,
                            now, warnings)
 
     return {

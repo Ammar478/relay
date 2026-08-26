@@ -835,9 +835,10 @@ def test_no_runner_column_carries_a_display_placeholder_in_place(name):
     no mtime stamping — the two things the `tmp_path` copy above cannot have.
 
     It does NOT reach the commit-reading branch, and it used to say it did. No
-    fixture under `tests/fixtures/` holds a `.git` of its own, and `_in_a_repo`
-    stops the walk at the relay's own project, so reading one in place asks git
-    nothing at all (`test_the_fixture_in_place_is_asked_no_git_question_at_all`
+    fixture under `tests/fixtures/` holds a `.git` of its own, and a relay
+    directory that is its own project owns only the repository ROOTED AT IT, so
+    reading one in place asks git nothing at all
+    (`test_the_fixture_in_place_is_asked_no_git_question_at_all`
     in `test_progress_log.py` is that fact, spied at the seam). The corpus
     sweeps below are what reach that branch; this one is the clock-and-mtime
     half. A docstring that overclaims is how a reader concludes a property is
@@ -847,7 +848,7 @@ def test_no_runner_column_carries_a_display_placeholder_in_place(name):
     em-dash — that is a recorded decision, and it is why this sweep is over the
     runner columns rather than over every string in the model."""
     target = FIXTURES / name
-    assert relay_model._in_a_repo(target, target) is False, target
+    assert relay_model._repo_dir(target) is None, target
     _assert_no_placeholder_columns(
         relay_model.build(target)["runners"], f"{name} (in place)")
 
@@ -3061,14 +3062,25 @@ def test_a_relay_whose_repository_is_readable_still_finds_it(tmp_path, chmodded)
     """The other side of the guard, and the reason an unreadable candidate
     CONTINUES the walk rather than ending it: the live relay shape is
     `<project>/.relay` with the `.git` at `<project>`. A `.relay` that cannot
-    answer is a refusal, not an answer, and the repository is one level up."""
+    answer is a refusal, not an answer, and the repository is one level up.
+
+    `_has_git` over `_repo_roots` is the cheap precondition that decides whether
+    git is asked at all — a necessary condition for git to report a work tree,
+    never a sufficient one — so a refusal that ended the search would cost a
+    chmod'd live relay its whole history without git ever being consulted."""
     project = tmp_path / "project"
     relay_dir = project / ".relay"
     relay_dir.mkdir(parents=True)
     (project / ".git").mkdir()
     chmodded(relay_dir, 0o600)
 
-    assert relay_model._in_a_repo(relay_dir, project) is True
+    assert relay_model._has_git(relay_dir) is False       # a refusal, not "no"
+    assert any(relay_model._has_git(root)
+               for root in relay_model._repo_roots(relay_dir)) is True
+    # ...and the shape is what carries it there: a relay that is its own
+    # project has one candidate, refusal or no refusal.
+    assert relay_model._repo_roots(relay_dir / "not-dot-relay") == \
+        [relay_dir / "not-dot-relay"]
 
 
 @NOT_ROOT
@@ -3287,13 +3299,14 @@ def test_active_leg_and_active_runner_agree_on_every_fixture_in_place(name):
     stamping and can be read where it lies. What that adds over the `tmp_path`
     copy above is the real clock and the real path — NOT the commit-reading
     branch of `build()`, which this reading does not reach either: a fixture
-    holds no `.git` of its own and `_in_a_repo` stops the walk at the relay's
-    own project. The wording here used to imply otherwise, so the bound is
+    holds no `.git` of its own, and a relay that is its own project owns only
+    the repository rooted at it. The wording here used to imply otherwise, so
+    the bound is
     asserted rather than described. `ACC-DATA-003` over a relay that does reach
     git is `test_active_leg_and_active_runner_agree_in_a_repository` below.
     """
     target = FIXTURES / name
-    assert relay_model._in_a_repo(target, target) is False, target
+    assert relay_model._repo_dir(target) is None, target
     assert_active_agrees(relay_model.build(target), f"{name} (in place)")
 
 

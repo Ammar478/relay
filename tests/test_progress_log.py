@@ -409,33 +409,157 @@ def test_no_git_repository_still_yields_a_log(relay):
 FIXTURES = REPO / "tests" / "fixtures"
 
 
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
 def test_a_relay_inside_a_repository_it_does_not_own_finds_no_repository(tmp_path):
-    """The bound itself, with no clock anywhere near it. `tests/fixtures/*` is
-    this shape: a relay directory that is its own project, sitting inside a
-    repository that belongs to somebody else. The parent walk must stop at the
-    project and report no repository, however many `.git` directories sit above
-    it."""
-    host = tmp_path / "host"
-    (host / ".git").mkdir(parents=True)
-    relay_dir = host / "nested" / "standalone"
-    relay_dir.mkdir(parents=True)
+    """The one bound left, with no clock anywhere near it (ACC-DATA-009).
 
-    assert relay_model._in_a_repo(relay_dir, relay_dir) is False
-    # One directory of slack - the live `<project>/.relay` shape - and still
-    # not the host's `.git` two levels up.
-    assert relay_model._in_a_repo(relay_dir, relay_dir.parent) is False
-    # The other side of the bound: a relay whose project really does hold the
-    # repository still finds it, or bounding the walk would cost every live
-    # relay its own history.
-    live = host / ".relay"
-    live.mkdir()
-    assert relay_model._in_a_repo(live, host) is True
+    `tests/fixtures/*` is this shape: a relay directory that is its own
+    project, sitting inside a repository that belongs to somebody else. Git
+    answers for it - correctly, and that is asserted here rather than assumed -
+    and the answer is still not this relay's, because a relay that IS its
+    project owns the repository ROOTED AT IT and no other.
+
+    The bound is the relay's own SHAPE and nothing about the repository: what
+    it must not catch is asserted beside it, twice, because the shape bound
+    replaced a parent walk that stopped at the relay's immediate parent and
+    that walk lost `<repo>/services/<svc>/.relay` its entire history.
+    """
+    host = tmp_path / "host"
+    (host / "services" / "svc").mkdir(parents=True)
+    _git(host, "init", "-q", "-b", "main")
+    top = str(host.resolve())
+
+    standalone = host / "services" / "standalone"
+    standalone.mkdir()
+    # Git really does answer for it; the shape is what refuses the answer.
+    assert _git(standalone, "rev-parse", "--show-toplevel").stdout.strip() == top
+    assert relay_model._repo_dir(standalone) is None
+
+    # A `.relay` beside the repository root, and a `.relay` two directories
+    # below it. Both are live relays and git is right about both.
+    for relay_dir in (host / ".relay", host / "services" / "svc" / ".relay"):
+        relay_dir.mkdir()
+        assert relay_model._repo_dir(relay_dir) == host.resolve(), relay_dir
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_git_failing_to_answer_is_not_an_answer(tmp_path, monkeypatch):
+    """"No answer" must not become "the directory I happen to be standing in".
+
+    The precondition only asks whether a `.git` is THERE, so a `.git` git will
+    not accept sends the question through and git exits non-zero. An empty
+    answer read as a path is `pathlib.Path("")`, which resolves to the
+    PROCESS'S working directory - and a dashboard is opened from wherever a
+    supervisor's shell happens to be, which is very often inside some other
+    project's repository. So the working directory is put INSIDE the relay's
+    own candidate roots here, where a missing guard reads as success.
+    """
+    project = tmp_path / "proj"
+    relay_dir = project / ".relay"
+    relay_dir.mkdir(parents=True)
+    (project / ".git").write_text("not a gitfile\n")   # git refuses this
+    monkeypatch.chdir(project)
+
+    assert relay_model._has_git(project) is True        # the question is asked
+    asked = _git_or_none(project, "rev-parse", "--show-toplevel")
+    assert asked is None, asked                         # ...and git says nothing
+    assert relay_model._repo_dir(relay_dir) is None
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_relay_reached_through_a_symlink_still_finds_its_repository(tmp_path):
+    """A checkout under a symlinked path is the ordinary case, not an exotic
+    one - `/tmp` is a symlink on macOS and so is many a home directory - and
+    git answers with the REAL path of the work tree. The relay directory is
+    resolved before it is compared with that answer, or every such relay reads
+    as owning no repository at all."""
+    _branch_point_relay(tmp_path / "real")
+    alias = tmp_path / "alias"
+    alias.symlink_to(tmp_path / "real", target_is_directory=True)
+    assert (alias / ".relay").is_dir()
+
+    assert relay_model._repo_dir(alias / ".relay") == (tmp_path / "real").resolve()
+    model = relay_model.build(alias / ".relay", now=NOW)
+    entry = commit_named(model, "alpha: the first leg's own work")
+    assert entry is not None, [e["m"] for e in entries_of(model, "commit")]
+    assert entry["leg"] == "alpha"
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_relay_directory_that_is_itself_a_repository_root_reads_it(tmp_path):
+    """The nearest candidate root is the relay directory itself, and git is
+    what says whether anything is there. A `.relay` tracked as a repository of
+    its own is not a shape a relay usually has, but it is a shape the candidate
+    list admits and git resolves - so it is asserted rather than left to be
+    rediscovered as a surprise."""
+    project = tmp_path / "proj"
+    relay_dir = project / ".relay"
+    (relay_dir / "batons").mkdir(parents=True)
+    (relay_dir / "legs.json").write_text(json.dumps(
+        {"relay": "own", "stages": [{"id": "S1", "legs": ["alpha"]}],
+         "legs": [{"id": "alpha", "stage": "S1", "status": "done"}]}))
+    _git(relay_dir, "init", "-q", "-b", "main")
+    _git(relay_dir, "add", "-A", when=NOW - 9000)
+    _git(relay_dir, "commit", "-q", "-m", "alpha: the relay's own work",
+         when=NOW - 9000)
+    _land(relay_dir, "alpha", NOW - 5000, _short_sha(relay_dir))
+
+    assert relay_model._repo_dir(relay_dir) == relay_dir.resolve()
+    model = relay_model.build(relay_dir, now=NOW)
+    entry = commit_named(model, "alpha: the relay's own work")
+    assert entry is not None, [e["m"] for e in entries_of(model, "commit")]
+    assert entry["leg"] == "alpha"
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_git_that_is_not_a_repository_does_not_inherit_the_host(tmp_path):
+    """The shape bound is checked against GIT'S ANSWER, not only against the
+    `.git` that made the question worth asking.
+
+    A relay directory that is its own project can hold a `.git` that git does
+    not accept - an empty directory, a copy that lost its objects, a checkout
+    interrupted half way - and git then walks PAST it and reports the host work
+    tree, which belongs to somebody else. Both halves are asserted, because
+    without the second one the relay reads the host's history on the strength
+    of a directory that is not a repository at all: the precondition passes,
+    the spawn happens, and only the answer refuses.
+    """
+    host = tmp_path / "host"
+    (host / "nested").mkdir(parents=True)
+    _git(host, "init", "-q", "-b", "main")
+    _git(host, "commit", "-q", "--allow-empty",
+         "-m", "host: not the relay's work", when=NOW - 200)
+
+    relay_dir = host / "nested" / "standalone"
+    (relay_dir / "batons").mkdir(parents=True)
+    (relay_dir / "legs.json").write_text(json.dumps(
+        {"relay": "standalone",
+         "stages": [{"id": "S1", "legs": ["alpha"]}],
+         "legs": [{"id": "alpha", "stage": "S1", "status": "done"}]}))
+    _land(relay_dir, "alpha", NOW - 9000, _short_sha(host))   # claims the host's
+    (relay_dir / ".git").mkdir()          # a `.git` git will not accept
+
+    # The precondition passes and git really is asked...
+    assert relay_model._has_git(relay_dir) is True
+    assert _git(relay_dir, "rev-parse", "--show-toplevel").stdout.strip() == \
+        str(host.resolve())
+    # ...and the answer is refused, because a relay that is its own project
+    # owns the repository ROOTED AT IT and no other.
+    assert relay_model._repo_dir(relay_dir) is None
+
+    model = relay_model.build(relay_dir, now=NOW)
+    assert entries_of(model, "commit") == [], \
+        [e["m"] for e in entries_of(model, "commit")]
+    assert not [e for e in model["log"] if "host: not the relay's work" in e["m"]]
 
 
 def test_the_fixture_in_place_is_asked_no_git_question_at_all():
-    """`_in_a_repo` is checked BEFORE git is spawned, so a relay that is not in
-    a repository of its own runs no git process. That is observable without a
-    clock, which is what makes it the guard: it holds on a fresh checkout,
+    """The shape bound is checked BEFORE git is spawned, so a relay that is not
+    in a repository of its own runs no git process: a `.git` at one of
+    `_repo_roots` is a necessary condition for git to report a work tree, so
+    where none holds one the answer is known without the spawn. That is
+    observable without a clock, which is what makes it the guard: it holds on a
+    fresh checkout,
     where every baton mtime is checkout time and the window would have hidden a
     broken bound behind it."""
     asked = []
@@ -530,6 +654,30 @@ def repo_relay(tmp_path):
     _git(project, "commit", "-q", "-m", "seed the relay", when=NOW - 9000)
     _git(project, "commit", "-q", "--allow-empty", "-m", "alpha: land the thing",
          when=NOW - 7200)
+    return relay_dir
+
+
+@pytest.fixture
+def standalone_relay(tmp_path):
+    """A relay directory that IS its project, owning a repository of its own.
+
+    The shape every fixture under `tests/fixtures/` has, plus the `.git` that
+    `.gitignore` keeps out of them: a relay directory NOT called `.relay`,
+    owning the repository rooted at it and nothing above it. It is the other
+    half of the shape bound - `test_a_relay_inside_a_repository_it_does_not_own
+    _finds_no_repository` is the half that refuses, and this is the half that
+    must go on working.
+    """
+    relay_dir = tmp_path / "standalone"
+    (relay_dir / "batons").mkdir(parents=True)
+    (relay_dir / "legs.json").write_text(json.dumps(
+        {"relay": "standalone",
+         "stages": [{"id": "S1", "legs": ["alpha"]}],
+         "legs": [{"id": "alpha", "stage": "S1", "status": "done"}]}))
+    _git(relay_dir, "init", "-q", "-b", "main")
+    _git(relay_dir, "add", "-A", when=NOW - 9000)
+    _git(relay_dir, "commit", "-q", "-m", "alpha: the leg's work", when=NOW - 9000)
+    _land(relay_dir, "alpha", NOW - 5000, _short_sha(relay_dir))
     return relay_dir
 
 
@@ -850,6 +998,18 @@ def commit_named(model, needle):
     return found[0] if found else None
 
 
+def _git_or_none(cwd, *args):
+    """git's stdout, or None when git refused - `git_run` asserts on non-zero.
+
+    One test needs to OBSERVE git failing rather than to succeed at something,
+    and asserting the failure is what makes that test's premise real instead of
+    assumed.
+    """
+    out = subprocess.run(["git", "-C", str(cwd), *args],
+                         capture_output=True, text=True)
+    return out.stdout if out.returncode == 0 else None
+
+
 def _short_sha(cwd, rev="HEAD"):
     return _git(cwd, "rev-parse", "--short", rev).stdout.strip()
 
@@ -1012,8 +1172,8 @@ def test_a_repository_with_no_default_branch_falls_back_to_the_event_window(
 @pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
 def test_an_ambient_git_dir_cannot_make_a_foreign_repo_the_relay_s(
         repo_relay, tmp_path, monkeypatch):
-    """`_in_a_repo` bounds WHERE commits are read from on the filesystem, and
-    `GIT_DIR` walks straight back past it: git obeys the environment over `-C`,
+    """`_repo_dir` asks git WHERE commits are read from, and `GIT_DIR` walks
+    straight back past the answer: git obeys the environment over `-C`,
     so a dashboard opened from a shell that exports one would report a foreign
     repository's commits as this relay's."""
     foreign = tmp_path / "foreign"
@@ -1550,14 +1710,34 @@ def test_a_commit_dated_exactly_at_the_earliest_record_is_in_the_window(tmp_path
     assert entry["t"] == min(e["t"] for e in relay_events(model))
 
 
+# --------------------------------------------------------------------------
+# THE WALK IS BOUNDED BY DEPTH, NEVER BY REACHABILITY (ACC-DATA-009, corrected
+# 2026-08-26 after a sixth topology defect)
+#
+# `--max-count` is a depth. `git log HEAD --not <ref>` is not: it drops every
+# commit ANOTHER REF CAN REACH, which is a decision about what belongs wearing
+# a bound's clothes. The module used to narrow its walk that way and keep the
+# result when it reached the record floor, and a judge showed the cost: an
+# unclaimed commit above the floor and reachable from HEAD left the log solely
+# because `main` also reached it.
+#
+# So the narrowing is gone, and with it `_default_branch_refs`,
+# `GIT_DEFAULT_REFS` and the last ref-name logic in the module. The two tests
+# below are what stops it coming back: one measures the OUTCOME on the shape
+# that exposed it, and one watches the ARGV, because a reintroduction could use
+# `^ref` or `a..b` and never mention `--not` at all.
+# --------------------------------------------------------------------------
+
 @pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
-def test_a_narrowed_walk_that_stops_above_the_window_is_thrown_away(tmp_path):
-    """The branch point's ONLY remaining job, at its own seam (ACC-DATA-009,
-    simplified 2026-08-26): it bounds how far back the walk looks and decides
-    nothing. Here the run's branch was cut AFTER the relay's earliest record,
-    so the narrowed walk stops above the floor and would be deciding that the
-    project's traffic from while the relay ran does not belong. It is thrown
-    away and the full walk is used - one extra `git log`, no lost commit."""
+def test_a_commit_the_trunk_can_also_reach_is_still_in_the_walk(tmp_path):
+    """A commit that is in the window and reachable from `main` is IN the log.
+
+    The run's branch was cut AFTER the relay's earliest record, so a commit
+    that landed on `main` while the relay ran is above the floor and reachable
+    from HEAD - and from `main`, which is the only thing a narrowed walk had
+    against it. Under `--not refs/heads/main` it left the log for a reason no
+    supervisor could read off the pane; the walk is bounded by depth now, and
+    depth cannot tell those two commits apart."""
     project = tmp_path / "late"
     relay_dir = project / ".relay"
     (relay_dir / "batons").mkdir(parents=True)
@@ -1578,21 +1758,134 @@ def test_a_narrowed_walk_that_stops_above_the_window_is_thrown_away(tmp_path):
     for i in range(3):
         _land(relay_dir, f"spare-{i}", NOW - 2500 + i)    # budget for both
 
-    refs = relay_model._default_branch_refs(relay_dir)
-    assert refs, "the repository has a default branch to narrow the walk with"
-    narrowed = [c[2] for c in relay_model._git_log(relay_dir, exclude=refs)]
-    assert narrowed == ["late: on the branch the relay cut"]
+    # What a reachability exclusion would have left: one commit of three.
+    excluded = _git(project, "log", "--format=%s", "HEAD",
+                    "--not", "refs/heads/main").stdout.split("\n")
+    assert [line for line in excluded if line] == [
+        "late: on the branch the relay cut"]
 
-    floor = NOW - 5000
     walked = [c[2] for c in relay_model._relay_commits(
-        relay_dir, str(project), floor, {})]
+        relay_model._repo_dir(relay_dir), {})]
     assert "while: on main while the relay ran" in walked, walked
 
     model = relay_model.build(relay_dir, now=NOW)
     assert commit_named(model, "while: on main while the relay ran") is not None, \
         [e["m"] for e in entries_of(model, "commit")]
     assert commit_named(model, "late: on the branch the relay cut") is not None
+    # ...and the DEPTH bound still bounds: this one is below the record floor.
     assert commit_named(model, "before: long before the relay") is None
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_trunk_merged_into_the_run_s_branch_costs_the_log_nothing(tmp_path):
+    """The judge's own shape, which is the one a coach actually produces: the
+    trunk moves on and somebody merges it INTO the run's branch to stay current.
+
+    Everything `main` carries is then reachable from HEAD as well, so a
+    narrowed walk drops it all - including the merge commit the run itself
+    made. Every one of those is above the relay's record floor and none of them
+    can be told from the run's own work by anything but a ref name."""
+    relay_dir = _branch_point_relay(tmp_path / "proj")
+    project = relay_dir.parent
+    _git(project, "checkout", "-q", "main")
+    _git(project, "commit", "-q", "--allow-empty",
+         "-m", "trunk: moved on while the relay ran", when=NOW - 4800)
+    _git(project, "checkout", "-q", "feat/the-run")
+    _git(project, "merge", "-q", "--no-ff", "-m", "merge: main into the run",
+         "main", when=NOW - 4700)
+    _land(relay_dir, "beta", NOW - 4600)          # a record after the merge
+    for i in range(3):
+        _land(relay_dir, f"spare-{i}", NOW - 4500 + i)   # budget for both
+
+    # What a narrowed walk would have lost, asserted so this test bites rather
+    # than merely passes: everything the trunk reaches, which is now everything
+    # the trunk carries PLUS everything it carried before the run began.
+    excluded = [line for line in _git(
+        project, "log", "--format=%s", "HEAD",
+        "--not", "refs/heads/main").stdout.split("\n") if line]
+    assert "trunk: moved on while the relay ran" not in excluded, excluded
+    assert "merge: main into the run" in excluded
+
+    model = relay_model.build(relay_dir, now=NOW)
+    said = [e["m"] for e in entries_of(model, "commit")]
+    assert commit_named(model, "trunk: moved on while the relay ran") is not None, said
+    assert commit_named(model, "merge: main into the run") is not None, said
+    assert commit_named(model, "alpha: the first leg's own work") is not None, said
+
+
+#: Every way git can be told to exclude what another ref REACHES. `--not` and a
+#: leading `^` are the explicit forms; `a..b` and `a...b` are the shorthands;
+#: `--branches`, `--tags`, `--remotes`, `--all` and `--glob` feed refs to the
+#: first two wholesale. A reintroduction that used any of these would be the
+#: same defect under a different spelling, so the guard is over the shape and
+#: not over the word.
+REACHABILITY_FLAGS = ("--not", "--branches", "--tags", "--remotes", "--all",
+                      "--glob", "--exclude", "--ancestry-path", "--boundary")
+
+#: The only git subcommands `build()` is allowed to run. `for-each-ref`,
+#: `symbolic-ref`, `merge-base` and `rev-list` are each a way to find a branch
+#: point, and finding one is what this check has died of six times.
+GIT_SUBCOMMANDS_ALLOWED = {"rev-parse", "cat-file", "log"}
+
+
+def _reachability_exclusions(args):
+    """Which of `args` exclude what another ref can reach."""
+    return [a for a in args
+            if a in REACHABILITY_FLAGS or a.startswith("^") or ".." in a
+            or any(a.startswith(f + "=") for f in REACHABILITY_FLAGS)]
+
+
+def test_reachability_exclusions_recognises_the_forms_it_guards_against():
+    """The guard's own predicate, tested where the forms are known - otherwise
+    a predicate that answered `[]` for everything would make the sweep below
+    green over any argv at all, which is the shape of hole this suite keeps
+    finding in itself."""
+    assert _reachability_exclusions(["--not", "refs/heads/main"]) == ["--not"]
+    assert _reachability_exclusions(["^refs/heads/main"]) == ["^refs/heads/main"]
+    assert _reachability_exclusions(["main..HEAD"]) == ["main..HEAD"]
+    assert _reachability_exclusions(["main...HEAD"]) == ["main...HEAD"]
+    assert _reachability_exclusions(["--glob=refs/heads/*"]) == ["--glob=refs/heads/*"]
+    assert _reachability_exclusions(["--all"]) == ["--all"]
+    # ...and nothing the module actually passes is caught by it.
+    assert _reachability_exclusions(
+        ["log", "--no-color", "--max-count=200", "--format=%ct%x1f%h%x1f%s",
+         "HEAD", "--no-walk", "abc1234", "--", "rev-parse", "--show-toplevel",
+         "cat-file", "--batch-check=%(objectname) %(objecttype)"]) == []
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_no_git_call_a_build_makes_excludes_what_another_ref_reaches(tmp_path):
+    """THE GUARD, at the argv, so a reintroduction cannot be quiet.
+
+    The outcome tests above are shape-specific: each was written against the
+    topology that had just broken the check, and the next topology is the one
+    nobody has tried. This one is not. It reads every git invocation a real
+    `build()` makes on a real repository and asserts that none of them names a
+    ref to exclude and none of them asks a question whose only use is finding a
+    branch point. `refs = []` used to leave the whole suite green.
+    """
+    relay_dir = _branch_point_relay(tmp_path / "proj")
+    _topology_clone(relay_dir.parent, "main", "feat/the-run")
+    seen = []
+    real = relay_model._git
+
+    def spy(repo, *args, **kwargs):
+        seen.append(args)
+        return real(repo, *args, **kwargs)
+
+    relay_model._git = spy
+    try:
+        model = relay_model.build(relay_dir, now=NOW)
+    finally:
+        relay_model._git = real
+
+    assert seen, "a build on a real repository asks git something"
+    assert {args[0] for args in seen} <= GIT_SUBCOMMANDS_ALLOWED, seen
+    for args in seen:
+        assert _reachability_exclusions(list(args)) == [], args
+    # And the reading is a real one, or the sweep above swept a build that did
+    # nothing: this is the clone topology, where the narrowed walk was empty.
+    assert commit_named(model, "alpha: the first leg's own work") is not None
 
 
 # --------------------------------------------------------------------------
@@ -1832,14 +2125,12 @@ def test_a_running_first_leg_with_no_baton_still_bounds_the_commits(tmp_path):
 @pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
 def test_a_branch_with_no_default_branch_and_a_running_first_leg(tmp_path):
     """The third door. `trunk` is the ONLY ref this repository has - no `main`,
-    no `master`, no `origin/*` and no second branch - so there is nothing to
-    narrow the walk with either. The records are the only bound left and they
-    have to be enough on their own, which is what the simplified rule says for
-    every commit nobody claims."""
+    no `master`, no `origin/*` and no second branch. The records are the only
+    bound there has ever been on a commit nobody claims, and since 2026-08-26
+    they are the only bound in the module at all: no ref narrows anything."""
     relay_dir = _one_leg_in(tmp_path / "proj", branch="trunk")
     project = relay_dir.parent
     assert _git(project, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == "trunk"
-    assert relay_model._default_branch_refs(relay_dir) == []
     model = relay_model.build(relay_dir, now=NOW)
     assert entries_of(model, "commit") == [], \
         [e["m"] for e in entries_of(model, "commit")]
@@ -2172,11 +2463,12 @@ def test_a_written_path_cannot_widen_the_repository_bound(nested_relay, where):
 @pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
 def test_a_written_path_cannot_widen_the_claim_check_either(nested_relay):
     """The same bound on the other read, and on the cheapest observation of
-    it. `_in_a_repo` is checked before git is spawned at all - by the log AND
-    by `_resolve_shas`, which asks the relay's own repository whether a claimed
-    sha is a commit in it. A relay that owns no repository asks nothing; a
-    widened walk starts asking the host's, which is how a baton comes to be
-    credited with a foreign object. No clock is involved in observing it."""
+    it. `_repo_dir` is resolved once, before git is spawned for either read -
+    the log's walk AND `_resolve_shas`, which asks the relay's own repository
+    whether a claimed sha is a commit in it. A relay that owns no repository
+    asks nothing; a widened bound starts asking the host's, which is how a
+    baton comes to be credited with a foreign object. No clock is involved in
+    observing it."""
     host = nested_relay.parent.parent
     sha = _git(host, "rev-parse", "--short=7", "HEAD").stdout.strip()
     _land(nested_relay, "alpha", NOW - 9000, sha)
@@ -2222,19 +2514,18 @@ def test_the_window_is_applied_though_the_derivation_produced_no_entry(tmp_path)
     are forty commits in the walk and no derived entry to bound them with, and
     the answer is still none of them."""
     relay_dir = _one_leg_in(tmp_path / "proj")
-    project = str(relay_dir.parent)
+    repo = relay_model._repo_dir(relay_dir)
     batons = relay_model._read_batons(relay_dir, [])
     runners = [{"leg": "alpha", "status": "running"}]
     records = relay_model._relay_records(relay_dir, runners, batons, [], [])
 
     # The walk really does have forty commits to bound - otherwise the
     # assertion below would pass for the wrong reason.
-    commits = relay_model._relay_commits(relay_dir, project, records[1], {})
+    commits = relay_model._relay_commits(repo, {})
     assert len(commits) == 40
 
     assert records[0] is True                       # records...
-    assert relay_model._commit_entries(
-        relay_dir, project, batons, records, 0, NOW) == []
+    assert relay_model._commit_entries(repo, batons, records, 0, NOW) == []
 
 
 @pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
@@ -2265,11 +2556,11 @@ def test_the_window_opens_when_legs_json_recorded_the_running_leg(tmp_path):
     _land(relay_dir, "alpha", NOW - 5000)          # claims no commit
 
     model = relay_model.build(relay_dir, now=NOW)
-    # HEAD is `main` itself, so the walk bound is HEAD's own ref and narrows
-    # nothing: the records are the whole window for what nobody claims.
-    assert relay_model._default_branch_refs(relay_dir) == ["refs/heads/main"]
-    assert relay_model._git_log(
-        relay_dir, exclude=relay_model._default_branch_refs(relay_dir)) == []
+    # HEAD is `main` itself. The walk reaches the whole of it and the records
+    # are the whole window for what nobody claims - which is the only bound
+    # there is now that no ref narrows the walk.
+    assert [c[2] for c in relay_model._git_log(relay_dir)] == [
+        "alpha: the first leg's own work", "before: long before the relay"]
     assert len(relay_events(model)) == 2            # alpha landed, beta started
     assert commit_named(model, "alpha: the first leg's own work") is not None, \
         [e["m"] for e in entries_of(model, "commit")]
@@ -2400,7 +2691,7 @@ def test_the_walk_stops_at_its_own_bound_and_keeps_the_newest(past_the_walk_boun
     """`_git_log` at its own seam: the cap is what it says it is, and the end
     of the branch it keeps is the newest end."""
     relay_dir, oldest, newest = past_the_walk_bound
-    walked = relay_model._git_log(relay_dir, exclude=["refs/heads/main"])
+    walked = relay_model._git_log(relay_dir)
     assert len(walked) == relay_model.LOG_MAX_COMMITS
     shas = [sha for _when, sha, _subject in walked]
     assert shas[0] == newest
@@ -2456,10 +2747,16 @@ def test_no_cap_on_the_walk_can_decide_whether_a_claim_is_in_the_log(
 #
 # The coach wrote `"path": "~/Documents/..."` into this repository's own
 # dashboard by hand. Nothing here expanded the `~`, so the value named a
-# directory called `~` under the process's working directory; `_in_a_repo`
-# clamped back to the relay directory, found no `.git`, and the relay was read
-# as one that owns no repository - no commit in the log, no baton's claim
-# settled, and not one word about any of it. The log looked merely quiet.
+# directory called `~` under the process's working directory, which was not
+# the relay's own project, so the read clamped back to the relay directory,
+# found no `.git`, and the relay was read as one that owns no repository - no
+# commit in the log, no baton's claim settled, and not one word about any of
+# it. The log looked merely quiet.
+#
+# Amended 2026-08-26: `path` no longer bounds the read at all - git answers
+# which work tree the relay is in - so the tests below assert what survives of
+# the rule, which is the WARNING. What a coach writes is still untrusted, and a
+# value the model cannot use still has to say so.
 # --------------------------------------------------------------------------
 
 @pytest.fixture
@@ -2546,8 +2843,8 @@ def test_a_written_path_that_names_no_directory_is_warned_about(home_relay, kind
     said = [w for w in model["warnings"] if "`path`" in w]
     assert len(said) == 1 and "not a directory" in said[0], model["warnings"]
     assert model["relay"]["path"] == written        # still quoted as written
-    # Ignored, not obeyed: the read falls back to the relay's own project,
-    # which is the widest bound `_in_a_repo` would have allowed it anyway.
+    # Ignored, not obeyed: the read comes from git either way, and a value the
+    # model cannot use may not switch a working read off.
     assert commit_named(model, "alpha: the leg's work") is not None
 
 
@@ -2609,9 +2906,21 @@ def test_a_tilde_path_cannot_widen_the_repository_bound(nested_relay, monkeypatc
 # exactly what the simplified rule says admits it, on any topology at all.
 # --------------------------------------------------------------------------
 
-def _branch_point_relay(project, base="main", branch="feat/the-run"):
-    """A relay one leg in, on a branch of its own, claiming its own commit."""
-    relay_dir = project / ".relay"
+#: The directory names a monorepo relay sits under, deepest last. A relay at
+#: `<repo>/services/<svc>/.relay` is depth 2 and is an ordinary shape; the
+#: coach reproduced the defect at 1, 2 and 3.
+DEPTH_DIRS = ("services", "svc", "inner")
+
+
+def _branch_point_relay(project, base="main", branch="feat/the-run", depth=0):
+    """A relay one leg in, on a branch of its own, claiming its own commit.
+
+    `depth` is how many directories below the REPOSITORY ROOT the relay's own
+    container sits. 0 is `<project>/.relay`, the shape this repository's own
+    relay happens to have, and which is why nothing here noticed that 1, 2 and
+    3 lost every leg-claimed commit silently.
+    """
+    relay_dir = project.joinpath(*DEPTH_DIRS[:depth], ".relay")
     (relay_dir / "batons").mkdir(parents=True)
     (relay_dir / "legs.json").write_text(json.dumps(
         {"relay": "branch-point",
@@ -2681,6 +2990,10 @@ def _topology_merged_into_the_trunk(project, base, branch):
     _origin_head(project, base)
 
 
+#: 0 is `<repo>/.relay`; 2 is the ordinary monorepo `<repo>/services/<svc>/.relay`.
+#: The coach reproduced the defect at 1, 2 and 3, so all four are read here.
+DEPTHS = [0, 1, 2, 3]
+
 TOPOLOGIES = {
     "no remote at all": _topology_none,
     "origin/HEAD names the run's own branch": _topology_clone,
@@ -2703,6 +3016,43 @@ def _built(tmp_path, topology, base):
 # these were reported by the round-4 code judge: on `develop` and on `trunk`
 # the leg's own claimed commit left the log entirely.
 BASE_NAMES = ["main", "master", "develop", "trunk", "zx9-nobodys-convention"]
+
+
+def test_the_topology_corpus_cannot_be_shrunk():
+    """The corpus is evidence only while it is the whole corpus.
+
+    A judge cut `TOPOLOGIES` and `BASE_NAMES` to one entry each: 72 of 100
+    cases deleted, suite green, exit 0 - and those five topologies are exactly
+    the ones that killed the five previous legs at this check. That is the
+    `ALL_FIXTURES = []` class landing on the check whose entire history is
+    topology, so it is closed the same way: DERIVE the list where the source of
+    truth is on disk, and assert membership and count where it is not.
+
+    `TOPOLOGIES` is derived from the module: every `_topology_*` function here
+    exists to be in it, so deleting an entry without deleting its function is
+    red, and deleting both is red on the count. `BASE_NAMES` and `DEPTHS` are
+    values with no source of truth but this file, so they are pinned outright -
+    each name and each depth is a case a judge or a coach reported.
+    """
+    defined = {name: obj for name, obj in globals().items()
+               if name.startswith("_topology_")}
+    assert len(defined) == 5, sorted(defined)
+    assert set(TOPOLOGIES.values()) == set(defined.values()), sorted(defined)
+    assert set(TOPOLOGIES) == {
+        "no remote at all",
+        "origin/HEAD names the run's own branch",
+        "origin/HEAD names the base branch",
+        "only the branch's own remote-tracking ref",
+        "the branch is already merged into its trunk",
+    }
+    # Two of these were the round-4 judge's report and one is nobody's
+    # convention, which is the point of it.
+    assert BASE_NAMES == ["main", "master", "develop", "trunk",
+                          "zx9-nobodys-convention"]
+    # 0 is the shape this repository's own relay has, and is why depth went
+    # unnoticed for six rounds; 1, 2 and 3 are what the round-5 judge measured.
+    assert DEPTHS == [0, 1, 2, 3]
+    assert len(TOPOLOGIES) * len(BASE_NAMES) == 25, "the matrix each sweep runs"
 
 
 @pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
@@ -2738,20 +3088,191 @@ def test_the_log_never_contradicts_the_runner_rows(tmp_path, topology, base):
     assert claimed == attributed, model["warnings"]
 
 
+# --------------------------------------------------------------------------
+# THE RELAY DOES NOT HAVE TO SIT BESIDE THE REPOSITORY ROOT (ACC-DATA-009,
+# amended 2026-08-26)
+#
+# The round-5 judge measured this, verbatim:
+#
+#     depth=0 (<repo>/.relay)                   ->  3/3 commits
+#     depth=1,2,3 (<repo>/services/svc/.relay)  ->  0 commit entries
+#                                                   1 runner row still claiming
+#                                                   0 warnings
+#
+# Twelve of thirteen topologies passed. The thirteenth was not a topology at
+# all - it was the model still GUESSING which repository it was in, by taking
+# `dirname(relay_dir)` for the project and walking no further. Git answers this
+# correctly from any subdirectory of a work tree, and the fix is to ask it.
+#
+# Nothing here noticed for six rounds because THIS repository's own relay sits
+# at its repository root, and so did every fixture and every constructed relay
+# in this file. Depth is now a parameter rather than a constant.
+# --------------------------------------------------------------------------
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+@pytest.mark.parametrize("depth", DEPTHS)
+def test_a_leg_claimed_commit_survives_at_every_depth(tmp_path, depth):
+    """The defect, at the four depths the coach measured. The commit predates
+    every record the relay has, so nothing but the claim can admit it - and a
+    claim is evidence wherever the relay directory happens to sit."""
+    relay_dir = _branch_point_relay(tmp_path / "proj", depth=depth)
+    model = relay_model.build(relay_dir, now=NOW)
+    entry = commit_named(model, "alpha: the first leg's own work")
+    assert entry is not None, [e["m"] for e in entries_of(model, "commit")]
+    assert entry["leg"] == "alpha"
+    # ...and depth widens nothing: the project's own history is still nobody's.
+    assert commit_named(model, "before: the project existed first") is None
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+@pytest.mark.parametrize("depth", DEPTHS)
+def test_the_log_never_contradicts_the_runner_rows_at_every_depth(tmp_path, depth):
+    """THE INVARIANT at depth, which is the measurement that condemned the
+    thirteenth topology: one runner row claiming a commit, zero commit entries,
+    zero warnings. Both sets are fed by the same settled claims, so a
+    disagreement means something upstream is deciding by topology again."""
+    relay_dir = _branch_point_relay(tmp_path / "proj", depth=depth)
+    model = relay_model.build(relay_dir, now=NOW)
+    claimed = {r["commit"] for r in model["runners"] if r["commit"]}
+    attributed = {e["commit"] for e in entries_of(model, "commit") if e["leg"]}
+    assert claimed, "the fixture's leg claims a commit"
+    assert claimed == attributed, model["warnings"]
+    assert assert_the_model_agrees_with_itself(model, relay_dir) == "compared"
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+@pytest.mark.parametrize("depth", DEPTHS)
+@pytest.mark.parametrize("label", ["the repository root", "the relay's container"])
+def test_a_correct_path_at_depth_rescues_nothing_and_is_not_warned_about(
+        tmp_path, depth, label):
+    """Both halves of the judge's second finding, at every depth.
+
+    A CORRECT `path` was falsely warned about below the repository root - there
+    was no value a coach could write at depth that was not - and it did not
+    rescue the reading either, because the read was bounded by the guess rather
+    than by the value. Now it warns about neither, and the reading does not
+    depend on it: an untrusted string in a JSON file cannot redirect a read
+    that git answers.
+    """
+    relay_dir = _branch_point_relay(tmp_path / "proj", depth=depth)
+    container = relay_dir.parent
+    written = str(container.parents[depth - 1] if depth else container)
+    (relay_dir / "dashboard.json").write_text(json.dumps({"path": written}))
+    model = relay_model.build(relay_dir, now=NOW)
+    assert [w for w in model["warnings"] if "`path`" in w] == [], model["warnings"]
+    assert model["relay"]["path"] == written        # quoted as the coach wrote it
+    entry = commit_named(model, "alpha: the first leg's own work")
+    assert entry is not None, [e["m"] for e in entries_of(model, "commit")]
+    assert entry["leg"] == "alpha"
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_at_depth_a_project_is_the_root_the_container_and_what_lies_between(
+        tmp_path):
+    """The label set at depth, swept end to end - every directory in it and one
+    on each side of it.
+
+    A monorepo relay's project has more than one honest name: `<repo>` is the
+    project, `<repo>/services/<svc>` is the project, and so is every step
+    between. What is NOT the project is anything ABOVE the repository root -
+    that is another project's directory, and it is the value the clone case
+    inherits - or the relay directory itself, which is where the relay keeps
+    its own files.
+
+    Swept rather than sampled because the two ends passed while the middle did
+    not: a label set that merely stopped at the root and one that ran past it
+    agree on the root and on the container, and disagree only here.
+    """
+    relay_dir = _branch_point_relay(tmp_path / "proj", depth=3)
+    root = tmp_path / "proj"
+    container = relay_dir.parent
+    between = [root.joinpath(*DEPTH_DIRS[:n]) for n in (1, 2)]
+    assert [str(d) for d in between] == [
+        str(root / "services"), str(root / "services" / "svc")]
+
+    for written in [root, *between, container]:
+        (relay_dir / "dashboard.json").write_text(json.dumps(
+            {"path": str(written)}))
+        model = relay_model.build(relay_dir, now=NOW)
+        assert [w for w in model["warnings"] if "`path`" in w] == [], written
+
+    for written in (tmp_path, tmp_path.parent, relay_dir):
+        (relay_dir / "dashboard.json").write_text(json.dumps(
+            {"path": str(written)}))
+        model = relay_model.build(relay_dir, now=NOW)
+        said = [w for w in model["warnings"] if "`path`" in w]
+        assert len(said) == 1 and str(written) in said[0], (written, said)
+        # ...and saying so never costs the reading, at either end.
+        assert commit_named(model, "alpha: the first leg's own work") is not None
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+@pytest.mark.parametrize("depth", DEPTHS)
+def test_a_path_naming_the_relay_directory_is_warned_about_at_every_depth(
+        tmp_path, depth):
+    """The value that was silent inside a clause that names it explicitly.
+
+    `<repo>/.relay` is not a project - it is where the relay keeps its own
+    files - and the fifteen other unusable values the judge tried all warned.
+    Whatever the model cannot use, it says so, at every depth."""
+    relay_dir = _branch_point_relay(tmp_path / "proj", depth=depth)
+    (relay_dir / "dashboard.json").write_text(json.dumps(
+        {"path": str(relay_dir)}))
+    model = relay_model.build(relay_dir, now=NOW)
+    said = [w for w in model["warnings"] if "`path`" in w]
+    assert len(said) == 1 and str(relay_dir) in said[0], model["warnings"]
+    # ...and saying so does not cost the reading, which no longer depends on it.
+    assert commit_named(model, "alpha: the first leg's own work") is not None
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+@pytest.mark.parametrize("depth", DEPTHS)
+def test_the_walk_is_still_bounded_at_every_depth(tmp_path, depth):
+    """Depth widens where the repository is found and NOT what belongs to the
+    run. The trunk's own history is unclaimed and older than every record, so
+    it stays out of the log wherever the relay sits - otherwise "ask git" would
+    have traded a silent empty log for a silent full one."""
+    relay_dir = _branch_point_relay(tmp_path / "proj", depth=depth)
+    repo = relay_model._repo_dir(relay_dir)
+    assert repo == (tmp_path / "proj").resolve()
+    assert len(relay_model._git_log(repo)) == 2      # the walk really reaches it
+    model = relay_model.build(relay_dir, now=NOW)
+    assert commit_named(model, "before: the project existed first") is None
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_the_rows_and_the_log_agree_where_no_repository_can_be_resolved(tmp_path):
+    """THE INVARIANT where git can answer nothing at all - the other direction,
+    and the one a fix that simply asked git harder could break.
+
+    A relay copied out of its repository still has batons naming shas. Nothing
+    on disk can confirm them, so the log attributes NO commit; the rows keep
+    the baton's own word, which `_settle_commits` may narrow and never invent.
+    The failure this forbids is the log claiming a commit no row does."""
+    relay_dir = _branch_point_relay(tmp_path / "proj", depth=2)
+    orphan = tmp_path / "orphan" / "svc" / ".relay"
+    orphan.parent.mkdir(parents=True)
+    shutil.copytree(relay_dir, orphan)
+    assert relay_model._repo_dir(orphan) is None
+
+    model = relay_model.build(orphan, now=NOW)
+    assert entries_of(model, "commit") == [], \
+        [e["m"] for e in entries_of(model, "commit")]
+    assert assert_the_model_agrees_with_itself(model, orphan) == "no-repository"
+
+
 @pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
 def test_a_repository_with_no_other_ref_keeps_the_claim_all_the_same(tmp_path):
     """INVERTED 2026-08-26, by the contract's own simplification. With the base
-    branch deleted the run's branch is the only ref there is, so there is no
-    branch point and nothing to narrow the walk with. Under the rule this
-    replaces, that cost alpha its commit - it predates alpha's baton, and the
-    record floor governed claims too. Under the rule now in force the claim IS
-    the evidence, so the commit stays and the pane stops disagreeing with the
-    runner row beside it."""
+    branch deleted the run's branch is the only ref there is. Under the rule
+    this replaces, that cost alpha its commit - it predates alpha's baton, and
+    the record floor governed claims too. Under the rule now in force the claim
+    IS the evidence, so the commit stays and the pane stops disagreeing with
+    the runner row beside it."""
     relay_dir = _branch_point_relay(tmp_path / "proj")
     _git(relay_dir.parent, "branch", "-q", "-D", "main")
     assert _git(relay_dir.parent, "for-each-ref", "--format=%(refname)"
                 ).stdout.split() == ["refs/heads/feat/the-run"]
-    assert relay_model._default_branch_refs(relay_dir) == []
     model = relay_model.build(relay_dir, now=NOW)
     entry = commit_named(model, "alpha: the first leg's own work")
     assert entry is not None, [e["m"] for e in entries_of(model, "commit")]
@@ -2778,19 +3299,22 @@ def test_a_detached_head_at_the_branch_tip_still_owns_its_branch(tmp_path):
 
 
 @pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
-def test_origin_head_naming_the_run_s_own_branch_empties_the_walk_not_the_log(
-        tmp_path):
-    """The seam the clone defect lived at, asserted at the seam. `origin/HEAD`
-    resolves to the run's own branch after `git clone -b <branch>`, so the
-    narrowed walk excludes HEAD itself and comes back with NOTHING. That used
-    to be the answer; now it is only a walk that failed, and the claim is
-    fetched by name regardless."""
+def test_origin_head_naming_the_run_s_own_branch_is_no_longer_a_seam(tmp_path):
+    """The seam the clone defect lived at, asserted where the seam WAS.
+
+    `origin/HEAD` resolves to the run's own branch after `git clone -b
+    <branch>`. The walk used to exclude what that ref reaches, which is HEAD
+    itself, and came back with nothing; then it came back with nothing and the
+    claim was fetched by name anyway. Now the ref is not consulted at all, so
+    the walk sees the branch whatever `origin/HEAD` names - and the assertion
+    is on the walk, because that is the half that used to be empty."""
     relay_dir = _branch_point_relay(tmp_path / "proj")
     project = relay_dir.parent
     _topology_clone(project, "main", "feat/the-run")
-    refs = relay_model._default_branch_refs(relay_dir)
-    assert "refs/remotes/origin/HEAD" in refs
-    assert relay_model._git_log(relay_dir, exclude=refs) == [], "the walk sees nothing"
+    assert _git(project, "symbolic-ref", "refs/remotes/origin/HEAD"
+                ).stdout.strip() == "refs/remotes/origin/feat/the-run"
+    assert [c[2] for c in relay_model._git_log(project)] == [
+        "alpha: the first leg's own work", "before: the project existed first"]
 
     model = relay_model.build(relay_dir, now=NOW)
     entry = commit_named(model, "alpha: the first leg's own work")
@@ -2853,13 +3377,13 @@ def test_a_clone_of_the_repository_shows_the_log_the_source_tree_shows(tmp_path)
 # a `path` the model cannot use is warned about, not silently obeyed
 # (ACC-DATA-009)
 #
-# `_in_a_repo` clamps a written `path` that is not the relay's own project back
-# to the relay directory, which is the right bound and the wrong silence: the
-# read then finds no repository, the log carries no commit, no baton's claim is
-# settled - and `relay.path` goes on reporting the value as though it were in
-# use. A value that names a directory the model may not read from is as
-# unusable as one that names no directory at all, and the model warns about
-# every other unusable field it reads.
+# A written `path` that is not the relay's own project used to clamp the read
+# back to the relay directory, which was the right bound and the wrong silence:
+# the read then found no repository, the log carried no commit, no baton's
+# claim was settled - and `relay.path` went on reporting the value as though it
+# were in use. A value that names a directory that is not this relay's project
+# is as unusable as one that names no directory at all, and the model warns
+# about every other unusable field it reads.
 # --------------------------------------------------------------------------
 
 @pytest.fixture
@@ -2875,18 +3399,25 @@ def other_project(tmp_path):
 
 @pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
 @pytest.mark.parametrize("kind", ["an ancestor", "a home directory",
-                                  "another repository"])
+                                  "another repository",
+                                  "the relay directory itself"])
 def test_a_path_that_is_not_the_relays_own_project_is_warned_about(
         home_relay, other_project, kind):
-    """Three values a coach can write that the model cannot read from, and one
+    """Four values a coach can write that are not this relay's project, and one
     warning apiece. Each is a directory, so none of them is caught by the
-    `not a directory` warning that already exists."""
+    `not a directory` warning that already exists.
+
+    THE FOURTH was the round-5 judge's finding: `<repo>/.relay` was the one
+    value inside this clause that yielded no commits and said nothing about it,
+    while the other fifteen the judge tried all warned. A gap in one branch is
+    what turns a documented rule into a trap."""
     home = home_relay.parent.parent
     if kind == "another repository":
         _git(home, "clone", "-q", str(home_relay.parent), str(other_project))
     written = {"an ancestor": str(home),
                "a home directory": "~",
-               "another repository": str(other_project)}[kind]
+               "another repository": str(other_project),
+               "the relay directory itself": str(home_relay)}[kind]
     (home_relay / "dashboard.json").write_text(json.dumps({"path": written}))
 
     model = relay_model.build(home_relay, now=NOW)
@@ -2900,9 +3431,9 @@ def test_a_path_that_is_not_the_relays_own_project_is_warned_about(
 def test_a_path_the_model_cannot_use_falls_back_to_the_relays_own_project(
         home_relay):
     """Warned about AND ignored, exactly as a `path` that names no directory
-    is: the read falls back to the relay's own project, which is the widest
-    bound `_in_a_repo` would have allowed the written value anyway. Silence
-    left the log empty and the claims unsettled instead."""
+    is: the read comes from the repository git reports for the relay, which the
+    written value never had the standing to redirect. Silence left the log
+    empty and the claims unsettled instead."""
     (home_relay / "dashboard.json").write_text(json.dumps(
         {"path": str(home_relay.parent.parent)}))
     model = relay_model.build(home_relay, now=NOW)
@@ -2915,13 +3446,26 @@ def test_a_path_the_model_cannot_use_falls_back_to_the_relays_own_project(
 
 
 @pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
-def test_the_two_shapes_a_relay_actually_has_are_not_warned_about(
-        home_relay, repo_relay):
-    """The bound narrows, so what it must not break is asserted beside it: a
-    live relay is `<project>/.relay` and a fixture relay is its own project,
-    and a `path` naming either of those is a coach getting it right."""
-    for relay_dir, written in ((home_relay, str(home_relay.parent)),
-                               (repo_relay, str(repo_relay))):
+def test_every_shape_a_relay_actually_has_is_not_warned_about(
+        tmp_path, home_relay, standalone_relay):
+    """The clause warns, so what it must not warn about is asserted beside it.
+
+    A live relay is `<project>/.relay`; a relay below the repository root is
+    `<repo>/services/<svc>/.relay` and BOTH its container and the repository
+    root are honest labels for its project; a fixture relay is its own project.
+    A `path` naming any of those is a coach getting it right.
+
+    The middle two are the round-5 finding read the other way round: before
+    this leg there was NO value a coach could write at depth that was not
+    warned about, so the warning that fired there was noise over a correct
+    value while the value that was genuinely unusable said nothing.
+    """
+    deep = _branch_point_relay(tmp_path / "deep", depth=2)
+    cases = [(home_relay, str(home_relay.parent)),
+             (deep, str(deep.parent)),
+             (deep, str(deep.parent.parent.parent)),
+             (standalone_relay, str(standalone_relay))]
+    for relay_dir, written in cases:
         (relay_dir / "dashboard.json").write_text(json.dumps({"path": written}))
         model = relay_model.build(relay_dir, now=NOW)
         assert [w for w in model["warnings"] if "`path`" in w] == [], written
@@ -2995,16 +3539,15 @@ def test_a_stash_is_not_a_bound_on_the_walk(tmp_path):
     """`git stash` writes `refs/stash`, and a stash commit's parent is HEAD.
     Used as a bound on the walk it stops it at HEAD, and a supervisor's
     Progress Log loses its unclaimed commits for exactly as long as somebody
-    leaves work stashed. Only the DEFAULT-branch refs bound the walk, so git's
-    own bookkeeping - `refs/stash`, `refs/notes/*`, `refs/bisect/*` - cannot
-    reach it. Asserted on a repository with no default branch, where a scan
-    over every ref would have had nothing else to choose from."""
+    leaves work stashed. NO ref bounds the walk since 2026-08-26 - not git's
+    own bookkeeping and not the default branch either - so there is nothing
+    here for a scan over refs to pick up. Asserted on a repository with no
+    default branch, where such a scan would have had nothing else to choose."""
     relay_dir = _branch_point_relay(tmp_path / "proj", base="trunk")
     project = relay_dir.parent
     (project / "README").write_text("uncommitted work\n")
     _git(project, "stash", "push", "-q", "-m", "work in progress", when=NOW - 4000)
     assert _git(project, "rev-parse", "--verify", "refs/stash").stdout.strip()
-    assert relay_model._default_branch_refs(relay_dir) == []
 
     model = relay_model.build(relay_dir, now=NOW)
     entry = commit_named(model, "alpha: the first leg's own work")
@@ -3017,13 +3560,12 @@ def test_an_annotated_tag_at_head_is_not_a_bound_on_the_walk(tmp_path):
     """A release cut on the run's own branch. A tag at HEAD used as a walk
     bound stops the walk at HEAD, and an ANNOTATED tag points at a tag object
     rather than at the commit, so a scan over every ref had to peel it before
-    it could even tell. Only the default-branch refs bound the walk, so there
-    is nothing here to peel and nothing to get wrong."""
+    it could even tell. No ref bounds the walk now, so there is nothing here to
+    peel and nothing to get wrong."""
     relay_dir = _branch_point_relay(tmp_path / "proj", base="trunk")
     project = relay_dir.parent
     _git(project, "tag", "-a", "-m", "the release", "v1.0", when=NOW - 4000)
     assert _git(project, "cat-file", "-t", "refs/tags/v1.0").stdout.strip() == "tag"
-    assert relay_model._default_branch_refs(relay_dir) == []
 
     model = relay_model.build(relay_dir, now=NOW)
     entry = commit_named(model, "alpha: the first leg's own work")
@@ -3100,20 +3642,14 @@ def test_live_relay_dirs_answers_for_a_candidate_that_is_and_one_that_is_not(
 def _reads_a_repository(relay_dir):
     """Whether the model can confirm a claim for the relay at `relay_dir`.
 
-    The same two steps `build()` takes, in the same order: a `path` a coach
-    wrote decides which project is read, and `_in_a_repo` decides whether that
-    project holds a repository at all. Outside one, nothing on disk can confirm
-    a claim and there are no commit entries to compare rows against.
+    The same step `build()` takes: git is asked what work tree the relay is in
+    (`_repo_dir`). It used to run `dashboard.json.path` through `_project_dir`
+    first, because a coach's untrusted string bounded the read; it no longer
+    bounds anything, which is the whole of the 2026-08-26 amendment. Outside a
+    repository nothing on disk can confirm a claim and there are no commit
+    entries to compare rows against.
     """
-    relay_dir = Path(relay_dir)
-    written = None
-    try:
-        written = json.loads((relay_dir / "dashboard.json").read_text()).get("path")
-    except (OSError, ValueError, AttributeError):
-        written = None
-    project = relay_model._project_dir(
-        written if isinstance(written, str) else None, relay_dir, [])
-    return relay_model._in_a_repo(relay_dir, project)
+    return relay_model._repo_dir(Path(relay_dir)) is not None
 
 
 def assert_the_model_agrees_with_itself(model, relay_dir):
@@ -3179,8 +3715,8 @@ def test_the_log_and_the_rows_agree_on_every_fixture_read_in_place(name):
 
     What this adds over the copy above is the real path, and the answer it
     asserts is that NONE of the host repository's commits reach a fixture's
-    log: `_in_a_repo` stops the walk at the relay's own project, and no fixture
-    holds a `.git`. It does NOT settle a claim against a repository, and the
+    log: a relay directory that is its own project owns only the repository
+    ROOTED AT IT, and no fixture holds a `.git`. It does NOT settle a claim against a repository, and the
     wording here used to say it did - so the arm is asserted rather than
     narrated. The reading that does settle a claim is
     `test_the_log_and_the_rows_agree_in_the_git_corpus` below.
@@ -3481,28 +4017,34 @@ def test_a_repository_that_abbreviates_wider_than_seven_still_attributes(
     assert_the_model_agrees_with_itself(model, relay_dir)
 
 
-def test_the_repository_bound_may_only_be_narrowed_by_the_project(tmp_path):
-    """`_in_a_repo` at its own seam. `project` comes from `dashboard.json.path`
-    and is untrusted, so it may NARROW the search for a `.git` and never widen
-    it: the two shapes a relay has are its own directory and `<project>/.relay`,
-    and anything else clamps back to the relay directory.
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_written_path_cannot_redirect_the_read_at_all(home_relay, other_project):
+    """The seam the untrusted `path` used to sit on, asserted as the stronger
+    property that replaced it.
 
-    Asserted here rather than only through `build()`, because `_project_dir`
-    now refuses a foreign path before this bound is ever reached - so the two
-    guards mask each other end to end, and reverting either one alone left the
-    suite green."""
-    host = tmp_path / "host"
-    (host / ".git").mkdir(parents=True)
-    relay_dir = host / "a" / "b" / ".relay"
-    relay_dir.mkdir(parents=True)
+    `path` used to BOUND where a `.git` was looked for, so the guard was that
+    it could only ever narrow. It no longer bounds anything: git answers which
+    work tree the relay is in, and a string in a JSON file is not consulted.
+    A coach cannot widen the read to another repository, and cannot switch it
+    off either - which is what the old clamp did, silently.
 
-    assert relay_model._in_a_repo(relay_dir, str(host)) is False
-    assert relay_model._in_a_repo(relay_dir, "/") is False
-    assert relay_model._in_a_repo(relay_dir, str(relay_dir.parent)) is False
-    (relay_dir.parent / ".git").mkdir()       # the live `<project>/.relay`
-    assert relay_model._in_a_repo(relay_dir, str(relay_dir.parent)) is True
-    (relay_dir / ".git").mkdir()              # a relay that is its own project
-    assert relay_model._in_a_repo(relay_dir, str(relay_dir)) is True
+    Asserted through `build()` and at the seam, because the two used to mask
+    each other: `_project_dir` refused a foreign path before the clamp was
+    reached, and reverting either alone left the suite green.
+    """
+    home = home_relay.parent.parent
+    _git(home, "clone", "-q", str(home_relay.parent), str(other_project))
+    _git(other_project, "commit", "-q", "--allow-empty",
+         "-m", "elsewhere: another project's work", when=NOW - 3500)
+
+    read = str(relay_model._repo_dir(home_relay))
+    for written in (str(other_project), str(home), "~", str(home_relay), None):
+        (home_relay / "dashboard.json").write_text(json.dumps(
+            {} if written is None else {"path": written}))
+        model = relay_model.build(home_relay, now=NOW)
+        assert str(relay_model._repo_dir(home_relay)) == read, written
+        assert commit_named(model, "alpha: the leg's work") is not None, written
+        assert commit_named(model, "elsewhere: another project's work") is None
 
 
 @pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
