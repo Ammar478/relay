@@ -5,8 +5,8 @@ and a rectangle, and it draws. The split matters because six view legs run in
 parallel on top of this file: a view that needed to reach past its `Pane` to
 place something would be a view that can collide with another view's pane.
 
-Three invariants this module holds for every view
--------------------------------------------------
+Four invariants this module holds for every view
+------------------------------------------------
 1. **Everything is clipped, nothing raises.** `Pane.line()` truncates to the
    pane's width, ignores a row outside the pane, and swallows the `curses.error`
    a write at the screen's last cell raises. "Degrade, not crash" is enforced
@@ -19,6 +19,11 @@ Three invariants this module holds for every view
 3. **All arithmetic is from the live terminal size.** `Canvas` is handed a
    rectangle measured from `getmaxyx()` at every repaint. There is no constant
    here that is a width.
+4. **Nothing drawn is a control character.** Every string a view hands over is
+   relay prose — a leg goal, a commit subject, a coach's log line, a warning —
+   and all of it is hand-written into `.relay/`. `Canvas.write()` is the one
+   place text becomes cells, so it is the one place a control character stops
+   being one. See `sanitise()`.
 
 Layout
 ------
@@ -35,6 +40,7 @@ is happening right now is the last thing to go.
 """
 
 import curses
+import functools
 
 from . import theme as theme_tokens
 
@@ -67,6 +73,66 @@ LEGEND = (
 # --------------------------------------------------------------------------
 # text
 # --------------------------------------------------------------------------
+
+
+#: Every code point a terminal reads as an instruction rather than as text:
+#: C0 (`0x00`-`0x1F`, which is NUL, BS, TAB, LF, CR and ESC), DEL, and the C1
+#: range (`0x80`-`0x9F`) that a UTF-8 terminal decodes straight back into
+#: single-byte controls — `0x9B` is CSI, so `\x9b31m` is `ESC[31m` spelled
+#: another way. An escape sequence can only *begin* with ESC or a C1, and every
+#: byte that would *continue* one is ordinary printable text once its
+#: introducer is gone. So this range is the whole of the problem, and what is
+#: not in it — an em-dash, CJK, box drawing — is prose and must survive
+#: untouched (ACC-DATA-007).
+CONTROL_ORDINALS = (tuple(range(0x00, 0x20)) + (0x7F,)
+                    + tuple(range(0x80, 0xA0)))
+
+
+@functools.lru_cache(maxsize=4)
+def _control_table(placeholder):
+    """The `str.translate` table for one placeholder, built once.
+
+    Cached because `write()` is called a few hundred times per repaint and
+    there are two placeholders in the whole program — the UTF-8 mark and its
+    ASCII fallback. Keyed by the placeholder rather than shared, because a
+    cache that answered with whichever table it built first would draw the
+    UTF-8 mark under a locale that cannot encode it, and curses turns that
+    into a blank — a strip by another route.
+    """
+    return dict.fromkeys(CONTROL_ORDINALS, placeholder)
+
+
+def sanitise(text, placeholder):
+    """`text` with every control character replaced by one `placeholder` cell.
+
+    **One cell, not two, and never none.** The three candidate answers were
+    strip, escape (`^[`, `\\x1b`) and substitute:
+
+    * Stripping is the lie this project keeps refusing. A goal that quietly
+      loses four characters reads as a goal its author wrote that way, and a
+      supervisor has no way to tell prose from prose-with-something-removed.
+    * Escaping is what ncurses does for you if you let a control character
+      through — `addstr` renders ESC as `^[` — and it costs a cell. Every
+      width computation in this package (`clip`, `wrap`, `Pane.right`,
+      `Pane.header`, `overview._fit`, `attention._item_rows`) counts Python
+      characters and spends them as cells. Two cells for one character makes
+      each of those quietly wrong, and the observable end of that is the
+      reserved last column: a goal with sixty ESCs in it ran a row to the
+      margin and wrapped into the pane below, which is invariant 2 gone and
+      `Frame.assert_within_width()` unable to certify *any* frame in the
+      repository.
+
+    So the substitution is one character for one character. Nothing upstream
+    of here has to know it happened, `len()` stays the cell count everywhere,
+    and the placeholder is visible: a reader sees that something was in the
+    text without being told what a `0x9B` is.
+
+    `placeholder` comes from the theme (`glyph("control")`) so that it
+    degrades with every other glyph — under a locale that cannot encode the
+    UTF-8 mark, curses would drop it to a blank, and a blank is stripping by
+    another route.
+    """
+    return text.translate(_control_table(placeholder))
 
 
 def clip(text, width, ellipsis="…"):
@@ -214,9 +280,18 @@ class Canvas:
         Never raises: a row or column outside the canvas draws nothing, and the
         `curses.error` that a write ending at the screen's last cell raises is
         swallowed after the cells have landed.
+
+        This is also where a control character stops being one, because this is
+        the only place in the package where text reaches the window — every
+        `Pane` method, every band, every rule label comes through here. A guard
+        that lives at one choke point can be *proved* to cover every path;
+        `tests/test_chrome.py` sweeps the package for a second `addstr` for
+        exactly that reason. See `sanitise()` for why it substitutes rather
+        than strips or escapes.
         """
         if not text or not (0 <= row < self.height) or col >= self.width:
             return 0
+        text = sanitise(str(text), self.theme.glyph("control"))
         if col < 0:
             text = text[-col:]
             col = 0

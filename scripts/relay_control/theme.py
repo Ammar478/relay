@@ -156,6 +156,12 @@ _FLAGS = {
 
 #: The five status glyphs ACC-TUI-006 names, plus the punctuation the chrome
 #: draws. One table, so a view never writes a literal `✓`.
+#:
+#: `control` is the odd one out: it is not punctuation a view asks for but the
+#: mark `chrome.sanitise()` leaves where a control character was. It is here
+#: rather than in `chrome.py` so that it degrades with everything else — under
+#: a locale that cannot encode it, curses would drop the mark to a blank and
+#: the substitution would become a silent deletion.
 GLYPHS = {
     "completed": "✓",
     "running": "●",
@@ -171,6 +177,7 @@ GLYPHS = {
     "bar_fill": "█",
     "bar_empty": "░",
     "updown": "↑↓",
+    "control": "▯",
 }
 
 #: What each glyph becomes when the locale cannot encode it. Still five
@@ -190,6 +197,7 @@ ASCII_GLYPHS = {
     "bar_fill": "#",
     "bar_empty": "-",
     "updown": "up/dn",
+    "control": "?",
 }
 
 
