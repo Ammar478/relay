@@ -216,6 +216,30 @@ def test_bold_and_reverse_are_recorded_separately():
     assert frame.attrs_at(0, 0).reverse is False
 
 
+def test_a_parameter_that_is_not_a_number_is_not_parameter_zero():
+    """An OMITTED parameter is 0, and 0 is a reset. One that is *there* and is
+    not a number is neither.
+
+    Reading the second as the first turned an unknown parameter into a full
+    reset: the model dropped attributes the terminal was still showing, so
+    `assert_attrs(..., has="bold")` failed and `lacks="bold"` passed, both
+    about a screen that never existed. Unknown parameters are recorded in
+    `other` and obeyed by nothing — the rule this file already states, applied
+    to the one shape that was exempt from it.
+    """
+    kept = feed("\x1b[1;7;99m\x1b[1;>2mSTILL").frame().attrs_for("STILL")
+    assert kept.bold is True and kept.reverse is True
+    assert kept.other == frozenset({99, ">2"})
+    # ...and both reach a failure message, which is where a reader meets them:
+    # an unreadable parameter sits in the same set as an unmodelled numeric one
+    assert kept.describe() == "bold+reverse other=99,>2"
+    # while the omitted parameter really does still reset, either spelling
+    assert feed("\x1b[1;7m\x1b[mPLAIN").frame().attrs_for("PLAIN") \
+        == DEFAULT_ATTRS
+    assert feed("\x1b[1;7m\x1b[0mPLAIN").frame().attrs_for("PLAIN") \
+        == DEFAULT_ATTRS
+
+
 def test_sgr_reset_returns_cells_to_default():
     for reset in ("\x1b[0m", "\x1b[m"):
         screen = feed("\x1b[1;31;44mHOT" + reset + "COLD")

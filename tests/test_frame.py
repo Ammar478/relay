@@ -24,6 +24,8 @@ from frame import (  # noqa: E402
     PAINT_EXITED,
     PAINT_QUIET,
     PAINT_SYNCHRONISED,
+    PAINT_TORN,
+    PAINT_UNSOUND,
     Frame,
     Screen,
     TerminalSession,
@@ -335,8 +337,13 @@ try:
         sys.stdout.write("\x1b[?2026h\x1b[2J\x1b[1;1HPANE header\x1b[?2026l")
         flushed()
         os.read(fd, 64)
+        # The answer is bracketed too, and pauses inside its bracket for
+        # longer than any quiet window: only the SECOND close can be the one
+        # that ends a wait which is honest about which repaint it waited for.
+        sys.stdout.write("\x1b[?2026h")
+        sys.stdout.flush()
         time.sleep(delay)
-        sys.stdout.write("\x1b[3;1HBODY middle")
+        sys.stdout.write("\x1b[3;1HBODY middle\x1b[?2026l")
         sys.stdout.flush()
     elif mode == "chatty":
         sys.stdout.write("\x1b[2J\x1b[HREADY")
@@ -373,6 +380,141 @@ try:
             time.sleep(delay)
             sys.stdout.write("\x1b[5;1HFOOT bottom")
             sys.stdout.flush()
+    os.read(fd, 1)
+finally:
+    termios.tcsetattr(fd, termios.TCSADRAIN, old)
+'''
+
+# A program whose DEC 2026 brackets are not what closing a bracket is supposed
+# to mean. Each mode is one shape the sequence can arrive in that vouches for
+# nothing, and each is written in ONE flush wherever the point is what the
+# harness sees in a single read:
+#
+#   honest-empty a bracket with nothing between its halves and nothing painted
+#                outside one either — a repaint that found nothing to change,
+#                which is what a TUI sends on a keystroke it ignores. It is
+#                telling the truth and has to stay proof.
+#   empty        a bracket with nothing between its halves, flushed together
+#                with the text a caller waits for, and the real answer only
+#                `delay` later. Nothing was painted inside it, so it says
+#                nothing about the repaint being waited for. The second
+#                keystroke is the honest form of the same program: a bracket
+#                that does enclose a repaint, and pauses inside it.
+#   forged       the closing bytes arrive as part of what the program is
+#                DRAWING — a line of prose quoting the sequence — in the same
+#                write as the program's own close, so the second close is one
+#                the program never opened.
+#   forged-late  the same forgery with the program's own close a `delay`
+#                later, which is the residual case: at the first close there
+#                is nothing yet to show it was not one.
+#   stray        the closing bytes in printed text with no repaint open at all.
+#   reopen       an opening sequence inside an already-open bracket.
+#   reopen-held  the same, and then the program stops writing without ever
+#                closing: the bracket that is "open" is one it may never have
+#                opened, so waiting for its close is waiting on nothing.
+#   stray-then-honest
+#                the closing bytes in printed text, and then a repaint
+#                bracketed impeccably. The second one is not readable either.
+#   stray-exit   the closing bytes in printed text, and then the program exits.
+#                Nothing more can arrive, which used to be proof on its own.
+#   torn         the program exits inside an open bracket, half a screen in.
+DEMO_BRACKETS = r'''
+import fcntl
+import os
+import select
+import struct
+import sys
+import termios
+import time
+import tty
+
+mode = sys.argv[1]
+delay = float(sys.argv[2])
+
+OPEN = "\x1b[?2026h"
+SHUT = "\x1b[?2026l"
+
+fd = sys.stdin.fileno()
+old = termios.tcgetattr(fd)
+tty.setraw(fd)
+
+
+def out(text):
+    sys.stdout.write(text)
+    sys.stdout.flush()
+
+
+def flushed():
+    """Wait until the terminal has taken everything written so far."""
+    sys.stdout.flush()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            queued = struct.unpack(
+                "i", fcntl.ioctl(1, termios.TIOCOUTQ, b"\0" * 4))[0]
+        except Exception:
+            time.sleep(0.01)
+            return
+        if queued == 0:
+            return
+        time.sleep(0.0002)
+
+
+def take_key():
+    flushed()
+    os.read(fd, 64)
+
+
+try:
+    out("\x1b[2J\x1b[HREADY")
+    take_key()
+    if mode == "empty":
+        out("\x1b[2J\x1b[1;1HPANE header" + OPEN + SHUT)
+        time.sleep(delay)
+        out("\x1b[3;1HBODY middle")
+        # ...and then the honest bracket: opened before the next key is read,
+        # so the wait for it begins inside one, and closed only after a pause
+        # longer than any quiet window the test uses.
+        select.select([fd], [], [], 5)
+        out(OPEN + "\x1b[2J\x1b[1;1HPANE header")
+        take_key()
+        time.sleep(delay)
+        out("\x1b[5;1HFOOT bottom" + SHUT)
+    elif mode == "honest-empty":
+        out(OPEN + SHUT)
+    elif mode == "forged":
+        out(OPEN + "\x1b[2J\x1b[1;1HPANE header"
+            + "\x1b[3;1Hdoc: " + SHUT + " ends a repaint"
+            + "\x1b[5;1HBODY middle" + SHUT)
+    elif mode == "forged-late":
+        out(OPEN + "\x1b[2J\x1b[1;1HPANE header\x1b[3;1Hdoc: " + SHUT)
+        time.sleep(delay)
+        out("\x1b[5;1HBODY middle" + SHUT)
+    elif mode == "stray":
+        out("\x1b[2J\x1b[1;1HPANE header"
+            + "\x1b[3;1Hdoc: " + SHUT + " ends a repaint")
+    elif mode == "reopen":
+        out(OPEN + "\x1b[2J\x1b[1;1HPANE header"
+            + "\x1b[3;1Hdoc: " + OPEN + " begins one"
+            + "\x1b[5;1HBODY middle" + SHUT)
+    elif mode == "reopen-held":
+        out(OPEN + "\x1b[2J\x1b[1;1HPANE header"
+            + "\x1b[3;1Hdoc: " + OPEN + " begins one")
+    elif mode == "stray-then-honest":
+        out("\x1b[2J\x1b[1;1HPANE header\x1b[3;1Hdoc: " + SHUT + " ends one")
+        select.select([fd], [], [], 5)
+        out(OPEN + "\x1b[2J\x1b[1;1HPANE header")
+        take_key()
+        time.sleep(delay)
+        out("\x1b[5;1HFOOT bottom" + SHUT)
+    elif mode == "stray-exit":
+        out("\x1b[2J\x1b[1;1HPANE header\x1b[3;1Hdoc: " + SHUT + " ends one")
+        flushed()
+        raise SystemExit(0)
+    elif mode == "torn":
+        out(OPEN + "\x1b[2J\x1b[1;1HPANE header")
+        flushed()
+        raise SystemExit(0)
     os.read(fd, 1)
 finally:
     termios.tcsetattr(fd, termios.TCSADRAIN, old)
@@ -583,6 +725,11 @@ def slow(program):
 @pytest.fixture
 def noisy(program):
     return program("noisy", DEMO_NOISY)
+
+
+@pytest.fixture
+def brackets(program):
+    return program("brackets", DEMO_BRACKETS)
 
 
 def session(path, *args, **kwargs):
@@ -866,12 +1013,64 @@ def test_synchronized_output_brackets_are_tracked():
     screen.feed(" DONE\x1b[?2026l")
     assert screen.synchronized_update is False
     assert screen.synchronized_updates == 1
+    assert screen.unbracketed_paints == 0         # all of it drawn inside one
+    assert screen.synchronized_faults == 0
     assert screen.lines()[0].rstrip() == "HALF DONE"
-    # a close with nothing open is not an update, and neither is a re-open
+    # a close with nothing open is not an update, and neither is a re-open.
+    # Both are also sequences a program bracketing its repaints cannot send,
+    # which is a fact about the byte stream that no count of well-formed
+    # brackets can express — so it gets a count of its own.
     screen.feed("\x1b[?2026l\x1b[?2026h\x1b[?2026h")
     assert screen.synchronized_updates == 1
+    assert screen.synchronized_faults == 2
     screen.feed("\x1b[?2026l")
     assert screen.synchronized_updates == 2
+    assert screen.synchronized_faults == 2
+
+
+def test_painting_outside_a_bracket_is_counted():
+    """`unbracketed_paints` is what makes a close a statement about the SCREEN.
+
+    `ESC[?2026l` vouches for the bracket it closes. It vouches for the whole
+    screen only if the program draws nothing outside one — which is a property
+    of the program, and this count is the observable part of it. Without it,
+    painting the heading and flushing an empty bracket beside it ended a wait
+    on the strongest label the harness has, with the answer still undrawn.
+
+    An empty bracket is not itself counted as anything: a repaint that found
+    nothing to change brackets too, and is telling the truth.
+    """
+    screen = Screen(5, 20)
+    screen.feed("\x1b[?2026h\x1b[?2026l")
+    assert screen.synchronized_updates == 1
+    assert screen.unbracketed_paints == 0
+    assert screen.synchronized_faults == 0
+    # moving the cursor and changing the pen are not painting: they change how
+    # the NEXT thing is drawn, and the screen is untouched
+    screen.feed("\x1b[3;5H\x1b[1;31m")
+    assert screen.unbracketed_paints == 0
+    # every way of putting something on the screen counts, and a text-only
+    # definition of "painting" would miss all but the first
+    for sequence in ("X", "\x1b[2J", "\x1b[K", "\x1b[3X", "\x1b[L", "\x1b[M",
+                     "\x1b[P", "\x1b[@", "\x1b[S", "\x1b[T"):
+        before = screen.unbracketed_paints
+        screen.feed(sequence)
+        assert screen.unbracketed_paints > before, repr(sequence)
+        # ...and none of them counts while a bracket is open
+        held = screen.unbracketed_paints
+        screen.feed("\x1b[?2026h" + sequence + "\x1b[?2026l")
+        assert screen.unbracketed_paints == held, repr(sequence)
+    # taking the alternate screen and giving it back each replace every
+    # visible cell, so both are painting, and the second is the one a curses
+    # child does on the way out
+    before = screen.unbracketed_paints
+    screen.feed("\x1b[?1049h")
+    assert screen.unbracketed_paints == before + 1
+    screen.feed("\x1b[?1049l")
+    assert screen.unbracketed_paints == before + 2
+    held = screen.unbracketed_paints
+    screen.feed("\x1b[?2026h\x1b[?1049h\x1b[?1049l\x1b[?2026l")
+    assert screen.unbracketed_paints == held
 
 
 def test_the_alternate_screen_is_kept_when_the_program_gives_it_back():
@@ -889,6 +1088,58 @@ def test_the_alternate_screen_is_kept_when_the_program_gives_it_back():
 def test_osc_title_is_consumed():
     screen = feed("\x1b]0;a window title\x07VISIBLE")
     assert screen.lines()[0].rstrip() == "VISIBLE"
+
+
+def test_an_escape_that_aborts_a_string_begins_a_sequence_rather_than_text():
+    """A frame that shows what no terminal showed is a wrong artefact.
+
+    An `ESC` inside an OSC is the string's terminator only when `\\` follows
+    it; anything else aborts the string and begins a sequence of its own,
+    which is what a terminal does with it. Consuming the escape *and* the byte
+    after it swallowed only the `[` of the sequence that followed, so `1;1H`
+    was drawn into the text plane — escape bytes rendered as content, which is
+    the one thing this emulator exists to prevent, and a human reading the
+    captured frame would take them for something the program printed.
+    """
+    screen = feed("\x1b]0;a window title\x1b[1;1HTOP")
+    assert screen.lines()[0].rstrip() == "TOP"
+    assert "1;1H" not in screen.lines()[0]
+    # both proper terminators still end the string, and still draw
+    assert feed("\x1b]0;title\x1b\\NEXT").lines()[0].rstrip() == "NEXT"
+    assert feed("\x1b]0;title\x07BELL").lines()[0].rstrip() == "BELL"
+    # and the aborting sequence is obeyed, not merely swallowed
+    aborted = feed("\x1b]52;c;\x1b[2;3HDEEP")
+    assert aborted.lines()[1].rstrip() == "  DEEP"
+
+
+def test_a_combining_mark_joins_the_cell_it_follows():
+    """Deleting it rewrote the program's text.
+
+    A zero-width mark occupies no column, which is why the column arithmetic
+    ignores it — that is not a reason to drop it. Dropped, `cafe` + U+0301
+    reached a frame as `cafe`, so an assertion on the accented word could not
+    pass against a program that draws the decomposed form, and every evidence
+    artefact carried a word the terminal never showed. Written out in escapes
+    below, because the two spellings of it are one byte string apart and a
+    test for this one cannot afford to be read wrong.
+    """
+    screen = feed("cafe\u0301 au lait")
+    assert screen.lines()[0].rstrip() == "cafe\u0301 au lait"
+    # no column of its own: it rides the cell before it, and what follows sits
+    # where a terminal puts it
+    assert screen.cells()[0][3] == "e\u0301"
+    assert screen.cells()[0][4] == " "
+    assert display_width(screen.lines()[0].rstrip()) == len("cafe au lait")
+    # a mark following a wide character belongs to the character, not to the
+    # placeholder cell standing in for its second column
+    wide = feed("\u65e5\u0301X")
+    assert wide.cells()[0][0] == "\u65e5\u0301"
+    assert wide.cells()[0][2] == "X"
+    # and one with nothing in front of it cannot join anything
+    assert feed("\u0301A").lines()[0].rstrip() == "A"
+    # REP repeats the cell, not the base character it was written from: a
+    # terminal repeats what it last drew, and what it last drew is accented
+    assert feed("e\u0301\x1b[2b").lines()[0].rstrip() == "e\u0301e\u0301e\u0301"
 
 
 def test_charset_designation_is_consumed():
@@ -1784,16 +2035,336 @@ def test_a_bracket_closed_before_the_key_was_read_does_not_end_the_wait(noisy):
     that repaint cannot be the answer to the key. Crediting it would end the
     wait before the program had drawn anything and stamp the frame with the
     strongest label the harness has.
+
+    Both halves of that are asserted here, and the second is what makes this
+    test about the mechanism rather than about the baseline timing: the
+    program's *answer* is bracketed too, and pauses inside its bracket for six
+    quiet windows. So the frame that comes back has to be the one the second
+    close ended — proved, and carrying the text that was drawn during the
+    pause. A harness that credited the stale bracket returns before the pause
+    with neither; a harness with no DEC 2026 at all returns at the quiet
+    window with neither.
     """
     with session(noisy, "sync-stale", "0.3", rows=10, cols=60,
-                 redraw=3.0) as term:
+                 paint=0.05, redraw=3.0) as term:
         term.wait_for("READY")
-        frame = term.send("x", expect="PANE header", quiet=0.5)
-    assert frame.paint_end == PAINT_QUIET, (
+        frame = term.send("x", expect="PANE header")
+    assert frame.contains("BODY middle"), (
         "a bracket that closed before the key was read was taken for the "
-        "answer to it"
+        "answer to it: %s" % frame.text
     )
-    assert frame.contains("BODY middle"), frame.text
+    assert frame.paint_end == PAINT_SYNCHRONISED, (
+        "the wait ended somewhere other than the close of the repaint that "
+        "answered the key"
+    )
+    frame.assert_finished()
+
+
+# --------------------------------------------------------------------------
+# What a closed bracket does *not* prove.
+#
+# `paint_end == "synchronised"` is an API making a claim about certainty, and
+# the claim is only worth the narrowest reading of what the sequence says. A
+# terminal reads `ESC [ ? 2026 l` as "the repaint I opened is complete"; it
+# does not read it as "a repaint happened", it cannot tell the program's own
+# sequence from the same bytes arriving as *content*, and a program that dies
+# between the two halves never said anything at all.
+#
+# Each shape below reached `assert_finished()` as proof. Each one now has a
+# name that says what it is worth, and `assert_finished()` refuses all of
+# them. The one that cannot be caught in time is caught before the session is
+# allowed to end.
+# --------------------------------------------------------------------------
+
+
+def test_a_close_that_does_not_cover_what_was_painted_is_not_the_end_of_it(
+        brackets):
+    """A bracket vouches for the bracket. The screen is a wider claim.
+
+    The program flushes the heading a caller waits for and, beside it, an
+    empty `ESC[?2026h ESC[?2026l` — a well-formed close, its own, honestly
+    meaning "the repaint I opened is complete". The repaint it opened drew
+    nothing; the painting on the screen happened OUTSIDE it, and the answer to
+    the keystroke is a third of a second away. Crediting the close ended the
+    wait before the answer existed, on the strongest label the harness has.
+
+    What separates this from the honest empty bracket a TUI sends when a
+    repaint finds nothing to change is exactly one observable thing: whether
+    anything was painted outside a bracket. Here something was.
+
+    The second keystroke is the same program doing it properly — everything
+    inside the bracket, pausing six quiet windows in the middle — and it is
+    here so this test fails if 2026 stops being read at all rather than only
+    when it is read too widely.
+    """
+    with session(brackets, "empty", "0.3", rows=10, cols=60,
+                 paint=0.05, redraw=3.0) as term:
+        term.wait_for("READY")
+        frame = term.send("x", expect="PANE header")
+        assert not frame.contains("BODY middle"), frame.text
+        assert frame.paint_end == PAINT_QUIET, (
+            "a close that covered none of the painting on the screen was "
+            "taken for the end of a repaint that had not started"
+        )
+        assert frame.paint_finished is False
+        with pytest.raises(AssertionError) as excinfo:
+            frame.assert_finished()
+        assert "not proof" in str(excinfo.value)
+
+        whole = term.send("x", expect="PANE header")
+        assert whole.contains("FOOT bottom"), whole.text
+        assert whole.paint_end == PAINT_SYNCHRONISED
+        whole.assert_finished()
+
+
+def test_a_repaint_that_found_nothing_to_change_still_ends_the_wait(brackets):
+    """The empty bracket that is telling the truth, and has to stay proof.
+
+    A TUI given a keystroke it ignores composes the same screen and brackets
+    it, and its curses layer finds no difference to send — so the bracket is
+    empty. The screen is whole: it is the screen that was already there, and
+    the program said so. Roughly forty visual checks in this project are
+    judged off frames taken exactly that way, so a rule that refused an empty
+    bracket outright would quietly drop all of them back to a 0.2s guess.
+
+    Which is why the rule is about painting the close did not cover, and not
+    about the bracket being empty.
+    """
+    with session(brackets, "honest-empty", "0.3", rows=10, cols=60,
+                 paint=0.05, redraw=3.0) as term:
+        term.wait_for("READY")
+        frame = term.send("x", expect="READY")
+        assert frame.paint_end == PAINT_SYNCHRONISED, (
+            "a repaint that found nothing to change was refused its own "
+            "statement that the screen is whole"
+        )
+        frame.assert_finished()
+
+
+def test_bracket_bytes_the_program_printed_are_not_the_program_speaking(
+        brackets):
+    """A close the program never opened is not proof of anything.
+
+    This is the shape a relay's own prose walks into: a pane rendering a log
+    line, a fixture or a baton that *quotes* `ESC[?2026l` puts those bytes on
+    the wire, and no terminal can tell them from the program's own sequence.
+    Here they land mid-repaint, in the same write as the program's real close
+    — so the real close is one with nothing open, the brackets do not balance,
+    and everything the harness thought it read about this repaint is worth
+    nothing.
+
+    It reports that instead of proof, and refuses to let the session end
+    quietly: a child that puts bracket bytes on the wire as content makes
+    every 2026 claim it has ever made unreadable, including ones already
+    handed over as frames.
+    """
+    captured = []
+    with pytest.raises(AssertionError) as teardown:
+        with session(brackets, "forged", "0.3", rows=10, cols=60,
+                     paint=0.05, redraw=3.0) as term:
+            term.wait_for("READY")
+            captured.append(term.send("x", expect="PANE header"))
+    frame = captured[0]
+    assert frame.paint_end == PAINT_UNSOUND, (
+        "a close the program never opened was taken for the end of a repaint"
+    )
+    assert frame.paint_finished is False
+    with pytest.raises(AssertionError) as excinfo:
+        frame.assert_finished()
+    message = str(excinfo.value)
+    assert "not proof" in message
+    assert "did not balance" in message      # and this ending's own advice
+    assert "quiet window" not in message
+    assert "2026" in str(teardown.value)
+    assert "did not balance" in str(teardown.value)
+
+
+def test_a_close_with_no_repaint_open_is_not_the_end_of_one(brackets):
+    """The same forgery with no repaint in progress at all.
+
+    Nothing was open, so nothing closed, and the wait falls back on silence —
+    which would have been reported as the honest guess it is. It is worse than
+    that: a program whose *text* carries bracket bytes is a program whose text
+    the emulator has been interpreting as control, so the screen itself is
+    suspect. The frame says so rather than saying `quiet`.
+    """
+    captured = []
+    with pytest.raises(AssertionError) as teardown:
+        with session(brackets, "stray", "0.3", rows=10, cols=60,
+                     paint=0.05, redraw=3.0) as term:
+            term.wait_for("READY")
+            captured.append(term.send("x", expect="PANE header"))
+    assert captured[0].paint_end == PAINT_UNSOUND
+    assert captured[0].paint_finished is False
+    assert "did not balance" in str(teardown.value)
+
+
+def test_a_bracket_opened_inside_a_bracket_is_not_the_end_of_one(brackets):
+    """The other half of the same forgery: an open that is not one.
+
+    The program opens a repaint, draws, and its own drawing carries a second
+    `ESC[?2026h`. The close that follows is well formed and encloses painting,
+    so every other test here would call it proof — but a bracket structure
+    that cannot nest and did is not the program stating anything a terminal
+    can read.
+    """
+    captured = []
+    with pytest.raises(AssertionError) as teardown:
+        with session(brackets, "reopen", "0.3", rows=10, cols=60,
+                     paint=0.05, redraw=3.0) as term:
+            term.wait_for("READY")
+            captured.append(term.send("x", expect="PANE header"))
+    assert captured[0].paint_end == PAINT_UNSOUND
+    assert captured[0].paint_finished is False
+    assert "did not balance" in str(teardown.value)
+
+
+def test_a_program_that_printed_bracket_bytes_is_not_believed_afterwards(
+        brackets):
+    """A fault is not an event in one repaint. It is a fact about the program.
+
+    The stream carried bracket bytes as content once, which means this
+    program's prose reaches the terminal unescaped — so the next repaint's
+    close is the same two candidates it always was, and the emulator has been
+    taking that prose for control the whole time. The repaint here is
+    bracketed impeccably and pauses inside its bracket, so every other test in
+    this file would call it proof. It is not.
+    """
+    captured = []
+    with pytest.raises(AssertionError) as teardown:
+        with session(brackets, "stray-then-honest", "0.3", rows=10, cols=60,
+                     paint=0.05, redraw=3.0) as term:
+            term.wait_for("READY")
+            term.send("x", expect="PANE header")
+            captured.append(term.send("x", expect="PANE header"))
+    frame = captured[0]
+    assert frame.paint_end == PAINT_UNSOUND, (
+        "a program that had already printed bracket bytes was believed the "
+        "next time it closed one"
+    )
+    # and the wait did not sit out the impeccable bracket to get there: it
+    # stopped at the fault, because that bracket's close means nothing
+    assert not frame.contains("FOOT bottom"), frame.text
+    assert frame.paint_finished is False
+    assert "did not balance" in str(teardown.value)
+
+
+def test_a_bracket_that_may_never_have_been_opened_is_not_waited_on(brackets):
+    """Once the brackets are known not to balance, the open one means nothing.
+
+    The program is inside a bracket by the emulator's reckoning, and one of the
+    two opens that put it there is a sequence a repaint-bracketing program
+    cannot send. Waiting for that bracket's close is waiting for a sequence
+    with no meaning behind it — the whole `redraw` window spent, and then a
+    "still writing" failure about a program that has stopped. The wait stops
+    at the fault and says what it found.
+    """
+    captured = []
+    with pytest.raises(AssertionError) as teardown:
+        with session(brackets, "reopen-held", "0.3", rows=10, cols=60,
+                     paint=0.05, redraw=3.0) as term:
+            term.wait_for("READY")
+            captured.append(term.send("x", expect="PANE header"))
+    assert captured[0].paint_end == PAINT_UNSOUND
+    assert captured[0].paint_finished is False
+    assert "did not balance" in str(teardown.value)
+
+
+def test_exiting_proves_the_screen_only_if_the_brackets_were_readable(brackets):
+    """"Nothing more can arrive" is not the only thing `exited` claims.
+
+    It also claims the screen is what the program drew, and the emulator has
+    been taking this program's printed bracket bytes for control all along —
+    so the text plane is not what the program drew. The exit does not repair
+    that, and it used to override it: `exited` is proof, and the frame went
+    back as one.
+    """
+    captured = []
+    with pytest.raises(AssertionError) as teardown:
+        with session(brackets, "stray-exit", "0.3", rows=10, cols=60,
+                     paint=0.05, redraw=3.0) as term:
+            term.wait_for("READY")
+            captured.append(term.send("x", expect="PANE header"))
+    assert captured[0].paint_end == PAINT_UNSOUND, (
+        "a program that printed bracket bytes was believed about its screen "
+        "because it had exited"
+    )
+    assert captured[0].paint_finished is False
+    assert "did not balance" in str(teardown.value)
+
+
+def test_a_program_that_exits_inside_a_bracket_left_a_torn_screen(brackets):
+    """Exiting is proof only when the program was not mid-repaint.
+
+    "The program is gone, so nothing can be added to the screen" is true, and
+    it is the wrong question. This program said "one whole frame begins",
+    drew half of it and died — so the screen is exactly the torn half-paint
+    the whole mechanism exists to exclude, and the program never said
+    otherwise. `exited` claimed it was whole.
+    """
+    with session(brackets, "torn", "0.3", rows=10, cols=60) as term:
+        term.wait_for("READY")
+        frame = term.send("x", expect="PANE header")
+        assert frame.contains("PANE header"), frame.text
+        assert frame.paint_end == PAINT_TORN, (
+            "a screen the program died halfway through drawing was called "
+            "finished because the program was gone"
+        )
+        assert frame.paint_finished is False
+        with pytest.raises(AssertionError) as excinfo:
+            frame.assert_finished()
+        message = str(excinfo.value)
+        assert "not proof" in message
+        assert "PANE header" in message
+        # the advice is this ending's own: "raise the quiet window" would send
+        # a reader after a timing problem that is not there
+        assert "exited INSIDE a bracket" in message
+        assert "quiet window" not in message
+        assert term.wait() == 0
+
+
+def test_a_forgery_the_harness_cannot_see_in_time_still_fails_the_run(
+        brackets):
+    """The residual case, pinned rather than hidden.
+
+    When the forged close and the program's own close arrive in the same read,
+    the brackets are seen not to balance before any frame is handed over. When
+    they do not — the program's close comes a third of a second later — there
+    is nothing at the first close to distinguish it from a real one, and the
+    harness hands back a frame stamped `synchronised` that is half a repaint.
+    That gap is not closable: the bytes are identical and the rest of the
+    program's write has not happened yet.
+
+    What is closable is the run. The unbalanced close lands before the session
+    is allowed to end, and the session refuses to end on it — so the frame is
+    never quietly kept as evidence, even though it was quietly handed over.
+    """
+    captured = []
+    with pytest.raises(AssertionError) as teardown:
+        with session(brackets, "forged-late", "0.3", rows=10, cols=60,
+                     paint=0.05, redraw=3.0) as term:
+            term.wait_for("READY")
+            captured.append(term.send("x", expect="PANE header"))
+            term.read(settle=0.6)        # the program's own close arrives here
+    frame = captured[0]
+    assert frame.paint_end == PAINT_SYNCHRONISED
+    assert not frame.contains("BODY middle"), frame.text
+    assert "did not balance" in str(teardown.value)
+
+
+def test_a_session_that_failed_on_its_own_keeps_its_own_failure(brackets):
+    """The bracket check at the end of a session never masks a real one.
+
+    A refusal raised while the body is already failing would replace the
+    finding a reader needs with a note about the child's escape sequences.
+    """
+    with pytest.raises(AssertionError) as excinfo:
+        with session(brackets, "stray", "0.3", rows=10, cols=60,
+                     paint=0.05, redraw=3.0) as term:
+            term.wait_for("READY")
+            term.send("x", expect="PANE header")
+            raise AssertionError("the finding the test was written for")
+    assert "the finding the test was written for" in str(excinfo.value)
 
 
 def test_a_resize_carries_the_same_boundary_and_the_same_knob(program):

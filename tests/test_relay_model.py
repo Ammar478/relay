@@ -1799,6 +1799,32 @@ def _skip_reasons(source):
     return reasons, opaque
 
 
+#: What pytest itself collects, straight out of its own `python_files`
+#: default. This project sets no `python_files`, so BOTH globs are live and a
+#: sweep that reads only the first one has a hole exactly the width of the
+#: second: a module named `something_test.py` runs in every suite run and is
+#: read by no check here. That is not hypothetical — a module planted in that
+#: shape, carrying a skip reason this machine decides AND a home-directory
+#: read, went green. A sweep is only as wide as what it globs, so this glob is
+#: pytest's, not a convention someone remembered.
+PYTEST_PYTHON_FILES = ("test_*.py", "*_test.py")
+
+
+def _collected_test_modules(directory):
+    """Sorted names of the files pytest would collect from `directory`.
+
+    Its own two globs, deduplicated: `test_a_test.py` matches both and is one
+    module. Split out from `_test_modules_on_disk` so the sweeps' reach can be
+    asserted against a directory planted with the evading shape rather than
+    only against `tests/`, which today happens to contain none of them —
+    the reason the hole survived.
+    """
+    names = set()
+    for pattern in PYTEST_PYTHON_FILES:
+        names |= {p.name for p in Path(directory).glob(pattern)}
+    return sorted(names)
+
+
 def _test_modules_on_disk():
     """`[(name, source)]` for every test module in `tests/`, DERIVED from disk.
 
@@ -1810,9 +1836,12 @@ def _test_modules_on_disk():
     module but these two has no skip at all, and none of them names a home
     directory. So neither can fail on another check's file for a reason that
     file's author would dispute.
+
+    "Every test module" means every module PYTEST runs, not every module named
+    the way this project happens to name them — see `PYTEST_PYTHON_FILES`.
     """
     here = Path(__file__).resolve().parent
-    names = sorted(p.name for p in here.glob("test_*.py"))
+    names = _collected_test_modules(here)
     assert set(SWEPT_TEST_MODULES) <= set(names), names
     assert len(names) >= 5, names
     return [(name, (here / name).read_text()) for name in names]
@@ -1937,6 +1966,39 @@ def test_no_test_module_names_a_path_only_one_machine_has():
     assert [what for _, what in planted] == [
         "expanduser", "~/Documents/Work/x/.relay",
         HOME_ROOTS[0] + "someone/relay", "home"], planted
+
+
+def test_the_sweeps_read_every_module_pytest_runs(tmp_path):
+    """The sweeps below are worth exactly what their glob is worth.
+
+    Both of them used to glob `test_*.py` alone, and pytest collects
+    `*_test.py` as well. A module in that shape is a real module — it runs,
+    its assertions count, its skips are green tests that ran nothing — and it
+    sat outside every check in this file. The reproduction is the planted
+    directory here: the evading name is found, the ordinary one still is, and
+    a helper module that pytest does NOT run is still left alone, because a
+    sweep that read `frame.py` would fail on the harness's own docstring.
+    """
+    for name in ("test_ordinary.py", "sneaky_test.py", "test_both_test.py",
+                 "frame.py", "conftest.py", "notes.txt"):
+        (tmp_path / name).write_text("")
+    assert _collected_test_modules(tmp_path) == [
+        "sneaky_test.py", "test_both_test.py", "test_ordinary.py"]
+
+    # And the sweeps themselves see a module planted in the evading shape,
+    # carrying both things they exist to refuse. Reading them through the same
+    # helper is the point: a fix that widened only one sweep is a fix that
+    # left the other one open.
+    (tmp_path / "evader_test.py").write_text(
+        'import pytest\n'
+        f'LIVE = Path("{HOME_ROOTS[0]}someone/relay")\n'
+        '@pytest.mark.skipif(not LIVE.is_dir(), reason="one laptop has it")\n'
+        'def test_x(): pass\n')
+    source = (tmp_path / "evader_test.py").read_text()
+    assert "evader_test.py" in _collected_test_modules(tmp_path)
+    assert _skip_reasons(source)[0] == {"one laptop has it"}
+    assert [what for _, what in _machine_paths(source)] == [
+        HOME_ROOTS[0] + "someone/relay"]
 
 
 def test_module_does_not_import_curses():

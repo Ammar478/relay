@@ -95,14 +95,23 @@ there; it waits, on two positive signals:
 When is a repaint over?
 -----------------------
 
-Two answers are proof and one is a guess, so every frame `expect=` returns
+Two answers are proof and four are not, so every frame `expect=` returns
 carries `frame.paint_end` saying which it was:
 
 * `"synchronised"` — the program bracketed the repaint in **DEC private mode
   2026**: `ESC [ ? 2026 h` before it, `ESC [ ? 2026 l` after. That closing
   sequence *is* the program saying "the screen is whole", which is the only
   statement about its own painting a terminal can read. The wait ends there.
-* `"exited"` — the program is gone, so nothing can be added to the screen.
+  Three things have to hold before the harness reads it as that statement, and
+  each of them was once missing; see "What a closed bracket does not say".
+* `"exited"` — the program is gone with no repaint open, so nothing can be
+  added to the screen and nothing was left half-drawn.
+* `"torn"` — the program is gone, but it died **inside** a bracket it had
+  opened. Nothing more can arrive and the program never said the screen was
+  whole, so this is the one screen a terminal knows is half a repaint. Kept as
+  evidence of exactly that; not proof.
+* `"unsound"` — the program's brackets did not balance. Not proof, and worse
+  than silence; see below.
 * `"quiet"` — it stopped writing for `paint` (0.2s). **This is a heuristic and
   the API does not pretend otherwise.** A program that pauses longer than that
   inside one repaint — clear the screen, draw the title, pause, draw the body —
@@ -112,11 +121,49 @@ carries `frame.paint_end` saying which it was:
   that separates a pause from an ending: `FIONREAD` answers for input, not
   output, and a byte the program has not written yet is not visible anywhere.
 
-What to do about the third one, in order of preference: have the program
+What to do about the last one, in order of preference: have the program
 bracket its repaints in 2026; call `frame.assert_finished()`, which refuses
 anything but the two proofs; raise the window for a call with `quiet=` (or for
 a session with `paint=`) past the longest pause the program takes; and assert
 on what the screen *should say*, never only on what it should not.
+
+What a closed bracket does not say
+----------------------------------
+
+`ESC [ ? 2026 l` says "the repaint I opened is complete". Read as anything
+wider than that, it hands back frames the program never vouched for, and three
+shapes did:
+
+* **Painting the close did not cover.** The sequence vouches for the bracket,
+  not for the screen; they are the same thing only for a program that draws
+  nothing outside a bracket. Paint the heading, then flush an empty
+  `ESC[?2026h ESC[?2026l` beside it, and a wait ended on that close with the
+  answer still undrawn — on the strongest label the harness has. So a close is
+  read as a statement about the screen only while nothing has been painted
+  outside a bracket since the wait began (`Screen.unbracketed_paints`);
+  otherwise the wait falls back to silence, which is what it actually has.
+
+  An *empty* bracket on its own is not the defect and is not treated as one: a
+  repaint that found nothing to change still brackets, and it is telling the
+  truth. Nothing separates it from a program about to paint unbracketed — so
+  the discipline is what gets checked, not the emptiness.
+* **Bracket bytes arriving as content.** A pane rendering a log line, a
+  fixture or a baton that *quotes* the sequence puts those bytes on the wire,
+  and they are byte for byte the program's own sequence — nothing a terminal
+  can observe separates them, and no clever reading will. What *is* observable
+  is the wreckage: a close with nothing open, or an open inside an open, which
+  a program bracketing its repaints never sends. Those are counted
+  (`Screen.synchronized_faults`), and a wait that sees one reports `unsound`
+  rather than a frame it vouches for — for the screen too, since a stream
+  carrying escape bytes as content has had that content taken for control all
+  along. The residual is honest and stated: when the forged close arrives
+  ahead of the program's own, the frame goes back stamped `synchronised`
+  before anything can show otherwise. A frame already returned cannot be
+  un-returned — so the *session* refuses to end once the brackets are known
+  not to balance, and nothing captured from that program is quietly kept.
+* **Dying inside a bracket.** "The program is gone, so nothing can be added"
+  is true and is the wrong question: it had said "one whole frame begins" and
+  never said it ended. That is `torn`, and `assert_finished()` refuses it.
 
 A program still writing when `redraw` runs out is the one case a terminal can
 be certain about — that screen is definitely partial — so `expect=` raises with
@@ -154,7 +201,17 @@ boundaries. Escape bytes never reach the text: frames carry what a human would
 see, never the sequences that put it there. A sequence the emulator does not
 model leaves *nothing* behind — an escape with an intermediate byte
 (`ESC # 8`, `ESC SP F`) is swallowed whole rather than dropping its final
-character into the text plane as content.
+character into the text plane as content. An `ESC` inside an OSC or DCS string
+is that string's terminator only when `\\` follows it; anything else aborts the
+string and *begins a sequence*, so `ESC ] 0 ; t ESC [ 1 ; 1 H` addresses the
+cursor instead of drawing `1;1H`.
+
+Nothing is dropped either. A zero-width combining mark joins the cell it
+follows rather than vanishing, so `cafe` + U+0301 is on the screen as the
+accented word a terminal shows; the grid holds one string per cell and
+`display_width` already counts the mark as zero, so no column moves. And an
+SGR parameter that is present but is not a number is an unknown parameter,
+recorded in `CellAttrs.other` — not parameter 0, which is a full reset.
 
 That includes the box drawing. `curses.border()` on `xterm-256color` does not
 send `┌` and `│`; it sends `ESC ( 0`, then the letters `l q k x m j`, then
@@ -312,23 +369,65 @@ DEFAULT_TERM = "xterm-256color"
 # How a wait for the end of a repaint ended — recorded on the frame, because
 # only two of these are proof that the program had finished the screen.
 #
-#   synchronised  the program closed a DEC 2026 bracket around the repaint.
-#                 It said, in a sequence a terminal reads, "that is the whole
-#                 screen". Proof.
-#   exited        the program is gone, so nothing further can arrive. Proof.
+#   synchronised  the program closed a DEC 2026 bracket that it had opened
+#                 cleanly and that enclosed painting. It said, in a sequence a
+#                 terminal reads, "that is the whole screen". Proof.
+#   exited        the program is gone with no repaint open, so nothing further
+#                 can arrive and nothing was left half-drawn. Proof.
+#   torn          the program is gone, but it died *inside* a bracket it had
+#                 opened. Nothing further can arrive and the program never
+#                 said the screen was whole — so this is the one screen a
+#                 terminal can be certain is half a repaint, kept as evidence
+#                 of exactly that. Not proof.
+#   unsound       the program's 2026 brackets did not balance during the wait
+#                 — a close with nothing open, or an open inside an open. A
+#                 program whose *content* carries bracket bytes is
+#                 indistinguishable from one issuing the sequence, so nothing
+#                 it appeared to say about its painting can be read. Not
+#                 proof, and worse than silence: the text plane is suspect too.
 #   quiet         it stopped writing for `paint` seconds. *Not* proof: a
 #                 program pausing mid-repaint for longer than that is quiet
 #                 and half-painted at the same time, and no observation a
 #                 terminal can make tells the two apart.
 #   unfinished    it was still writing when the window ran out. That is the
-#                 one case a terminal can be certain *is* a partial screen,
+#                 other case a terminal can be certain *is* a partial screen,
 #                 so `expect=` refuses it rather than handing it over.
 PAINT_SYNCHRONISED = "synchronised"
 PAINT_EXITED = "exited"
+PAINT_TORN = "torn"
+PAINT_UNSOUND = "unsound"
 PAINT_QUIET = "quiet"
 PAINT_UNFINISHED = "unfinished"
-PAINT_ENDS = (PAINT_SYNCHRONISED, PAINT_EXITED, PAINT_QUIET, PAINT_UNFINISHED)
+PAINT_ENDS = (PAINT_SYNCHRONISED, PAINT_EXITED, PAINT_TORN, PAINT_UNSOUND,
+              PAINT_QUIET, PAINT_UNFINISHED)
 PAINT_PROVED = frozenset({PAINT_SYNCHRONISED, PAINT_EXITED})
+
+# What `assert_finished()` tells a caller to do about it. The default is the
+# advice for silence; the other two endings are not the caller's knob to turn
+# and saying "raise the quiet window" at them would send a reader looking for
+# a timing problem that is not there.
+_NOT_PROVED_ADVICE = (
+    ". A program proves it by bracketing the repaint in DEC 2026"
+    " (ESC[?2026h ... ESC[?2026l) around everything it draws, and by exiting"
+    " outside one; short of that, raise the quiet window with quiet=/paint="
+    " and assert on what the screen should say rather than on what it"
+    " should not."
+)
+_WHY_NOT_PROOF = {
+    PAINT_TORN: (
+        ". The program exited INSIDE a bracket it had opened, so this screen"
+        " is a repaint it never finished and never said was whole — kept as"
+        " evidence of exactly that. The finding is the exit; raising a window"
+        " cannot change it."
+    ),
+    PAINT_UNSOUND: (
+        ". The program's 2026 brackets did not balance — a close with nothing"
+        " open, or an open inside an open. Bracket bytes reaching the terminal"
+        " as CONTENT look exactly like that, so this program's statements"
+        " about its own painting cannot be read, and neither can its text"
+        " plane. Escape what the program renders; no window setting helps."
+    ),
+}
 
 # The DEC Special Graphics set: what `ESC ( 0` turns the ASCII range 0x5F-0x7E
 # into until `ESC ( B` turns it back. ncurses draws every box, rule and arrow
@@ -388,6 +487,11 @@ def _param(text):
 
 
 def _char_width(ch: str) -> int:
+    if len(ch) > 1:
+        # A whole cell, not a character: the grid holds one string per cell and
+        # a cell carrying combining marks is several characters long. The marks
+        # are zero-width, so the cell is as wide as what they are attached to.
+        return _char_width(ch[0])
     if unicodedata.combining(ch):
         return 0
     if unicodedata.category(ch) in ("Mn", "Me", "Cf"):
@@ -476,7 +580,8 @@ class CellAttrs(NamedTuple):
         if self.flags:
             parts.append("+".join(sorted(self.flags)))
         if self.other:
-            parts.append("other=" + ",".join(str(n) for n in sorted(self.other)))
+            parts.append(
+                "other=" + ",".join(str(n) for n in sorted(self.other, key=str)))
         return " ".join(parts)
 
     def __repr__(self) -> str:
@@ -584,17 +689,28 @@ def _apply_sgr(attrs: CellAttrs, raw: str) -> CellAttrs:
     Unknown parameters land in `other` instead of being dropped, and never stop
     the known ones in the same sequence from applying.
     """
-    tokens = []
-    for chunk in raw.split(";"):
-        tokens.append(tuple(_param(part) for part in chunk.split(":")))
+    chunks = raw.split(";")
+    tokens = [tuple(_param(part) for part in chunk.split(":")) for chunk in chunks]
     fg, bg = attrs.fg, attrs.bg
     flags = set(attrs.flags)
     other = set(attrs.other)
     index = 0
     while index < len(tokens):
         token = tokens[index]
+        head = chunks[index].split(":")[0]
         index += 1
-        code = token[0] or 0  # an omitted parameter means 0
+        code = token[0]
+        if code is None:
+            if head:
+                # A parameter that is not a number is not parameter 0. Reading
+                # it as one made `ESC[1;>2m` a full RESET: the model dropped
+                # bold that the terminal still shows, and every attribute
+                # assertion over that run then passed or failed for something
+                # that never happened on screen. It is an unknown parameter,
+                # and unknown parameters are recorded, not obeyed.
+                other.add(head)
+                continue
+            code = 0                     # an OMITTED parameter really means 0
         if len(token) > 1 and code in _SGR_EXTENDED:
             # colon form: the colour carries its own arguments
             value = tuple(part for part in token if part is not None)
@@ -751,10 +867,14 @@ class Frame:
     def paint_finished(self) -> bool:
         """Whether the program was *proved* to have finished this screen.
 
-        True only for a repaint the program bracketed with DEC 2026 or one it
-        could no longer add to because it had exited. A frame captured on
+        True only for a repaint the program bracketed with DEC 2026 — cleanly,
+        and with nothing painted outside the bracket — or one it could no
+        longer add to
+        because it had exited with no repaint open. A frame captured on
         silence alone answers False: silence is the strongest signal available
-        without the program's cooperation, and it is still a guess.
+        without the program's cooperation, and it is still a guess. So does a
+        frame the program died halfway through (`torn`), and one whose
+        brackets did not balance (`unsound`).
         """
         return self.paint_end in PAINT_PROVED
 
@@ -778,15 +898,8 @@ class Frame:
                 "this frame was captured on %s, which is not proof the "
                 "program had finished the screen" % self.paint_end
             )
-        raise AssertionError(
-            self._message(
-                reason
-                + ". A program proves it by bracketing the repaint in DEC 2026"
-                " (ESC[?2026h ... ESC[?2026l) or by exiting; short of that,"
-                " raise the quiet window with quiet=/paint= and assert on what"
-                " the screen should say rather than on what it should not."
-            )
-        )
+        raise AssertionError(self._message(reason + _WHY_NOT_PROOF.get(
+            self.paint_end, _NOT_PROVED_ADVICE)))
 
     # -- searching -------------------------------------------------------
 
@@ -1281,9 +1394,14 @@ class Screen:
     def reset(self):
         self._attrs = DEFAULT_ATTRS
         # DEC 2026: True between the program's own "here comes one repaint"
-        # and "that repaint is complete"; the counter is how many it closed.
+        # and "that repaint is complete"; the counters are how many it closed,
+        # how much it drew while NOT inside one, and how many of its 2026
+        # sequences could not have come from a program bracketing its
+        # repaints. See `_synchronized_update` for why the three are not one.
         self.synchronized_update = False
         self.synchronized_updates = 0
+        self.unbracketed_paints = 0
+        self.synchronized_faults = 0
         self._grid = [self._blank_row() for _ in range(self.rows)]
         self._attr_grid = [self._blank_attr_row() for _ in range(self.rows)]
         self._overflow = [_NO_OVERFLOW] * self.rows
@@ -1498,6 +1616,26 @@ class Screen:
         else:
             self._put(ch)
 
+    def _combine(self, ch):
+        """A zero-width mark joins the cell that precedes it.
+
+        Dropping it rewrote the text: `e` followed by U+0301 arrived on the
+        screen as `e`, so a frame showed a word the terminal never displayed
+        and `assert_contains("\u00e9")` could not pass on a program that drew
+        it decomposed. The grid holds one string per cell, so the mark has
+        somewhere to go, and `display_width` already counts it as zero — the
+        column arithmetic is unchanged.
+        """
+        col = self.cursor_col if self._pending_wrap else self.cursor_col - 1
+        if col < 0:
+            return                       # nothing on this row precedes it
+        row = self._grid[self.cursor_row]
+        if row[col] == _WIDE_PLACEHOLDER and col > 0:
+            col -= 1                     # it belongs to the wide cell itself
+        self._painted()
+        row[col] += ch
+        self._last_char = row[col]
+
     def _tab(self):
         stops = [t for t in sorted(self._tabs) if t > self.cursor_col]
         self.cursor_col = stops[0] if stops else self.cols - 1
@@ -1517,7 +1655,9 @@ class Screen:
         ch = self._translate(ch)
         width = _char_width(ch)
         if width == 0:
+            self._combine(ch)
             return
+        self._painted()
         overflowed = False
         if self._pending_wrap:
             if self.autowrap:
@@ -1633,7 +1773,16 @@ class Screen:
         # OSC / DCS / APC / PM: runs until BEL or ST (ESC \)
         if self._string_esc:
             self._string_esc = False
-            self._state = "ground"
+            # An ESC inside a string is ST when `\\` follows it and ABORTS the
+            # string when anything else does — and either way the right thing
+            # to do is hand the byte to `_escape`, which starts a sequence for
+            # the openers and lands in ground for `\\`, which starts nothing.
+            # Swallowing it instead consumed only the `[` of the sequence that
+            # followed, so `ESC ] 0 ; t ESC [ 1 ; 1 H X` drew `1;1HX` into the
+            # text plane: a frame showing content no terminal ever displayed,
+            # which is the one thing an evidence artefact must never do.
+            self._state = "esc"
+            self._escape(ch)
             return
         if ch == "\x07":
             self._state = "ground"
@@ -1789,21 +1938,66 @@ class Screen:
         terminal can measure — silence, a settled burst — is a guess about a
         program that might simply be slow.
 
-        Reopening an update that is already open is not a second update, and a
-        close with nothing open is ignored, so the completed count only ever
-        counts brackets the program actually closed.
+        WHAT THE CLOSING SEQUENCE VOUCHES FOR IS THE BRACKET, NOT THE SCREEN.
+        "The repaint I opened is complete" is a statement about the whole
+        screen only for a program that draws nothing outside a bracket, and
+        that is a property of the program, not of the sequence. So two more
+        counts sit beside `synchronized_updates`, which on its own is the
+        weakest of the three and must never end a wait by itself:
+
+        * `unbracketed_paints` is how much the program has drawn while no
+          bracket was open. A close is proof of the screen only when this has
+          not moved since the wait began — otherwise the screen carries
+          painting the program never said anything about, and an empty bracket
+          flushed alongside it ends the wait on a repaint that had not
+          started. That was reachable: paint, then `h` `l`, and the frame came
+          back stamped with the strongest label the harness has.
+        * `synchronized_faults` counts 2026 sequences that a program
+          bracketing its repaints cannot emit: a close with nothing open, and
+          an open inside an open. They are ignored, as a real terminal ignores
+          them, but they are not *nothing*: the likeliest source is bracket
+          bytes arriving as CONTENT — a log line, a fixture, prose quoting the
+          sequence, rendered into a pane — and those are byte for byte the
+          program's own sequence. Once a stream carries them, no 2026 claim in
+          it can be read, and neither can the text plane, since the emulator
+          has been taking that content for control all along.
+
+        A bracket that encloses no painting is *not* by itself a fault, and
+        deliberately so: a repaint that found nothing to change still opened
+        and closed one, and it is telling the truth — there was nothing to
+        draw and the screen is whole. Nothing distinguishes it from a program
+        about to draw unbracketed, which is why the discipline, not the
+        emptiness, is what gets checked.
         """
         if on:
+            if self.synchronized_update:
+                self.synchronized_faults += 1
+                return
             self.synchronized_update = True
             return
-        if self.synchronized_update:
-            self.synchronized_update = False
-            self.synchronized_updates += 1
+        if not self.synchronized_update:
+            self.synchronized_faults += 1
+            return
+        self.synchronized_update = False
+        self.synchronized_updates += 1
+
+    def _painted(self):
+        """Record that something was drawn — called from every operation that
+        changes what is on the screen, and from nowhere else.
+
+        Cursor motion, attribute changes and mode switches deliberately do not
+        call it: they change how the *next* thing is drawn, not the screen, so
+        a bracket containing only those enclosed no repaint and painting only
+        those outside one costs a program nothing.
+        """
+        if not self.synchronized_update:
+            self.unbracketed_paints += 1
 
     def _switch_screen(self, to_alt, save_cursor):
         if to_alt:
             if self.in_alt_screen:
                 return
+            self._painted()
             self._saved_screen = (
                 [row[:] for row in self._grid],
                 [row[:] for row in self._attr_grid],
@@ -1818,6 +2012,7 @@ class Screen:
         else:
             if not self.in_alt_screen:
                 return
+            self._painted()
             self.in_alt_screen = False
             # What the program drew on the alternate screen is about to be
             # replaced by the primary screen it was given. A terminal throws
@@ -1909,6 +2104,7 @@ class Screen:
         return self.scroll_bottom - self.scroll_top + 1
 
     def _scroll_up(self, count):
+        self._painted()
         # Scrolling the region away twice leaves the same blank region as
         # scrolling it away once, so a count past the region height is the
         # same screen — and a count of two hundred million is a hung harness,
@@ -1923,6 +2119,7 @@ class Screen:
             self._overflow.insert(self.scroll_bottom, _NO_OVERFLOW)
 
     def _scroll_down(self, count):
+        self._painted()
         for _ in range(min(count, self._region_height())):
             del self._grid[self.scroll_bottom]
             del self._attr_grid[self.scroll_bottom]
@@ -1953,6 +2150,7 @@ class Screen:
     # -- erasing / editing -----------------------------------------------
 
     def _clear_row(self, row, start=0, end=None):
+        self._painted()
         end = self.cols if end is None else end
         blank_attrs = self._blank_attrs()
         for col in range(start, end):
@@ -1999,6 +2197,7 @@ class Screen:
     def _insert_lines(self, count):
         if not self._in_region():
             return
+        self._painted()
         # past the foot of the region every further insert only pushes a blank
         # row out, so the screen stops changing: clamping is equivalent
         for _ in range(min(count, self.scroll_bottom - self.cursor_row + 1)):
@@ -2014,6 +2213,7 @@ class Screen:
     def _delete_lines(self, count):
         if not self._in_region():
             return
+        self._painted()
         for _ in range(min(count, self.scroll_bottom - self.cursor_row + 1)):
             del self._grid[self.cursor_row]
             del self._attr_grid[self.cursor_row]
@@ -2025,6 +2225,7 @@ class Screen:
         self._pending_wrap = False
 
     def _delete_chars(self, count):
+        self._painted()
         row = self._grid[self.cursor_row]
         attr_row = self._attr_grid[self.cursor_row]
         col = self.cursor_col
@@ -2039,6 +2240,7 @@ class Screen:
         self._pending_wrap = False
 
     def _insert_chars(self, count):
+        self._painted()
         row = self._grid[self.cursor_row]
         attr_row = self._attr_grid[self.cursor_row]
         col = self.cursor_col
@@ -2263,8 +2465,16 @@ class TerminalSession:
         self.start()
         return self
 
-    def __exit__(self, *exc):
-        self.close()
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            self.close()
+        except AssertionError:
+            if exc_type is not None:
+                # The body already carries a finding. Replacing it with a note
+                # about the program's escape sequences hides the thing the
+                # test was written to catch.
+                return False
+            raise
         return False
 
     @property
@@ -2343,7 +2553,45 @@ class TerminalSession:
         # is closed, so the last reap happens after the fds are gone.
         if self.pid is not None and self.exit_code is None:
             self._wait_exit(timeout)
+        self._refuse_unbalanced_brackets()
         return self.exit_code
+
+    def _refuse_unbalanced_brackets(self):
+        """Fail the session if the program's DEC 2026 brackets did not balance.
+
+        This is the backstop for the one shape the wait cannot catch in time.
+        A close arriving as *content* — a pane rendering a log line, a fixture
+        or a baton that quotes the sequence — is byte for byte the program's
+        own close, so at the instant it arrives there is nothing to read but
+        its bytes, and a frame goes back stamped `synchronised`. The
+        program's real close then follows with nothing open, and that is
+        observable: this stream's brackets are not a program bracketing
+        repaints, and no 2026 claim in it, including ones already handed over,
+        means what it appeared to mean.
+
+        A frame already returned cannot be un-returned. The run can: the
+        session refuses to end, so nothing captured from this program is
+        quietly kept as evidence. Every frame it hands over after the
+        imbalance shows says `unsound` on its face as well.
+        """
+        faults = self.screen.synchronized_faults
+        if not faults:
+            return
+        raise AssertionError(
+            self.frame()._message(
+                "the program's DEC 2026 brackets did not balance: %d sequence%s"
+                " that a program bracketing its own repaints cannot send (a"
+                " close with nothing open, or an open inside an open). The"
+                " likeliest source is bracket bytes reaching the terminal as"
+                " CONTENT — a log line, a fixture, prose quoting the sequence,"
+                " rendered into a pane — and those are byte for byte the"
+                " program's own sequence. So no frame from this session can be"
+                " read as proof that a repaint had finished, and its text plane"
+                " is suspect too: the emulator has been taking that content for"
+                " control. Escape what the program renders."
+                % (faults, "" if faults == 1 else "s")
+            )
+        )
 
     def termios_attrs(self):
         """Current terminal attributes, for restore checks after exit.
@@ -2580,18 +2828,51 @@ class TerminalSession:
             if time.monotonic() >= deadline:
                 return False
 
+    def _paint_baseline(self):
+        """What a wait for the end of a repaint measures its 2026 evidence
+        against: brackets already closed, and painting already done outside
+        any bracket.
+
+        Both are counts rather than flags so that a baseline taken at the
+        right moment — after the delivery barrier — cannot be satisfied by
+        something the program did before it read the keys.
+
+        `synchronized_faults` is deliberately NOT baselined. A fault is not an
+        event in one repaint that a later repaint can be clear of: it is the
+        discovery that this program puts bracket bytes on the wire as content,
+        and that is true of every frame it has drawn and will draw. So it
+        applies to the whole session, in both directions from where it was
+        found.
+        """
+        return (self.screen.synchronized_updates,
+                self.screen.unbracketed_paints)
+
     def _await_paint_end(self, window: float = None, quiet: float = None,
-                         since: int = None) -> Frame:
+                         since=None) -> Frame:
         """Read until the program has finished the screen; return that frame.
 
-        Three endings, and the frame records which one it was, because they do
+        Five endings, and the frame records which one it was, because they do
         not carry the same weight:
 
-        * the program **closed a DEC 2026 bracket** it opened after `since`
-          updates had completed. That sequence means "this repaint is whole",
-          so the wait ends the instant it arrives and the frame is proof;
-        * the program **exited**. Nothing further can arrive, so the screen is
-          whatever it left, and that is proof too;
+        * the program **closed a DEC 2026 bracket** that it opened cleanly
+          after the `since` baseline, having painted nothing outside a bracket
+          since. That sequence means "this repaint is whole", so the wait ends
+          the instant it arrives and the frame is proof. All three
+          qualifications are load-bearing and each of them was once missing —
+          see `Screen._synchronized_update` for the two added here;
+        * the program **exited** with no repaint open. Nothing further can
+          arrive and nothing was left half-drawn, so that is proof too;
+        * the program **exited inside a bracket it had opened**: `torn`. The
+          screen is certainly half a repaint, and the program never said
+          otherwise. It is handed back as evidence of exactly that, and it is
+          not proof;
+        * the program's brackets **did not balance**: `unsound`. It sent a
+          2026 sequence no repaint-bracketing program sends, which is what
+          bracket bytes arriving as content look like, so nothing it appeared
+          to say can be read. The wait stops there — waiting for the close of
+          a bracket that may never have been opened is waiting on nothing —
+          and the session refuses to end on it, because a frame handed back
+          before the imbalance showed cannot be un-handed;
         * the program **went quiet** for `quiet` (default `paint`, 0.2s). This
           is the strongest signal available without the program's cooperation
           and it is *not* proof: a program that pauses longer than `quiet`
@@ -2599,7 +2880,7 @@ class TerminalSession:
           and nothing a terminal can observe separates the two. `quiet=` moves
           the boundary; it does not remove it.
 
-        The fourth outcome is a failure, not a frame: a program still writing
+        The sixth outcome is a failure, not a frame: a program still writing
         when `window` (default `redraw`) runs out is *known* to have handed
         over a partial screen, and returning it as though the repaint had
         finished is exactly the false pass this wait exists to prevent. Raise
@@ -2607,20 +2888,37 @@ class TerminalSession:
         """
         quiet = self.paint if quiet is None else quiet
         window = self.redraw if window is None else window
-        since = self.screen.synchronized_updates if since is None else since
+        updates, loose = self._paint_baseline() if since is None else since
         started = time.monotonic()
         deadline = started + window
         last = started
         while True:
             now = time.monotonic()
+            unsound = bool(self.screen.synchronized_faults)
             if not self.screen.synchronized_update:
-                if self.screen.synchronized_updates > since:
-                    return self.frame(paint_end=PAINT_SYNCHRONISED)
+                if (self.screen.synchronized_updates > updates
+                        and self.screen.unbracketed_paints == loose):
+                    return self.frame(
+                        paint_end=PAINT_UNSOUND if unsound
+                        else PAINT_SYNCHRONISED)
                 if now - last >= quiet:
-                    return self.frame(paint_end=PAINT_QUIET)
+                    return self.frame(
+                        paint_end=PAINT_UNSOUND if unsound else PAINT_QUIET)
+            elif unsound:
+                # Inside a bracket, and the brackets are not readable: the one
+                # that is "open" may be one the program never opened, so its
+                # close is a sequence with no meaning behind it and waiting
+                # out `redraw` for it buys nothing. With no bracket open the
+                # quiet path below is short and settles the screen first, so
+                # it is left to do that.
+                return self.frame(paint_end=PAINT_UNSOUND)
             if not self.is_running:
                 # Nothing more can come; take whatever the exit path wrote.
                 self._drain(settle=0.02, idle=0.02)
+                if self.screen.synchronized_faults:
+                    return self.frame(paint_end=PAINT_UNSOUND)
+                if self.screen.synchronized_update:
+                    return self.frame(paint_end=PAINT_TORN)
                 return self.frame(paint_end=PAINT_EXITED)
             if now >= deadline:
                 break
@@ -2665,7 +2963,7 @@ class TerminalSession:
         Fails with the last frame in the message if the needle never appears.
         """
         timeout = self.timeout if timeout is None else timeout
-        since = self.screen.synchronized_updates
+        since = self._paint_baseline()
         deadline = time.monotonic() + timeout
         rx = re.compile(needle) if regex else None
         while True:
