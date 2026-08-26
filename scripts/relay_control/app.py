@@ -21,9 +21,33 @@ A view's `handle` is offered the key *first*, so a view leg can bind whatever it
 needs without editing this file. It must never consume `q`: quitting is not a
 view's decision. Everything a view is allowed to assume is written down in
 `.relay/skills/pane-conventions.md`.
+
+Every repaint says where it ends
+--------------------------------
+`paint()` brackets the whole screen in DEC private mode 2026 — `ESC[?2026h`
+before it touches the terminal, `ESC[?2026l` once `doupdate()` has flushed the
+last cell. That is this program *stating*, in a sequence the terminal reads,
+that what lies between is one whole frame.
+
+It matters because it is the only such statement there is. A terminal watching
+this program cannot tell a pause in the middle of a repaint from the end of
+one: an unwritten byte is invisible, `FIONREAD` answers for input, and no
+portable syscall separates blocked-in-read from sleeping. Without the bracket
+the frame harness has to fall back on "it stopped writing for 0.2s", and a
+screen that is half-painted and quiet at the same instant passes every negative
+assertion made about it for the wrong reason. `tests/frame.py` records which it
+was on every frame it captures (`Frame.paint_end`); with the bracket in place
+this program's frames say `"synchronised"`, which is proof, and roughly forty
+S2-S4 visual checks are judged on that rather than on a guess.
+
+An unknown private mode is ignored by a conforming terminal, so this costs
+nothing on a terminal that has never heard of 2026 — it is written past curses,
+straight at the terminal, because it is not a terminfo capability and nothing
+in the screen model should know about it.
 """
 
 import argparse
+import contextlib
 import curses
 import os
 import pathlib
@@ -55,6 +79,12 @@ for _key, _view in (("f", "legs"), ("w", "runners"),
 _QUIT = (ord("q"), ord("Q"))
 _TAB = 9
 _ESC = 27
+
+#: DEC private mode 2026, synchronised output: "one whole frame begins" and
+#: "that frame is complete". See the module docstring for why this program
+#: says so rather than leaving a terminal to guess.
+_SYNC_BEGIN = "\033[?2026h"
+_SYNC_END = "\033[?2026l"
 
 
 class State:
@@ -89,18 +119,88 @@ class State:
 # --------------------------------------------------------------------------
 
 
+def _write_through(sequence):
+    """Put one control sequence on the terminal, past curses.
+
+    Curses flushes its own buffer at the end of `doupdate()`, so a sequence
+    written and flushed here lands either side of the repaint and never inside
+    it. Never raises: a terminal that has gone away mid-paint is the loop's
+    problem to notice, not a traceback over the screen.
+    """
+    try:
+        sys.stdout.write(sequence)
+        sys.stdout.flush()
+    except (OSError, ValueError):  # pragma: no cover - the terminal is gone
+        pass
+
+
+@contextlib.contextmanager
+def synchronised_output():
+    """Bracket everything drawn inside it as one whole frame (DEC 2026).
+
+    The close is in a `finally` on purpose: a repaint that raised halfway
+    through still has to be closed, or the terminal — and the frame harness —
+    is left waiting inside a bracket for a frame that is never coming.
+    """
+    _write_through(_SYNC_BEGIN)
+    try:
+        yield
+    finally:
+        _write_through(_SYNC_END)
+
+
+def _band_budget(available):
+    """Rows the attention band may spend, out of the `available` between the
+    status bar and the keybar.
+
+    The split, and why it is this one. The band is worst-first: it is the part
+    of the screen that says a human has to decide something, so it is not the
+    part to drop first. The panes are the context for that decision, and a
+    pane needs two rows to exist at all (`chrome.MIN_PANE_HEIGHT`: one title,
+    one body). So the band may have everything except those two rows, never
+    more than `attention.MAX_ROWS`, and the band itself truncates with `+N
+    more` rather than growing into what is left.
+
+    A fraction of the height was the alternative and it is worse where it
+    matters: at 8x30 a half share is two rows, which is a marker and nothing
+    else — the band would spend its last row counting the item it could have
+    shown. Reserving what a pane needs keeps the shape the same at every size
+    that can hold both, which is every terminal of six rows or more.
+
+    Below that neither can be whole. The band then takes the lot rather than
+    leaving a row too short to hold a pane and too short to hold anything
+    else, and what it cannot show it says it cannot show. This is compatible
+    with ACC-ROBUST-001/002, which govern 80x24 and narrow *widths*: at 80x24
+    this is unchanged at seven rows for the band and fourteen for the panes.
+    """
+    if available <= 0:
+        return 0
+    for_a_pane = available - chrome.MIN_PANE_HEIGHT
+    if for_a_pane < 1:
+        return min(attention.MAX_ROWS, available)
+    return min(attention.MAX_ROWS, for_a_pane)
+
+
 def paint(stdscr, theme, model, state):
-    """One whole screen, measured from the live terminal size.
+    """One whole screen, measured from the live terminal size, and said to be
+    whole by the bracket around it (DEC 2026 — see the module docstring).
 
     Every rectangle below is arithmetic on `getmaxyx()`; there is no constant
     here that is a width or a height. A terminal too short for a region simply
     does not get that region — the header goes last, the keybar next, and the
     view's canvas is whatever is left over.
     """
+    with synchronised_output():
+        _compose(stdscr, theme, model, state)
+        stdscr.noutrefresh()
+        curses.doupdate()
+
+
+def _compose(stdscr, theme, model, state):
+    """Draw the screen into the window. Nothing here reaches the terminal."""
     stdscr.erase()
     rows, cols = stdscr.getmaxyx()
     if rows < 1 or cols < 2:
-        stdscr.refresh()
         return
 
     chrome.draw_header(chrome.Canvas(stdscr, theme, 0, 0, 1, cols), model)
@@ -113,7 +213,10 @@ def paint(stdscr, theme, model, state):
     if bottom >= top:
         band = 0
         if state.view == "overview":
-            band = min(attention.height(model, cols), max(0, bottom - top))
+            # The band is *offered* rows rather than clamped after the fact:
+            # a clamp told neither side, so the band drew four rows believing
+            # it had drawn seven and the Overview was left less than a pane.
+            band = attention.height(model, cols, _band_budget(bottom - top + 1))
             if band:
                 attention.draw(
                     chrome.Canvas(stdscr, theme, top, 0, band, cols), model, state)
@@ -126,7 +229,6 @@ def paint(stdscr, theme, model, state):
     if rows >= 3:
         chrome.draw_keybar(
             chrome.Canvas(stdscr, theme, keybar_row, 0, 1, cols), module.BINDINGS)
-    stdscr.refresh()
 
 
 # --------------------------------------------------------------------------

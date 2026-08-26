@@ -44,6 +44,7 @@ sys.path.insert(0, str(SCRIPTS))
 from frame import TerminalSession  # noqa: E402
 
 import relay_model  # noqa: E402
+from relay_control import app  # noqa: E402
 
 # The keybar is drawn on every view at every size, so it is the one needle that
 # always means "the program has painted a screen".
@@ -125,6 +126,40 @@ def frame_of(relay_dir, size=WIDE, **kwargs):
     term = session(relay_dir, size=size, **kwargs)
     try:
         return term.frame()
+    finally:
+        term.close()
+
+
+#: A key nothing binds. The Overview has no `handle()` at all and this is in
+#: neither the quit keys nor the view jumps, so the loop reads it, changes
+#: nothing, and repaints — which is exactly one whole frame and no new content.
+IDLE_KEY = "z"
+
+
+def repaint(term, expect=READY):
+    """A frame the program *proved* whole, off a keystroke that changes nothing.
+
+    `session()` cannot hand one back: `TerminalSession.start()` has already
+    read the first paint — bracket and all — by the time any wait takes its
+    DEC 2026 baseline, so a `wait_for` straight after it can only end on the
+    quiet window. Provoking a repaint is what puts a closed bracket *after*
+    the baseline.
+
+    The needle is text that survives the repaint, which on its own would be
+    unsound — it is on screen before the program has drawn anything. Here it
+    is only the trigger for the capture: the wait ends on the bracket, whose
+    baseline is taken after the keys were read, so nothing but a repaint that
+    post-dates the keystroke can end it. `paint_end == "synchronised"` is that
+    statement, and it is the assertion doing the work, not the needle.
+    """
+    return term.send(IDLE_KEY, expect=expect)
+
+
+def proved_frame_of(relay_dir, size=WIDE, **kwargs):
+    """`frame_of`, but a frame the program stated was whole."""
+    term = session(relay_dir, size=size, **kwargs)
+    try:
+        return repaint(term)
     finally:
         term.close()
 
@@ -567,7 +602,11 @@ def test_the_legs_pane_draws_a_glyph_per_leg_in_its_status_colour():
     ("malformed", STANDARD),
 ])
 def test_no_captured_frame_carries_mojibake(relay, size):
-    frame = frame_of(FIXTURES / relay, size=size)
+    # Both assertions here are negative — "this sequence is *not* on the
+    # screen" — and a half-painted screen satisfies them without being asked.
+    # `proved_frame_of` is the form that refuses to be satisfied that way.
+    frame = proved_frame_of(FIXTURES / relay, size=size)
+    frame.assert_finished()
     for sequence in MOJIBAKE:
         assert sequence not in frame.text, frame._message(
             "a mojibake sequence %r reached the screen" % sequence)
@@ -595,7 +634,10 @@ def test_it_degrades_below_80x24_without_crashing(size):
     """Degrade, not crash: fewer panes, never a traceback and never a hang."""
     term = session(FIXTURES / "agent-service", size=size)
     try:
-        frame = term.frame()
+        # A frame the program stated was whole: "no traceback" and "nothing is
+        # too wide" are both true of a screen it had not finished drawing.
+        frame = repaint(term)
+        frame.assert_finished()
         assert "Traceback" not in frame.text, frame._message("the TUI raised")
         frame.assert_within_width()
         assert frame.text.strip(), frame._message("nothing was drawn at all")
@@ -738,3 +780,165 @@ def test_the_tui_gets_its_facts_from_relay_model_build():
         "no module under scripts/relay_control/ imports relay_model")
     calls = [name for name, text in sources.items() if "build(" in text]
     assert calls, "no module under scripts/relay_control/ calls build()"
+
+
+# --------------------------------------------------------------------------
+# every repaint is bracketed — the harness is handed proof, not silence
+# --------------------------------------------------------------------------
+#
+# `tests/frame.py` decides a repaint has ended one of three ways, and only two
+# of them are proof (`Frame.paint_end`). Without a bracket this program's
+# frames end on `"quiet"` — it stopped writing for 0.2s — and a program that
+# pauses longer than that inside one repaint is quiet and half-painted at the
+# same instant. Roughly forty S2-S4 checks are judged off these frames, so the
+# assertions below are what keeps every one of them a proof rather than a
+# guess: if the bracketing is ever removed, these fail and the rest quietly
+# drop back to the heuristic without anything saying so.
+
+
+def test_the_first_paint_closes_one_bracket_and_leaves_none_open():
+    """Off the emulator's own counter, which is where the first paint lives.
+
+    `TerminalSession.start()` has read the whole first paint before any wait
+    can take a DEC 2026 baseline, so no `paint_end` can speak for it. What can
+    is `Screen.synchronized_updates`: it counts brackets the program *closed*.
+    One repaint has happened, so it is exactly one — a program that opened a
+    bracket and never closed it would count zero and leave the flag standing,
+    and every wait after it would hang until its window ran out.
+    """
+    term = session(FIXTURES / "agent-service")
+    try:
+        assert term.screen.synchronized_updates == 1, (
+            "the first paint closed %d DEC 2026 brackets, not one"
+            % term.screen.synchronized_updates)
+        assert not term.screen.synchronized_update, (
+            "the program is still inside a bracket it never closed")
+        repaint(term)
+        assert term.screen.synchronized_updates == 2, (
+            "a second repaint did not close a second bracket (%d)"
+            % term.screen.synchronized_updates)
+    finally:
+        term.close()
+
+
+def test_a_repaint_is_proved_whole_rather_than_merely_quiet():
+    """The deliverable: this TUI's frames are proof, not the 0.2s heuristic.
+
+    Without the bracketing `paint_end` is `"quiet"` — "it stopped writing for
+    0.2s" — and a program that pauses longer than that inside one repaint is
+    quiet and half-painted at the same instant. Roughly forty S2-S4 visual
+    checks are judged off these frames; if this assertion ever goes, every one
+    of them silently drops back to a guess.
+    """
+    term = session(FIXTURES / "agent-service")
+    try:
+        frame = repaint(term)
+        assert frame.paint_end == "synchronised", frame._message(
+            "this frame was captured on %r. The TUI is not bracketing its "
+            "repaints in DEC 2026, so the harness has nothing but silence to "
+            "go on" % frame.paint_end)
+        frame.assert_finished()
+    finally:
+        term.close()
+
+
+def test_a_view_switch_is_proved_whole():
+    """The transition frames are the ones the S3 view checks are judged on."""
+    term = session(FIXTURES / "agent-service")
+    try:
+        frame = term.send("F", expect="Esc Overview")
+        frame.assert_finished()
+        assert frame.paint_end == "synchronised", frame._message(
+            "captured on %r" % frame.paint_end)
+    finally:
+        term.close()
+
+
+def test_a_resize_repaint_is_proved_whole():
+    """A SIGWINCH has no delivery barrier, so the bracket is all there is."""
+    term = session(FIXTURES / "agent-service", size=WIDE)
+    try:
+        frame = term.resize(*STANDARD, expect=OVERVIEW_KEYS)
+        assert frame.paint_end == "synchronised", frame._message(
+            "the redraw after a resize was captured on %r" % frame.paint_end)
+        frame.assert_finished()
+    finally:
+        term.close()
+
+
+@pytest.mark.parametrize("size", [WIDE, STANDARD, (12, 40), (8, 30), (5, 20),
+                                  (3, 12)])
+def test_every_terminal_size_brackets_its_repaints(size):
+    """Including the sizes whose paint draws almost nothing: those are frames too."""
+    term = session(FIXTURES / "agent-service", size=size)
+    try:
+        assert term.screen.synchronized_updates == 1
+        repaint(term).assert_finished()
+    finally:
+        term.close()
+
+
+def test_the_bracket_leaves_nothing_on_the_screen_or_in_the_attributes():
+    """An unknown private mode is inert: it draws no cell and sets no SGR.
+
+    Read off the captured planes rather than off the wire, because what would
+    go wrong — the sequence escaping into the text, or leaving a parameter
+    behind in the attribute plane — is only visible there.
+    """
+    frame = proved_frame_of(FIXTURES / "agent-service")
+    for residue in ("2026", "[?", "?20"):
+        frame.assert_not_contains(residue)
+    for bad in MOJIBAKE:
+        frame.assert_not_contains(bad)
+    stray = [(row, col, cell.describe())
+             for row, attrs in enumerate(frame.attrs)
+             for col, cell in enumerate(attrs) if cell.other]
+    assert not stray, frame._message(
+        "the repaint left unmodelled SGR parameters at %r" % (stray[:8],))
+
+
+def test_a_terminal_that_does_not_know_the_bracket_still_gets_a_whole_screen():
+    """`TERM=vt100`: no colour, no alternate screen, and no 2026 in terminfo.
+
+    The sequence is written past curses, so it goes out whatever the terminal
+    claims to understand — which is what a private mode is for. What this
+    proves is that doing so corrupts nothing on a terminal that ignores it.
+    """
+    term = session(FIXTURES / "agent-service", term="vt100")
+    try:
+        assert term.screen.synchronized_updates == 1
+        frame = repaint(term)
+        assert frame.paint_end == "synchronised", frame._message(
+            "captured on %r at TERM=vt100" % frame.paint_end)
+        frame.assert_contains(READY)
+        frame.assert_not_contains("2026")
+        frame.assert_not_contains("Traceback")
+        frame.assert_within_width()
+        assert term.is_running
+    finally:
+        term.close()
+
+
+def test_the_bracket_is_closed_even_when_the_repaint_raises(monkeypatch):
+    """Exactly one open and one close, and the close survives an exception.
+
+    No screen can show this: a repaint that died inside an unclosed bracket
+    leaves the terminal — and every wait in `tests/frame.py` — inside a frame
+    that never ends, which looks like a hang and not like a traceback. The
+    pairing is asserted where it lives, on the context manager itself.
+    """
+    seen = []
+    monkeypatch.setattr(app, "_write_through", seen.append)
+
+    with app.synchronised_output():
+        pass
+    assert seen == [app._SYNC_BEGIN, app._SYNC_END], (
+        "one repaint wrote %r" % (seen,))
+
+    seen.clear()
+    with pytest.raises(RuntimeError):
+        with app.synchronised_output():
+            raise RuntimeError("a repaint that died halfway through")
+    assert seen == [app._SYNC_BEGIN, app._SYNC_END], (
+        "a repaint that raised wrote %r — an open bracket is a frame that "
+        "never ends" % (seen,))
