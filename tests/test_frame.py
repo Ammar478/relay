@@ -11,17 +11,23 @@ Two layers:
 """
 
 import os
+import signal
 import subprocess
 import sys
 import termios
+import time
 from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import frame as frame_module  # noqa: E402
 from frame import (  # noqa: E402
+    PAINT_ABANDONED,
+    PAINT_ENDS,
     PAINT_EXITED,
+    PAINT_PROVED,
     PAINT_QUIET,
     PAINT_SYNCHRONISED,
     PAINT_TORN,
@@ -418,10 +424,21 @@ finally:
 #   stray-exit   the closing bytes in printed text, and then the program exits.
 #                Nothing more can arrive, which used to be proof on its own.
 #   torn         the program exits inside an open bracket, half a screen in.
+#   killed       a program that never brackets ANYTHING: it paints the first
+#                half of a repaint and is then killed where it stands, with
+#                SIGKILL it sends itself so the tear is deterministic rather
+#                than a race. "Nothing more is coming" is true of it and says
+#                nothing whatever about the screen.
+#   disciplined  the mirror image: every byte it ever paints is inside a
+#                bracket it closes, and on the key it paints nothing at all
+#                and goes. Its exit really does leave a screen it vouched for.
+#   final-exit   writes its last line and is reaped before anything reads it:
+#                the screen is only whole if the exit path drains first.
 DEMO_BRACKETS = r'''
 import fcntl
 import os
 import select
+import signal
 import struct
 import sys
 import termios
@@ -466,7 +483,12 @@ def take_key():
 
 
 try:
-    out("\x1b[2J\x1b[HREADY")
+    if mode == "disciplined":
+        # Bracketed from the very first byte: this program has never put a
+        # glyph on the screen that a closed bracket did not cover.
+        out(OPEN + "\x1b[2J\x1b[HREADY" + SHUT)
+    else:
+        out("\x1b[2J\x1b[HREADY")
     take_key()
     if mode == "empty":
         out("\x1b[2J\x1b[1;1HPANE header" + OPEN + SHUT)
@@ -515,6 +537,23 @@ try:
         out(OPEN + "\x1b[2J\x1b[1;1HPANE header")
         flushed()
         raise SystemExit(0)
+    elif mode == "killed":
+        out("\x1b[2J\x1b[1;1HPANE header")
+        flushed()
+        os.kill(os.getpid(), signal.SIGKILL)
+    elif mode == "disciplined":
+        # Nothing is painted for this keystroke; the program simply goes,
+        # leaving the bracketed screen it already vouched for.
+        flushed()
+        raise SystemExit(0)
+    elif mode == "final-exit":
+        # Writes its last line and goes, without waiting for the terminal to
+        # take it: the bytes are in the pty and the writer is gone. `os._exit`
+        # rather than SystemExit because the termios restore below is
+        # TCSADRAIN, which would block until somebody reads — the one thing
+        # this mode exists to make sure nobody has done yet.
+        out("\x1b[3;1HFINAL LINE")
+        os._exit(0)
     os.read(fd, 1)
 finally:
     termios.tcsetattr(fd, termios.TCSADRAIN, old)
@@ -1199,9 +1238,39 @@ def test_dec_special_graphics_draws_the_box_characters_it_was_sent():
     assert screen.lines()[0].rstrip() == "┌──┐plain"
 
 
+# The DEC Special Graphics set, written out here character by character from
+# the VT100 chart instead of read from `frame._DEC_SPECIAL_GRAPHICS`. The test
+# that used to carry this name checked eleven entries — the ones a box border
+# uses — so the other twenty-one were a table carrying its own answer and could
+# be changed with a green suite. A frame is what a human would see, and that is
+# decided entry by entry.
+DEC_GRAPHICS_INPUT = "_`abcdefghijklmnopqrstuvwxyz{|}~"
+DEC_GRAPHICS_GLYPHS = " ◆▒␉␌␍␊°±␤␋┘┐┌└┼⎺⎻─⎼⎽├┤┴┬│≤≥π≠£·"
+
+
 def test_the_whole_graphics_table_is_mapped_not_guessed():
-    screen = feed("\x1b(0lqkxmjtuvwn\x1b(B", cols=20)
-    assert screen.lines()[0].rstrip() == "┌─┐│└┘├┤┴┬┼"
+    """Every one of the 32 positions the set redefines, not a sample of them."""
+    assert len(DEC_GRAPHICS_INPUT) == len(DEC_GRAPHICS_GLYPHS) == 32
+    screen = feed("\x1b(0" + DEC_GRAPHICS_INPUT + "\x1b(B", rows=3, cols=40)
+    assert screen.lines()[0][:32] == DEC_GRAPHICS_GLYPHS
+    # every one of them a single cell, so a border cannot shift a pane's text
+    assert screen.wrapped_rows() == []
+    assert screen.lines()[0][32:].strip() == ""
+
+
+def test_the_graphics_set_redefines_that_range_and_nothing_else():
+    """`ESC ( 0` is not "translate everything": it redefines 0x5F-0x7E.
+
+    Letters, digits and punctuation below that range are the same glyphs in
+    both sets, and a table that reached them would corrupt every pane label
+    drawn inside a border run.
+    """
+    untouched = "".join(
+        chr(code) for code in range(0x20, 0x5F) if chr(code) not in "\x1b"
+    )
+    screen = feed("\x1b(0" + untouched + "\x1b(B", rows=3, cols=80)
+    assert screen.lines()[0][:len(untouched)] == untouched
+    assert not set(untouched) & set(DEC_GRAPHICS_INPUT)
 
 
 def test_shift_out_selects_g1_and_shift_in_returns_to_ascii():
@@ -1288,17 +1357,33 @@ def test_inserting_and_deleting_more_lines_than_the_screen_holds():
     assert deleted.lines() == step.lines()
 
 
-def test_a_repeat_past_the_screen_matches_writing_the_characters():
-    """REP is only clamped where the clamp cannot be seen.
+# One screen is 100 cells and the clamp settles at 200, so these counts sit
+# either side of a row boundary, a whole screen and the settling point, and
+# 5007 is a whole number of none of them. The oracle is always writing the
+# characters out — nothing here is taken on trust from `_clamp_repeat`, which
+# is the point: a clamp checked against its own arithmetic is not checked.
+REPEAT_COUNTS = [0, 1, 19, 20, 21, 99, 100, 101, 150, 199, 200, 201, 219, 220,
+                 250, 5007]
+
+
+@pytest.mark.parametrize("count", REPEAT_COUNTS)
+@pytest.mark.parametrize("start", [0, 7, 43])
+def test_a_repeat_leaves_the_screen_writing_the_characters_would(count, start):
+    """REP is clamped only where the clamp cannot be seen.
 
     Past a full screen every cell holds the same character, so a further
-    `cols` repeats put the screen and the cursor back exactly where they were.
-    The oracle is writing the characters out.
+    `cols` repeats put the screen and the cursor back exactly where they were
+    — an equivalence, not an approximation. It is claimed for every count from
+    zero upward and from any starting column, so it is checked that way: a
+    clamp that settles too early, takes the residue modulo the wrong dimension
+    or is off by one at the boundary shows up as a different screen or a
+    different cursor.
+
+    A count of 0 means 1, as it does for every other CSI parameter.
     """
-    # 5007 is not a whole number of screens *or* of rows: a clamp that drops
-    # the residue leaves the cursor in the wrong column
-    repeated = feed("A\x1b[5007b")
-    written = feed("A" * 5008)
+    lead = "Z" * start
+    repeated = feed(lead + "A" + "\x1b[%db" % count)
+    written = feed(lead + "A" * ((count or 1) + 1))
     assert repeated.lines() == written.lines()
     assert (repeated.cursor_row, repeated.cursor_col) == (
         written.cursor_row,
@@ -1323,6 +1408,80 @@ def test_a_parameter_too_long_to_be_a_number_is_survived():
     assert [line.rstrip() for line in screen.lines()] == [""] * 5
     screen = feed("\x1b[" + "9" * 5000 + "mHI")
     assert screen.lines()[0].rstrip() == "HI"
+
+
+# A digit run no int() will read. Everything below asks what the emulator does
+# with it, never what `_MAX_PARAM` happens to be.
+UNREADABLE = "\x1b[" + "9" * 5000
+
+
+def test_a_digit_run_too_long_to_read_saturates_every_count_it_can_be():
+    """The cap has to mean "past the whole screen" for every operation.
+
+    `_MAX_PARAM` exists for one reason — CPython refuses to build an int from
+    5000 digits — and its *value* is arbitrary: any number past the point
+    where a count stops changing the screen would do. What is not arbitrary is
+    that it is past that point for every routine that takes a count, and the
+    test that stood here checked one of them on a screen small enough that
+    almost any cap would have passed it.
+    """
+    rows, cols = 24, 80
+    content = "".join("row %d\r\n" % i for i in range(5))
+
+    def blank(screen):
+        return all(not line.strip() for line in screen.lines())
+
+    # scroll, insert-line and delete-line take the screen away entirely
+    for final in "STLM":
+        assert blank(feed(content + "\x1b[1;1H" + UNREADABLE + final,
+                          rows, cols)), final
+    # in-row counts clear the rest of the row and shift nothing back in
+    for final in "@PX":
+        screen = feed("abcdef\x1b[1;3H" + UNREADABLE + final, rows, cols)
+        assert screen.lines()[0].rstrip() == "ab", final
+    # a repeat past the screen fills it: this is the one that a cap merely
+    # bigger than a row would still pass
+    screen = feed("A" + UNREADABLE + "b", rows, cols)
+    assert screen.lines() == ["A" * cols] * rows
+    # ...though not the cursor column, and the module should not pretend
+    # otherwise: 10**5000 characters do not land where 10**7 do, and no
+    # arithmetic on a number int() will not build can say where they land.
+    # cursor motion saturates at the edges
+    assert feed(UNREADABLE + "C", rows, cols).cursor_col == cols - 1
+    assert feed(UNREADABLE + "B", rows, cols).cursor_row == rows - 1
+    homed = feed(UNREADABLE + ";" + "9" * 5000 + "H", rows, cols)
+    assert (homed.cursor_row, homed.cursor_col) == (rows - 1, cols - 1)
+
+
+def test_no_parameter_of_any_length_reads_larger_than_the_cap():
+    """The length guard and the cap have to agree, or neither is the cap.
+
+    `_param` promises that what survives the guard "is at most `_MAX_PARAM`
+    when it is seven digits or fewer, so the length guard is still the whole
+    cap". That is the invariant the two constants exist to keep between them,
+    and it is the one thing about either of them that is not arbitrary: raise
+    the digit guard alone and a parameter one digit over it reads as a number
+    larger than the value the guard is imposing.
+    """
+    cap = frame_module._MAX_PARAM
+    # far past the largest grid this harness will ever drive, and past the
+    # point REP stops changing the screen on one that size
+    assert cap >= 2 * 200 * 200
+    for text in ("0", "1", "9", "9" * 7, "9" * 8, "9" * 5000,
+                 "0" * 20 + "9" * 7, "1" + "0" * 5000):
+        value = frame_module._param(text)
+        assert value is not None, text
+        assert 0 <= value <= cap, (text[:20], value, cap)
+    # a run int() cannot read saturates rather than raising or truncating
+    assert frame_module._param("9" * 5000) == cap
+    # ...and one it CAN read is the number it is, leading zeros and all. The
+    # guard exists to stop int() raising; it decides nothing else, so it must
+    # be exactly as wide as the cap. One digit narrower and numbers below the
+    # cap are clamped to it; one wider and numbers above it get through.
+    assert frame_module._MAX_PARAM_DIGITS == len(str(cap))
+    assert frame_module._param("0000042") == 42
+    assert frame_module._param("1234567") == 1234567
+    assert frame_module._param("000" + "1234567") == 1234567
 
 
 # --------------------------------------------------------------------------
@@ -1664,6 +1823,34 @@ def test_close_kills_a_program_that_will_not_quit(menu):
     assert not term.is_running
 
 
+def test_close_kills_a_program_that_refuses_every_signal_it_can_refuse(program):
+    """The polite half of `close()` is not the half that makes it a guarantee.
+
+    A program that ignores SIGTERM is left running by a `close()` that only
+    asks — and every session in this suite is closed in a `finally`, so a
+    child that survives it survives into the next test, holding a pty and
+    a fixture directory. This one ignores every signal a process is allowed
+    to ignore; SIGKILL is the only one left, and the exit code says which
+    signal actually did it, so "it stopped on its own about then" cannot pass
+    for "close() killed it".
+    """
+    path = program("stubborn", DEMO_STUBBORN)
+    term = session(path, rows=10, cols=40)
+    term.start()
+    term.wait_for("STUBBORN and staying")
+    assert term.is_running
+    started = time.monotonic()
+    code = term.close(timeout=1.0)
+    elapsed = time.monotonic() - started
+    assert not term.is_running
+    assert code == -signal.SIGKILL, (
+        "close() returned %r: the child ignores every catchable signal, so "
+        "anything but SIGKILL leaves it running" % (code,)
+    )
+    # and it does not sit on the asking half for longer than it was given
+    assert elapsed < 5.0, elapsed
+
+
 # --------------------------------------------------------------------------
 # The width helper has to catch a real defect
 # --------------------------------------------------------------------------
@@ -1772,6 +1959,26 @@ import sys
 
 sys.stderr.write("relay-control: no .relay directory here\n")
 sys.exit(2)
+'''
+
+# A program that will not take the polite hint. `close()` asks with SIGTERM
+# and then insists with SIGKILL, and only the second half is what makes
+# closing a session a guarantee rather than a request — a TUI wedged in a
+# signal handler, or one that traps SIGTERM to save state and then hangs, is
+# exactly the program a test needs to be sure is gone before the next one
+# starts. SIGKILL cannot be caught, blocked or ignored; nothing else here is
+# true of every child.
+DEMO_STUBBORN = r'''
+import signal
+import sys
+import time
+
+for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT, signal.SIGQUIT):
+    signal.signal(sig, signal.SIG_IGN)
+sys.stdout.write("STUBBORN and staying")
+sys.stdout.flush()
+while True:
+    time.sleep(0.05)
 '''
 
 
@@ -2320,6 +2527,88 @@ def test_a_program_that_exits_inside_a_bracket_left_a_torn_screen(brackets):
         # a reader after a timing problem that is not there
         assert "exited INSIDE a bracket" in message
         assert "quiet window" not in message
+
+
+def test_a_program_that_never_bracketed_cannot_prove_the_screen_it_died_on(
+    brackets,
+):
+    """The exit path had it exactly backwards, and this is the shape.
+
+    `torn` is only reachable for a program that DOES bracket — so the programs
+    able to prove nothing at all were the ones being handed proof. This one
+    never sent a 2026 sequence in its life: it painted the first half of a
+    repaint and was killed where it stood. Every fact the harness has about it
+    is "it has stopped writing", which is equally true of a child killed
+    mid-paint and of one that finished. The screen is missing a line and
+    `assert_finished()` passed on it.
+    """
+    with session(brackets, "killed", "0.3", rows=10, cols=60) as term:
+        term.wait_for("READY")
+        frame = term.send("x", expect="PANE header")
+        assert frame.contains("PANE header"), frame.text
+        assert not frame.contains("BODY middle"), (
+            "the child was supposed to die before drawing this")
+        assert frame.paint_end == PAINT_ABANDONED, (
+            "a screen a non-bracketing child was killed halfway through was "
+            "called proved because the child was gone"
+        )
+        assert frame.paint_finished is False
+        with pytest.raises(AssertionError) as excinfo:
+            frame.assert_finished()
+        message = str(excinfo.value)
+        assert "PANE header" in message
+        assert "outside" in message and "bracket" in message
+        # the advice for this ending is not the quiet-window advice: no
+        # window setting resurrects a program that is already gone
+        assert "quiet window" not in message
+
+
+def test_the_last_thing_a_program_wrote_reaches_the_frame(brackets):
+    """A program can write its final line and go with nobody having read it.
+
+    That line is the screen a crash or a refusal is read off, so the frame the
+    wait hands back has to carry it whichever the wait notices first, the bytes
+    or the exit. The keystroke goes in with `os.write` rather than `send()`
+    precisely so nothing has read the pty when the program goes: `send()`\'s
+    delivery barrier reads it.
+
+    The exit path drains before it decides the ending, so the guarantee does
+    not rest on the order. On this platform the two cannot even be seen in the
+    other order — macOS keeps a session leader in an exiting state (`ps` shows
+    `?Es`) until its pty output queue is drained, so the exit is not reapable
+    until something reads. That is why the drain on the exit path cannot be
+    mutated into a failure here; it is a platform detail, not the guarantee,
+    and the guarantee is what this asserts.
+    """
+    with session(brackets, "final-exit", "0.3", rows=10, cols=60) as term:
+        term.wait_for("READY")
+        os.write(term.master_fd, b"x")
+        frame = term.wait_for("FINAL LINE")
+        assert frame.paint_end == PAINT_ABANDONED
+        assert frame.paint_finished is False
+        assert term.wait(timeout=5) == 0
+
+
+def test_a_program_that_bracketed_everything_proves_the_screen_it_left(
+    brackets,
+):
+    """...and the mirror image, so the tightening is not just "never proof".
+
+    Every glyph this program ever put on the screen was inside a bracket it
+    closed. On the keystroke it paints nothing and exits, so no closing
+    sequence arrives to end the wait — the exit does. That exit really is
+    proof: nothing more can come, and nothing on the screen was ever outside
+    a bracket the program vouched for.
+    """
+    with session(brackets, "disciplined", "0.3", rows=10, cols=60) as term:
+        term.wait_for("READY")
+        frame = term.send("x", expect="READY")
+        assert frame.paint_end == PAINT_EXITED, (
+            "a program that bracketed every byte it painted and then exited "
+            "was not believed"
+        )
+        assert frame.paint_finished is True
+        frame.assert_finished()
         assert term.wait() == 0
 
 
@@ -2402,14 +2691,98 @@ def test_expect_refuses_a_screen_the_program_had_not_stopped_writing(noisy):
         assert "redraw=" in message                  # and what to do about it
 
 
-def test_a_program_that_has_exited_proves_the_screen_it_left(program):
-    """Nothing more can arrive, so the screen is whatever it left behind."""
+def test_a_program_that_has_exited_left_a_screen_it_never_vouched_for(program):
+    """The everyday shape of the same defect, and the everyday program.
+
+    This one is not killed and is not mid-anything: it writes its message and
+    exits with a status it chose. "Nothing more can arrive, so the screen is
+    whatever it left behind" was the reasoning, and the frame went back as
+    proof. But a program exiting with a status it chose is not the only way to
+    reach this branch, and the branch cannot tell the two apart — a Python
+    program dying on an uncaught exception mid-repaint also writes and exits.
+    Never having bracketed anything, it never said any screen of its was
+    whole, and this ending says so.
+    """
     path = program("refuses", DEMO_REFUSES)
     with session(path, rows=10, cols=80) as term:
         frame = term.wait_for("relay-control")
-        assert frame.paint_end == PAINT_EXITED
-        assert frame.paint_finished is True
+        assert frame.lines[0] == "relay-control: no .relay directory here"
+        assert frame.paint_end == PAINT_ABANDONED
+        assert frame.paint_finished is False
+        with pytest.raises(AssertionError) as excinfo:
+            frame.assert_finished()
+        assert "nothing more is coming" in str(excinfo.value)
+
+
+# --------------------------------------------------------------------------
+# The endings, and what each one is worth
+#
+# Written out here rather than read from the module. `PAINT_ENDS` and
+# `PAINT_PROVED` are tables carrying the answer, and no test consulted them at
+# all — a name could be dropped from the tuple, or moved into `PAINT_PROVED`,
+# with a green suite. Roughly forty S2-S4 checks rest on `paint_end` meaning
+# what it says, so what it says is stated here independently: the name, and
+# whether `assert_finished()` accepts it.
+#
+# The two that are proof are the two a program can state. Everything else is
+# the harness guessing, or the harness knowing the screen is torn.
+# --------------------------------------------------------------------------
+
+PAINT_ENDINGS = {
+    "synchronised": True,    # the program closed a 2026 bracket over it
+    "exited": True,          # gone, and it had bracketed everything it drew
+    "abandoned": False,      # gone, having painted outside any bracket
+    "torn": False,           # gone from inside a bracket it had opened
+    "unsound": False,        # its brackets did not balance
+    "quiet": False,          # it stopped writing for a while
+    "unfinished": False,     # it had not stopped writing at all
+}
+
+
+def test_every_ending_is_named_registered_and_weighed():
+    """Each ending has one name, one weight, and a constant that carries it."""
+    assert len(PAINT_ENDS) == len(PAINT_ENDINGS), PAINT_ENDS
+    assert set(PAINT_ENDS) == set(PAINT_ENDINGS)
+    assert set(PAINT_PROVED) == {
+        name for name, proved in PAINT_ENDINGS.items() if proved
+    }
+    for name in PAINT_ENDINGS:
+        constant = "PAINT_" + name.upper()
+        assert getattr(frame_module, constant) == name
+        assert constant in frame_module.__all__, (
+            "%s is not exported, so a caller cannot name the ending it gets"
+            % constant
+        )
+    # ...and no PAINT_ constant exists that is not one of them: an ending the
+    # module can stamp on a frame and this table has never weighed is exactly
+    # the gap that let `exited` mean two different things.
+    declared = {
+        value for name, value in vars(frame_module).items()
+        if name.startswith("PAINT_") and isinstance(value, str)
+    }
+    assert declared == set(PAINT_ENDINGS)
+
+
+@pytest.mark.parametrize("ending,proved", sorted(PAINT_ENDINGS.items()))
+def test_assert_finished_accepts_exactly_the_endings_that_are_proof(
+    ending, proved
+):
+    """`paint_finished` and `assert_finished()` have to agree, per ending.
+
+    A frame built by hand, because the point is the weighing and not the
+    capture: every ending is checked, including the one no returned frame
+    carries (`unfinished` is raised with, not handed back).
+    """
+    frame = Frame(["SCREEN CONTENT"], label="demo", paint_end=ending)
+    assert frame.paint_finished is proved
+    if proved:
+        assert frame.assert_finished() is frame
+        return
+    with pytest.raises(AssertionError) as excinfo:
         frame.assert_finished()
+    message = str(excinfo.value)
+    assert ending in message, "the failure does not say which ending it was"
+    assert "SCREEN CONTENT" in message, "the failure does not carry the screen"
 
 
 def test_a_frame_nobody_waited_on_makes_no_claim(menu):

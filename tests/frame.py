@@ -95,7 +95,7 @@ there; it waits, on two positive signals:
 When is a repaint over?
 -----------------------
 
-Two answers are proof and four are not, so every frame `expect=` returns
+Two answers are proof and five are not, so every frame `expect=` returns
 carries `frame.paint_end` saying which it was:
 
 * `"synchronised"` — the program bracketed the repaint in **DEC private mode
@@ -104,8 +104,12 @@ carries `frame.paint_end` saying which it was:
   statement about its own painting a terminal can read. The wait ends there.
   Three things have to hold before the harness reads it as that statement, and
   each of them was once missing; see "What a closed bracket does not say".
-* `"exited"` — the program is gone with no repaint open, so nothing can be
-  added to the screen and nothing was left half-drawn.
+* `"exited"` — the program is gone with no repaint open, **and it never
+  painted a glyph outside a bracket it closed**. So the screen is bracketed
+  repaints and nothing else, each one vouched for, and no further repaint can
+  start. Both halves are needed; see "What an exit does not say".
+* `"abandoned"` — the program is gone with no repaint open, but it had painted
+  outside one, so no statement of its own covers the screen. Not proof.
 * `"torn"` — the program is gone, but it died **inside** a bracket it had
   opened. Nothing more can arrive and the program never said the screen was
   whole, so this is the one screen a terminal knows is half a repaint. Kept as
@@ -164,6 +168,30 @@ shapes did:
 * **Dying inside a bracket.** "The program is gone, so nothing can be added"
   is true and is the wrong question: it had said "one whole frame begins" and
   never said it ended. That is `torn`, and `assert_finished()` refuses it.
+
+What an exit does not say
+-------------------------
+
+The same sentence, one level up. An exit proves that nothing more is coming,
+which is real and is why exiting was read as the end of a repaint. It is not
+"what is on screen is whole": a child killed mid-paint has also stopped
+writing, and a program that dies on an uncaught exception halfway through a
+repaint exits with a status it chose. Nothing a terminal can observe separates
+those from a program that finished.
+
+So an exit is proof only for a program whose painting was all inside brackets
+it closed — then the screen is repaints it vouched for, and the exit adds the
+one thing a close cannot say, that no further repaint will start. Anything
+else is `abandoned`. The reading this replaces was exactly backwards: `torn`
+is only reachable for a program that DOES bracket, so the programs able to
+prove nothing at all — the ones that never bracket — were the ones being
+handed proof. A child that never emitted a 2026 bracket in its life cannot
+have proved that any screen of its was whole.
+
+Unlike a close, which vouches for one repaint and so is measured from the
+wait's baseline, this is asked of the whole session: the screen an exit leaves
+is everything the program ever drew, and a glyph painted outside a bracket ten
+repaints ago is still on it and still unvouched for.
 
 A program still writing when `redraw` runs out is the one case a terminal can
 be certain about — that screen is definitely partial — so `expect=` raises with
@@ -345,12 +373,15 @@ from typing import NamedTuple
 
 __all__ = [
     "DEFAULT_ATTRS",
+    "PAINT_ABANDONED",
     "PAINT_ENDS",
     "PAINT_EXITED",
     "PAINT_PROVED",
     "PAINT_QUIET",
     "PAINT_SYNCHRONISED",
+    "PAINT_TORN",
     "PAINT_UNFINISHED",
+    "PAINT_UNSOUND",
     "AttrRun",
     "CellAttrs",
     "Frame",
@@ -372,8 +403,18 @@ DEFAULT_TERM = "xterm-256color"
 #   synchronised  the program closed a DEC 2026 bracket that it had opened
 #                 cleanly and that enclosed painting. It said, in a sequence a
 #                 terminal reads, "that is the whole screen". Proof.
-#   exited        the program is gone with no repaint open, so nothing further
-#                 can arrive and nothing was left half-drawn. Proof.
+#   exited        the program is gone with no repaint open, AND every glyph it
+#                 ever put on the screen was inside a bracket it closed. Both
+#                 halves are load-bearing: "nothing more is coming" is equally
+#                 true of a child killed mid-paint, so on its own it says
+#                 nothing about the screen. What makes this proof is that the
+#                 program vouched for everything on the screen and has now
+#                 stopped adding to it. Proof.
+#   abandoned     the program is gone with no repaint open, but it had painted
+#                 outside a bracket, so no statement of its own covers the
+#                 screen. It stopped writing; whether it stopped because it
+#                 was finished or because it was killed mid-repaint is exactly
+#                 what a terminal cannot see. Not proof.
 #   torn          the program is gone, but it died *inside* a bracket it had
 #                 opened. Nothing further can arrive and the program never
 #                 said the screen was whole — so this is the one screen a
@@ -394,12 +435,13 @@ DEFAULT_TERM = "xterm-256color"
 #                 so `expect=` refuses it rather than handing it over.
 PAINT_SYNCHRONISED = "synchronised"
 PAINT_EXITED = "exited"
+PAINT_ABANDONED = "abandoned"
 PAINT_TORN = "torn"
 PAINT_UNSOUND = "unsound"
 PAINT_QUIET = "quiet"
 PAINT_UNFINISHED = "unfinished"
-PAINT_ENDS = (PAINT_SYNCHRONISED, PAINT_EXITED, PAINT_TORN, PAINT_UNSOUND,
-              PAINT_QUIET, PAINT_UNFINISHED)
+PAINT_ENDS = (PAINT_SYNCHRONISED, PAINT_EXITED, PAINT_ABANDONED, PAINT_TORN,
+              PAINT_UNSOUND, PAINT_QUIET, PAINT_UNFINISHED)
 PAINT_PROVED = frozenset({PAINT_SYNCHRONISED, PAINT_EXITED})
 
 # What `assert_finished()` tells a caller to do about it. The default is the
@@ -414,6 +456,14 @@ _NOT_PROVED_ADVICE = (
     " should not."
 )
 _WHY_NOT_PROOF = {
+    PAINT_ABANDONED: (
+        ". The program is gone, which proves only that nothing more is"
+        " coming — a child killed mid-repaint has also stopped writing. It"
+        " painted outside any DEC 2026 bracket, so nothing it ever said"
+        " covers this screen, and a program that never brackets cannot have"
+        " proved that any screen of its was whole. Bracket every repaint;"
+        " no window setting turns an exit into a statement."
+    ),
     PAINT_TORN: (
         ". The program exited INSIDE a bracket it had opened, so this screen"
         " is a repaint it never finished and never said was whole — kept as"
@@ -868,13 +918,17 @@ class Frame:
         """Whether the program was *proved* to have finished this screen.
 
         True only for a repaint the program bracketed with DEC 2026 — cleanly,
-        and with nothing painted outside the bracket — or one it could no
-        longer add to
-        because it had exited with no repaint open. A frame captured on
-        silence alone answers False: silence is the strongest signal available
-        without the program's cooperation, and it is still a guess. So does a
-        frame the program died halfway through (`torn`), and one whose
-        brackets did not balance (`unsound`).
+        and with nothing painted outside the bracket — or for the screen an
+        exit left behind when the program had bracketed everything it ever
+        painted and had no repaint open (`exited`).
+
+        A frame captured on silence alone answers False: silence is the
+        strongest signal available without the program's cooperation, and it
+        is still a guess. So does a frame the program died halfway through
+        (`torn`), one whose brackets did not balance (`unsound`), and one an
+        exit left with unbracketed painting on it (`abandoned`) — an exit
+        proves that nothing more is coming, which a child killed mid-repaint
+        also proves.
         """
         return self.paint_end in PAINT_PROVED
 
@@ -2847,11 +2901,59 @@ class TerminalSession:
         return (self.screen.synchronized_updates,
                 self.screen.unbracketed_paints)
 
+    def _exit_ending(self):
+        """What the program's exit is worth as a statement about the screen.
+
+        An exit proves one thing: nothing more is coming. That is real
+        information — it is why exiting was read as the end of a repaint — and
+        it is not the question. "The program has stopped writing" is equally
+        true of a child that finished its repaint and of one killed halfway
+        through it, and no observation a terminal can make separates them. The
+        only thing that can is what the program itself said while it painted.
+
+        So an exit is proof only for a program that never painted a glyph
+        outside a DEC 2026 bracket it closed. Then the screen is bracketed
+        repaints and nothing else, every one of them vouched for, and the exit
+        adds the last missing piece: no further repaint will start. Four
+        readings, weakest first:
+
+        * `unsound` — the brackets did not balance somewhere in this session,
+          so nothing the program appeared to say about its painting can be
+          read, and neither can its text plane. The exit does not repair that.
+        * `torn` — it died INSIDE a bracket it had opened. It said "one whole
+          frame begins" and never said it ended: the one screen a terminal
+          knows is half a repaint.
+        * `abandoned` — it is gone, no bracket open, but it painted outside
+          one. Whether the last thing it drew was a finished screen or the
+          first half of one is exactly what cannot be seen. Not proof, and
+          this is the reading the exit path used to skip: it was `torn` or
+          proof, so the programs that could prove NOTHING — the ones that
+          never bracket at all — were the ones handed proof.
+        * `exited` — gone, no bracket open, and it never painted outside one.
+          Proof.
+
+        `unbracketed_paints` is read for the whole session here, not from the
+        wait's baseline, and that difference is deliberate. A closed bracket
+        is an event: it vouches for one repaint, so what matters is painting
+        since the wait began. An exit is not an event about one repaint — it
+        is the end of the program, and the screen it leaves is everything the
+        program ever drew. A glyph painted outside a bracket ten repaints ago
+        is still on that screen and still unvouched for. So this asks a
+        property of the program, the way `synchronized_faults` does.
+        """
+        if self.screen.synchronized_faults:
+            return PAINT_UNSOUND
+        if self.screen.synchronized_update:
+            return PAINT_TORN
+        if self.screen.unbracketed_paints:
+            return PAINT_ABANDONED
+        return PAINT_EXITED
+
     def _await_paint_end(self, window: float = None, quiet: float = None,
                          since=None) -> Frame:
         """Read until the program has finished the screen; return that frame.
 
-        Five endings, and the frame records which one it was, because they do
+        Six endings, and the frame records which one it was, because they do
         not carry the same weight:
 
         * the program **closed a DEC 2026 bracket** that it opened cleanly
@@ -2860,8 +2962,12 @@ class TerminalSession:
           the instant it arrives and the frame is proof. All three
           qualifications are load-bearing and each of them was once missing —
           see `Screen._synchronized_update` for the two added here;
-        * the program **exited** with no repaint open. Nothing further can
-          arrive and nothing was left half-drawn, so that is proof too;
+        * the program **exited** with no repaint open, having never painted
+          outside one. Nothing further can arrive and everything on the
+          screen was vouched for, so that is proof too;
+        * the program **exited having painted outside a bracket**:
+          `abandoned`. It stopped writing, which a child killed mid-repaint
+          also does, and it never said any screen of its was whole. Not proof;
         * the program **exited inside a bracket it had opened**: `torn`. The
           screen is certainly half a repaint, and the program never said
           otherwise. It is handed back as evidence of exactly that, and it is
@@ -2914,12 +3020,10 @@ class TerminalSession:
                 return self.frame(paint_end=PAINT_UNSOUND)
             if not self.is_running:
                 # Nothing more can come; take whatever the exit path wrote.
+                # That is one real fact and it is not the one a caller wants:
+                # see `_exit_ending` for what an exit is allowed to claim.
                 self._drain(settle=0.02, idle=0.02)
-                if self.screen.synchronized_faults:
-                    return self.frame(paint_end=PAINT_UNSOUND)
-                if self.screen.synchronized_update:
-                    return self.frame(paint_end=PAINT_TORN)
-                return self.frame(paint_end=PAINT_EXITED)
+                return self.frame(paint_end=self._exit_ending())
             if now >= deadline:
                 break
             if self._read_once(min(quiet, deadline - now)):
