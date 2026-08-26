@@ -436,7 +436,8 @@ def draw_header(canvas, model):
     path = relay.get("path") or ""
     usable = canvas.width - 1
 
-    title = clip(title, usable)
+    ell = canvas.theme.glyph("ellipsis")
+    title = clip(title, usable, ell)
     metrics = metrics_of(model)
     # Metrics are dropped from the left — TIME first — because a token figure
     # is the one a reader is most often watching change.
@@ -444,7 +445,7 @@ def draw_header(canvas, model):
         metrics = metrics[1:]
     right = _metric_width(metrics)
     gap = usable - len(title) - (right + 2 if right else 0)
-    path = elide_left(path, max(0, gap - 2))
+    path = elide_left(path, max(0, gap - 2), ell)
 
     col = canvas.segments(0, [(title, theme_tokens.TITLE)])
     if path:
@@ -453,7 +454,8 @@ def draw_header(canvas, model):
         col = usable - right
         for index, (label, value) in enumerate(metrics):
             if index:
-                col = canvas.segments(0, [(" · ", theme_tokens.MUTED)], col)
+                col = canvas.segments(
+                    0, [(" %s " % canvas.theme.glyph("sep"), theme_tokens.MUTED)], col)
             col = canvas.segments(0, [(label, theme_tokens.METRIC_LABEL),
                                       (" ", theme_tokens.MUTED),
                                       (value, theme_tokens.METRIC_VALUE)], col)
