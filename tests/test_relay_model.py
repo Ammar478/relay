@@ -1030,20 +1030,37 @@ CORPUS_COMMITS = [
 ]
 
 
-@pytest.fixture(scope="session")
-def corpus_relay(tmp_path_factory):
+#: The two claims the ACC-DATA-009 defect actually credited, and the whole
+#: reason `corpus_relay_denied` exists.
+#:
+#: `create-path-credential-guard` claims `8036f9f` as its own work and
+#: `pg-repository-correctness` claims `4f0b17c`. Both are agent-service shas,
+#: and both are quoted verbatim by THIS repository's judge batons while they
+#: report on that relay (`code-judge-S1.md:162`,
+#: `behaviour-judge-S1.md:186,190`). This repository has never held either
+#: object, and the log credited two of its own legs with them anyway.
+#:
+#: That reproduction was read off `REPO / ".relay"` in place. `.relay/` is
+#: git-ignored, so the reading skipped on every clone, every CI checkout and
+#: every container: the repro of the defect the check names ran on exactly one
+#: laptop. Withholding these two commits from the graft reproduces the same
+#: corpus with none of the dependence — the real batons, the real shas, a
+#: repository that does not have them — anywhere the suite runs.
+CORPUS_DENIED_CLAIMS = ("4f0b17c", "8036f9f")
+
+
+def _graft_agent_service(root, withheld=()):
     """The frozen agent-service batons, on a repository holding their commits.
 
     Returns `(relay_dir, sha_of)`, where `sha_of[token]` is the real short sha
     that stands in for the corpus sha `token`.
 
-    Session-scoped: fifteen git processes is too much to pay once per test, and
-    `build()` never writes to a relay directory (there is a test for that), so
-    every consumer sees the same bytes.
+    A token in `withheld` is neither committed nor substituted: its baton keeps
+    the corpus sha its runner wrote, and no object of that name exists in the
+    grafted repository. That is a CLAIM THE REPOSITORY DENIES, which is the one
+    shape the full graft cannot produce and the shape ACC-DATA-009 was written
+    for.
     """
-    if not HAS_GIT:
-        pytest.skip("git is not installed")
-    root = tmp_path_factory.mktemp("corpus")
     project = root / "grafted"
     relay_dir = project / ".relay"
     shutil.copytree(FIXTURES / "agent-service", relay_dir)
@@ -1060,7 +1077,8 @@ def corpus_relay(tmp_path_factory):
         sha_of[token] = git_run(project, "rev-parse", "--short=7",
                                 "HEAD").stdout.strip()
 
-    ordered = sorted(CORPUS_COMMITS, key=lambda c: c[1])
+    ordered = [c for c in sorted(CORPUS_COMMITS, key=lambda c: c[1])
+               if c[0] not in withheld]
     for token, when, subject in ordered:
         if token == CORPUS_FORK_POINT:
             land(token, when, subject)
@@ -1078,6 +1096,62 @@ def corpus_relay(tmp_path_factory):
         when = AGENT_SERVICE_BATON_MTIMES[path.stem]
         os.utime(path, (when, when))
     return relay_dir, sha_of
+
+
+@pytest.fixture(scope="session")
+def corpus_relay(tmp_path_factory):
+    """The graft with every claimed commit present.
+
+    Session-scoped: fifteen git processes is too much to pay once per test, and
+    `build()` never writes to a relay directory (there is a test for that), so
+    every consumer sees the same bytes.
+    """
+    if not HAS_GIT:
+        pytest.skip("git is not installed")
+    return _graft_agent_service(tmp_path_factory.mktemp("corpus"))
+
+
+@pytest.fixture(scope="session")
+def corpus_relay_denied(tmp_path_factory):
+    """The same graft, on a repository that never made two of the commits its
+    batons claim — `CORPUS_DENIED_CLAIMS`, the two shas the real defect
+    credited. Everything else about the corpus is unchanged, so a test reading
+    it measures the denied claims and not a broken graft."""
+    if not HAS_GIT:
+        pytest.skip("git is not installed")
+    return _graft_agent_service(tmp_path_factory.mktemp("corpus-denied"),
+                                withheld=CORPUS_DENIED_CLAIMS)
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_the_denied_corpus_claims_two_shas_its_repository_does_not_have(
+        corpus_relay_denied):
+    """The premise of the ACC-DATA-009 reproduction, asserted rather than
+    assumed. If the graft ever starts making these commits, the tests that read
+    this corpus stop measuring a denied claim and go green for the wrong
+    reason — so the denial is checked against git, here, once."""
+    relay_dir, sha_of = corpus_relay_denied
+    project = relay_dir.parent
+    # Which two, derived from the corpus rather than restated. Emptying
+    # `CORPUS_DENIED_CLAIMS` withholds nothing and turns every loop below into
+    # zero iterations — a corpus that reproduces nothing, silently.
+    assert set(CORPUS_DENIED_CLAIMS) == {
+        CORPUS_OWN["pg-repository-correctness"],
+        CORPUS_OWN["create-path-credential-guard"],
+    }, CORPUS_DENIED_CLAIMS
+    for sha in CORPUS_DENIED_CLAIMS:
+        assert sha not in sha_of, sha
+        leg = next(k for k, v in CORPUS_OWN.items() if v == sha)
+        assert sha in (relay_dir / "batons" / f"{leg}.md").read_text(), (leg, sha)
+        found = subprocess.run(["git", "-C", str(project), "cat-file", "-t", sha],
+                               capture_output=True, text=True)
+        assert found.returncode != 0, (sha, found.stdout)
+    # Non-vacuity: the rest of the graft is intact and every other claim is a
+    # real object, so what the log does with these two is the only difference.
+    assert set(sha_of) == {t for t, _, _ in CORPUS_COMMITS} - set(CORPUS_DENIED_CLAIMS)
+    for sha in sha_of.values():
+        assert subprocess.run(["git", "-C", str(project), "cat-file", "-t", sha],
+                              capture_output=True, text=True).returncode == 0, sha
 
 
 def test_the_corpus_fixture_still_names_the_shas_these_tests_read():
@@ -1649,6 +1723,220 @@ def test_no_test_module_defines_one_name_twice():
     _, planted = _duplicate_top_level_names(
         "def test_a():\n    pass\n\n\ndef test_a():\n    pass\n")
     assert planted == {"test_a": [1, 5]}, planted
+
+
+#: Every reason a swept test module is allowed to skip for, and why each one is
+#: not a guard that evaporates.
+#:
+#: A skip is how three guards in this suite stopped guarding. `git is not
+#: installed` hid 84 tests over a live defect and reported exit 0. Two
+#: ACC-DATA-009 readings sat behind `.relay/`, which `.gitignore` swallows, so
+#: they skipped on every clone, every CI checkout and every container — one of
+#: them the reproduction of the defect that check names in full. And one of
+#: those two was parametrised over a hardcoded `~/Documents/...` path that
+#: resolved on one person's disk and nowhere else.
+#:
+#: None of those three reasons is below, because none of them survived. What is
+#: left may only be a PLATFORM fact — something no checkout of this repository
+#: can change — and every entry says which. "This machine happens to have a
+#: directory" is the reason this sweep exists to refuse, and a skip that wants
+#: one has to be written down here, in front of a reader, first.
+ALLOWED_SKIP_REASONS = {
+    "git is not installed":
+        "the suite is RED without git — test_git_is_installed_or_this_suite_"
+        "is_not_evidence — so these marks name which properties went unproven "
+        "rather than substituting for proving them",
+    "no /dev/zero on this platform":
+        "a character-device fixture cannot be made where there is no character "
+        "device; the other six shapes of the same parametrisation still run",
+    "root ignores permission bits":
+        "a chmod test passes for the wrong reason as root, which is a property "
+        "of the process and not of the checkout",
+    "root ignores permission bits, so a chmod test would pass for the wrong "
+    "reason":
+        "the same platform fact, worded as the NOT_ROOT marker's reason",
+    "no descriptor table to read on this platform":
+        "neither /dev/fd nor /proc/self/fd exists, so there is nothing to count",
+}
+
+
+def _called_name(node):
+    """`f(...)` -> "f", `a.b(...)` -> "b", anything else -> None."""
+    if isinstance(node.func, ast.Attribute):
+        return node.func.attr
+    if isinstance(node.func, ast.Name):
+        return node.func.id
+    return None
+
+
+def _skip_reasons(source):
+    """`(reasons, opaque)` for one module's source.
+
+    `reasons` is every plain string handed to `pytest.skip(...)` or to a
+    `skipif(..., reason=...)`. `opaque` is the line of every such call whose
+    reason this sweep cannot read.
+
+    An f-string reason counts as opaque on purpose: `f"{live} is not on this
+    machine"` is precisely the skip this sweep was written to refuse, and a
+    reason assembled at run time cannot be registered in front of a reader.
+    """
+    reasons, opaque = set(), []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Call):
+            continue
+        name = _called_name(node)
+        if name not in ("skip", "skipif", "importorskip"):
+            continue
+        if name == "skip":
+            given = node.args[0] if node.args else None
+        else:
+            given = next((kw.value for kw in node.keywords if kw.arg == "reason"),
+                         None)
+        if isinstance(given, ast.Constant) and isinstance(given.value, str):
+            reasons.add(given.value)
+        else:
+            opaque.append(node.lineno)
+    return reasons, opaque
+
+
+def _test_modules_on_disk():
+    """`[(name, source)]` for every test module in `tests/`, DERIVED from disk.
+
+    The two sweeps below read all of them rather than `SWEPT_TEST_MODULES`.
+    A hardcoded list is the exact defect this stage keeps finding — shortening
+    it deletes tests silently, which is how `ALL_FIXTURES` lost a fixture and
+    how a sweep loses a module — and these two sweeps can afford the whole
+    directory because they forbid something no module currently does: every
+    module but these two has no skip at all, and none of them names a home
+    directory. So neither can fail on another check's file for a reason that
+    file's author would dispute.
+    """
+    here = Path(__file__).resolve().parent
+    names = sorted(p.name for p in here.glob("test_*.py"))
+    assert set(SWEPT_TEST_MODULES) <= set(names), names
+    assert len(names) >= 5, names
+    return [(name, (here / name).read_text()) for name in names]
+
+
+def test_no_test_module_skips_for_a_reason_this_machine_decides():
+    """A skip is a green test that ran nothing, and a suite full of them
+    reports success over unproven behaviour (ACC-DATA-*, all).
+
+    This closes the class rather than the three instances that have now been
+    closed one at a time: every skip either names a reason registered in
+    `ALLOWED_SKIP_REASONS` — where a reader can see it is a platform fact — or
+    this fails. The registry is held to being exactly the reasons in use, both
+    ways, so a stale entry cannot sit there as a licence for the next skip that
+    wants it.
+    """
+    found, by_module = set(), {}
+    for name, source in _test_modules_on_disk():
+        reasons, opaque = _skip_reasons(source)
+        assert opaque == [], (
+            name, opaque, "a skip reason must be a plain string, registered in "
+            "ALLOWED_SKIP_REASONS")
+        found |= reasons
+        by_module[name] = reasons
+
+    assert sorted(found) == sorted(ALLOWED_SKIP_REASONS), {
+        "unregistered": sorted(found - set(ALLOWED_SKIP_REASONS)),
+        "registered but unused": sorted(set(ALLOWED_SKIP_REASONS) - found),
+    }
+    assert len(found) >= 4, found
+    # A module that can skip must also be a module the rest of this file sweeps
+    # — otherwise dropping it from `SWEPT_TEST_MODULES` quietly takes its skips
+    # out of range of every check here, which is the same hole one level up.
+    assert {n for n, r in by_module.items() if r} <= set(SWEPT_TEST_MODULES), \
+        by_module
+
+    # And the detector sees both shapes it exists to see: without this, a
+    # `_skip_reasons` returning `(set(), [])` passes everything above.
+    planted, planted_opaque = _skip_reasons(
+        'import pytest\n'
+        'def test_a():\n'
+        '    if not LIVE.is_dir():\n'
+        '        pytest.skip("absent from every clone")\n'
+        '@pytest.mark.skipif(not LIVE.is_dir(), reason="one laptop has it")\n'
+        'def test_b(): pass\n'
+        '@pytest.mark.skipif(True, reason=f"{LIVE} is not on this machine")\n'
+        'def test_c(): pass\n')
+    assert planted == {"absent from every clone", "one laptop has it"}, planted
+    assert len(planted_opaque) == 1, planted_opaque
+
+
+def _module_level(tree):
+    """Every node evaluated at IMPORT time — module-level statements and the
+    decorators of top-level definitions — and nothing inside a function body.
+
+    The distinction is the whole precision of the sweep below. A `~` inside a
+    test body is that test's SUBJECT: `relay_model` expands what a coach writes
+    in `dashboard.json.path`, and the tests for it set `HOME` to a `tmp_path`
+    first. A `~` expanded at import time cannot be pointed anywhere: whatever
+    it resolves to is a fact about the machine collecting the suite.
+    """
+    for stmt in tree.body:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            for decorator in stmt.decorator_list:
+                yield from ast.walk(decorator)
+        else:
+            yield from ast.walk(stmt)
+
+
+#: Where a named user's home directory lives, on the two platforms this suite
+#: runs on. ASSEMBLED rather than written out: these are the needles of a
+#: detector that reads the module it is written in, and a literal here would be
+#: a true positive of its own.
+HOME_ROOTS = tuple(f"/{name}/" for name in ("Users", "home"))
+
+
+def _machine_paths(source):
+    """`(lineno, what)` for every place a module reaches for a path only one
+    machine has: a literal naming a named user's home anywhere in the file, or
+    a `~` resolved at import time."""
+    tree = ast.parse(source)
+    hits = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if any(root in node.value for root in HOME_ROOTS):
+                hits.append((node.lineno, node.value))
+    for node in _module_level(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) \
+                and node.value.startswith("~"):
+            hits.append((node.lineno, node.value))
+        elif isinstance(node, ast.Call) and _called_name(node) in (
+                "expanduser", "expandvars", "home"):
+            hits.append((node.lineno, _called_name(node)))
+    return sorted(set(hits))
+
+
+def test_no_test_module_names_a_path_only_one_machine_has():
+    """`LIVE_RELAYS`' second entry was a `~/Documents/Work/...` path expanded
+    at import time.
+
+    It cannot resolve anywhere but the laptop it was typed on, so every
+    assertion parametrised over it was green-by-absence on every other machine
+    — and it was, silently, behind a skip that read like a platform fact. A
+    relay that matters is frozen under `tests/fixtures/`, which travels; a live
+    one is DISCOVERED relative to this repository, never spelled out.
+    """
+    for name, source in _test_modules_on_disk():
+        assert _machine_paths(source) == [], name
+
+    # Non-vacuity: the detector finds the entry this test is named after and
+    # both other spellings of the same mistake. Assembled rather than written
+    # out, because this module is one of the modules swept above — a literal
+    # `/Users/...` here would be a true positive of its own.
+    planted = _machine_paths(
+        'A = os.path.expanduser("~/Documents/Work/x/.relay")\n'
+        'B = "{root}someone/relay"\n'
+        'C = Path.home() / ".relay"\n'
+        'def test_x(monkeypatch):\n'
+        '    monkeypatch.setenv("HOME", str(tmp_path))\n'
+        '    assert build(d)["relay"]["path"] == "~/proj"\n'.format(
+            root=HOME_ROOTS[0]))
+    assert [what for _, what in planted] == [
+        "expanduser", "~/Documents/Work/x/.relay",
+        HOME_ROOTS[0] + "someone/relay", "home"], planted
 
 
 def test_module_does_not_import_curses():

@@ -33,12 +33,14 @@ from test_relay_model import (  # noqa: E402,F401  (fixtures are used by name)
     AGENT_SERVICE_BATON_MTIMES,
     ALL_FIXTURES,
     FIXTURES,
+    CORPUS_DENIED_CLAIMS,
     CORPUS_FORK_POINT,
     CORPUS_OWN,
     CORPUS_QUOTED,
     CORPUS_SILENT,
     HAS_GIT,
     corpus_relay,
+    corpus_relay_denied,
     git_run as _git,
     relay,
 )
@@ -1324,29 +1326,73 @@ def test_a_claimed_sha_the_repository_does_not_have_is_not_credited(tmp_path):
     assert entry is not None and entry["leg"] is None
 
 
-def test_this_repos_own_relay_credits_only_shas_this_repo_has():
-    """The defect as it was reproduced: this repository's own log credited
-    `code-judge-S1` with `4f0b17c` and `behaviour-judge-S1` with `8036f9f`,
-    both agent-service shas those judges quoted while reporting on another
-    relay, neither a valid object here. Run in place, because a copy of a
-    relay is outside the repository whose commits it names."""
-    own = REPO / ".relay"
-    if not HAS_GIT or not (own / "batons").is_dir():
-        pytest.skip(".relay is git-ignored and absent from a fresh clone")
-    model = relay_model.build(own, now=NOW)
-    named = sorted({e["commit"] for e in model["log"] if e["commit"]})
-    assert named, "this relay's batons name commits"
-    unresolvable = [sha for sha in named
-                    if subprocess.run(["git", "-C", str(REPO), "cat-file", "-t", sha],
-                                      capture_output=True, text=True).returncode != 0]
-    assert unresolvable == [], unresolvable
-    # Derived at assert time, never hardcoded. This branch's history was
-    # rewritten wholesale on 2026-08-25 - an author rewrite, same trees, every
-    # sha new - and the sha this line used to name stopped existing. A test
-    # naming a sha survives that as a green test that no longer tests anything;
-    # HEAD is the one commit the log must always carry, and git is asked for it.
-    head = _git(REPO, "rev-parse", "--short=7", "HEAD").stdout.strip()
-    assert head in {e["commit"] for e in entries_of(model, "commit")}
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_the_real_corpus_credits_only_shas_its_repository_has(corpus_relay_denied):
+    """THE DEFECT'S OWN REPRODUCTION, on a corpus that travels.
+
+    It was reproduced by reading `REPO / ".relay"` in place: this repository's
+    log credited `code-judge-S1` with `4f0b17c` and `behaviour-judge-S1` with
+    `8036f9f`, both agent-service shas those judges quoted while reporting on
+    another relay, neither a valid object here.
+
+    That reading is behind `.relay/`, which is git-ignored, so it skipped on
+    every clone, every CI checkout and every container - the reproduction of
+    the defect ACC-DATA-009 names in full ran on one laptop and nowhere else,
+    and a `skipif` nobody reads is how a guard stops guarding.
+
+    `corpus_relay_denied` is the same corpus without the machine: the real
+    agent-service batons, claiming their real shas in the real prose their
+    runners wrote, on a repository whose history withholds exactly those two.
+    A sha this repository does not have is not this leg's work, wherever the
+    suite runs. The live relay is still read, at the bottom of this test, as an
+    extra reading of the assertions this one has already made - so the test
+    body is never empty and never skipped.
+    """
+    relay_dir, sha_of = corpus_relay_denied
+    model = relay_model.build(relay_dir, now=None)
+    denied = set(CORPUS_DENIED_CLAIMS)
+    real = set(sha_of.values())
+
+    rows = {r["leg"]: r["commit"] for r in model["runners"]}
+    settled = {sha for sha in rows.values() if sha}
+    assert settled, model["runners"]          # the graft still settles claims
+    assert settled <= real, sorted(settled - real)
+    for sha in CORPUS_DENIED_CLAIMS:
+        leg = next(k for k, v in CORPUS_OWN.items() if v == sha)
+        assert rows[leg] is None, (leg, rows[leg])
+
+    named = {e["commit"] for e in entries_of(model, "commit") if e["commit"]}
+    assert named, model["log"]
+    assert named <= real, sorted(named - real)
+    # Not "not credited to that leg" - not anywhere in the model. A denied sha
+    # reaching a column, a subject or a message is the same lie about what this
+    # run did, whichever pane it arrives in.
+    blob = json.dumps(model)
+    for sha in denied:
+        assert sha not in blob, sha
+
+    # THE LIVE READING, as an extra. Everything above has already run; what a
+    # live relay adds is drift - batons nobody froze, written since. It is read
+    # here rather than in a test of its own precisely so that its absence
+    # cannot empty a test body: on a clone this loop runs zero times and the
+    # assertions that matter have already been made.
+    for own in live_relay_dirs():
+        model = relay_model.build(own, now=NOW)
+        named = sorted({e["commit"] for e in model["log"] if e["commit"]})
+        assert named, ("this relay's batons name commits", own)
+        unresolvable = [
+            sha for sha in named
+            if subprocess.run(["git", "-C", str(own.parent), "cat-file", "-t", sha],
+                              capture_output=True, text=True).returncode != 0]
+        assert unresolvable == [], unresolvable
+        # Derived at assert time, never hardcoded. This branch's history was
+        # rewritten wholesale on 2026-08-25 - an author rewrite, same trees,
+        # every sha new - and the sha this line used to name stopped existing.
+        # A test naming a sha survives that as a green test that no longer
+        # tests anything; HEAD is the one commit the log must always carry, and
+        # git is asked for it.
+        head = _git(own.parent, "rev-parse", "--short=7", "HEAD").stdout.strip()
+        assert head in {e["commit"] for e in entries_of(model, "commit")}
 
 
 # --------------------------------------------------------------------------
@@ -3002,15 +3048,53 @@ def test_an_annotated_tag_at_head_is_not_a_bound_on_the_walk(tmp_path):
 # every relay this suite can read.
 # --------------------------------------------------------------------------
 
-# The relays this model is pointed at while it is being built. `.relay` is
-# git-ignored, and the second lives only on the machine this relay runs on, so
-# each is read where it exists and named where it does not - a live relay is
-# evidence, not a fixture, and it cannot be shipped.
-LIVE_RELAYS = [
-    REPO / ".relay",
-    Path(os.path.expanduser(
-        "~/Documents/Work/Projescts/AI internal/aihub/agent-service/.relay")),
-]
+# A LIVE RELAY IS AN EXTRA, NEVER A GUARD.
+#
+# This list used to hold two paths: `REPO / ".relay"`, which is git-ignored and
+# therefore absent from every clone, CI checkout and container; and a hardcoded
+# `~/Documents/Work/.../agent-service/.relay`, which resolved on one person's
+# disk and nowhere else. Both were read behind a `pytest.skip`, so every
+# assertion over them was green-by-absence off this laptop - the same defect
+# `HAS_GIT` had (84 quiet skips over a live defect) and `ALL_FIXTURES` had
+# (90 tests deletable to zero, still green).
+#
+# The home-directory entry is gone. The relay it named is already frozen at
+# `tests/fixtures/agent-service`, and what it proved beyond the freeze - a
+# baton claiming a sha no branch here reaches - is frozen too, as
+# `corpus_relay_denied`. This repository's own relay stays, DISCOVERED rather
+# than named, and is read only in addition to a frozen corpus that is read
+# every time. The rule the readings below follow: the frozen corpus carries the
+# assertion, a live relay adds drift to it, and no test's whole body sits
+# behind whether a directory happens to exist.
+
+#: Where a live relay could be, relative to this repository. Discovered, never
+#: named: a path a test spells out is a path that resolves on one machine.
+LIVE_RELAY_CANDIDATES = (REPO / ".relay",)
+
+
+def live_relay_dirs(candidates=LIVE_RELAY_CANDIDATES):
+    """Which candidates are relay directories on the machine running this."""
+    return [p for p in candidates if (p / "batons").is_dir()]
+
+
+def test_live_relay_dirs_answers_for_a_candidate_that_is_and_one_that_is_not(
+        tmp_path):
+    """The discovery itself, tested where a relay can be MADE.
+
+    Otherwise `live_relay_dirs` is the one thing in this file whose behaviour
+    depends on the machine reading it: returning `[]` unconditionally would be
+    invisible on a clone and would silently delete the live reading everywhere
+    else. Here it is asked about two directories that exist because this test
+    made them, so the answer is the same on every machine.
+    """
+    present = tmp_path / "present"
+    (present / "batons").mkdir(parents=True)
+    absent = tmp_path / "absent"
+    absent.mkdir()
+    assert live_relay_dirs((present, absent)) == [present]
+    assert live_relay_dirs(()) == []
+    # And the candidate list is derived from this repository, not typed out.
+    assert LIVE_RELAY_CANDIDATES == (REPO / ".relay",)
 
 
 def _reads_a_repository(relay_dir):
@@ -3067,6 +3151,12 @@ def assert_the_model_agrees_with_itself(model, relay_dir):
     entries = {e["commit"]: e["leg"] for e in entries_of(model, "commit") if e["leg"]}
     if not _reads_a_repository(relay_dir):
         assert entries == {}, entries      # nothing here can confirm a claim
+        # A ROW MAY still carry one: `_parse_baton` seeds `commit` with the
+        # baton's first claim and `_settle_commits` only ever narrows it, so
+        # outside a repository the baton's own word stands (its docstring says
+        # so in as many words). Asserting `rows == {}` here was tried while
+        # closing this leg and is WRONG - it contradicts the documented
+        # behaviour on nine of ten fixtures.
         return "no-repository"
     assert set(rows.values()) <= set(entries), \
         sorted(set(rows.values()) - set(entries))
@@ -3159,26 +3249,44 @@ def test_the_log_and_the_rows_agree_on_every_ref_topology(tmp_path, topology, ba
     assert_the_model_agrees_with_itself(model, relay_dir)
 
 
-@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
-@pytest.mark.parametrize("live", LIVE_RELAYS, ids=lambda p: p.parent.name)
-def test_the_log_and_the_rows_agree_on_a_live_relay(live):
-    """The two relays this model is actually pointed at: this one, on a branch
-    its trunk has already absorbed, and the live agent-service relay whose
-    batons claim two shas no branch here reaches. Both were measured
-    contradicting themselves on 2026-08-26 - 20 rows against 5 entries here,
-    and 0 entries at all from a clone.
+def _file_stamps(relay_dir):
+    return sorted((p.name, p.stat().st_mtime)
+                  for p in relay_dir.rglob("*") if p.is_file())
 
-    Read-only, in place, with no clock injected: a live relay is evidence and
-    this suite may not write to one."""
-    if not (live / "batons").is_dir():
-        pytest.skip(f"{live} is not on this machine (a live relay is not a fixture)")
-    before = sorted((p.name, p.stat().st_mtime) for p in live.rglob("*") if p.is_file())
-    model = relay_model.build(live)
-    assert {r["commit"] for r in model["runners"] if r["commit"]}, "a row claims one"
-    assert_the_model_agrees_with_itself(model, live)
-    assert sorted((p.name, p.stat().st_mtime)
-                  for p in live.rglob("*") if p.is_file()) == before, \
-        "build() wrote to a live relay"
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_the_log_and_the_rows_agree_on_a_real_relay(corpus_relay,
+                                                    corpus_relay_denied):
+    """The two relays this model is actually pointed at were measured
+    contradicting themselves on 2026-08-26 - 20 rows against 5 entries here,
+    and 0 entries at all from a clone. Both shapes are frozen: the full graft
+    is a relay whose repository confirms every claim, and the denied graft is
+    one whose repository confirms all but two.
+
+    Every reading is read-only, in place, with no clock injected: `build()` may
+    not write to a relay directory, and this suite may not write to a live one.
+    The frozen readings happen on every machine; a live relay, where the
+    machine running the suite has one, is read in addition to them.
+    """
+    read = []
+    for relay_dir in (corpus_relay[0], corpus_relay_denied[0]):
+        before = _file_stamps(relay_dir)
+        model = relay_model.build(relay_dir, now=None)
+        assert {r["commit"] for r in model["runners"] if r["commit"]}, relay_dir
+        assert assert_the_model_agrees_with_itself(model, relay_dir) == "compared"
+        assert _file_stamps(relay_dir) == before, f"build() wrote to {relay_dir}"
+        read.append(relay_dir)
+    # The frozen readings are not optional. An empty loop is a green test that
+    # compared nothing, which is exactly what the two skipped live readings
+    # this replaced were.
+    assert len(read) == 2, read
+
+    for live in live_relay_dirs():
+        before = _file_stamps(live)
+        model = relay_model.build(live)
+        assert {r["commit"] for r in model["runners"] if r["commit"]}, live
+        assert_the_model_agrees_with_itself(model, live)
+        assert _file_stamps(live) == before, f"build() wrote to {live}"
 
 
 # --------------------------------------------------------------------------
