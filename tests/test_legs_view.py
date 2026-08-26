@@ -323,7 +323,14 @@ def test_cycling_the_filter_moves_the_highlight_and_the_rows_with_it():
                     "%r is the active filter and is drawn exactly like %r"
                     % (entry, other))
             if not counts[key]:
+                # An empty filter is not an empty pane, and it is never a
+                # range the pane did not draw.
                 frame.assert_contains("no leg is %s" % label.lower())
+                assert "none" in frame.raw_lines[row_of(frame, "Legs (")], \
+                    frame._message("an empty filter's meta is not `none`")
+                assert not re.search(r"\d+-\d+ of \d+", frame.text), \
+                    frame._message("an empty filter claims a range it did "
+                                   "not draw")
                 continue
             drawn = Table(frame).ids
             assert len(drawn) == counts[key], frame._message(
@@ -395,18 +402,23 @@ def test_every_column_drawn_carries_its_own_label_whole(size):
     compares the rightmost.
     """
     frame = legs_frame(AGENT_SERVICE, size=size, expect="q Quit")
-    head = frame.find("Stage/ID")
-    if head is None:
-        return
     order = ["Status", "Stage/ID", "Fulfills"]
+    # The head row is the one under the filter row — located that way and not
+    # by looking for `Stage/ID`, because a mutation that drops a label would
+    # otherwise take this test with it.
+    head = row_of(frame, "All (") + 1
+    if head >= frame.rows - 1:
+        return
     labels = [text for _, text in fields(frame.raw_lines[head])]
+    if not any(label in labels for label in order):
+        return                          # too short for a head row at all
     assert [label for label in order if label in labels] == labels, \
         frame._message("the column heads at %dx%d are %r"
                        % (size[1], size[0], labels))
-    table = Table(frame)
-    assert table.rows, frame._message("no leg rows to check the heads against")
-    rightmost = max(fields(frame.raw_lines[index])[-1][0]
-                    for index in table.rows)
+    body = [index for index in range(head + 1, frame.rows - 1)
+            if frame.raw_lines[index].strip()]
+    assert body, frame._message("no rows to check the heads against")
+    rightmost = max(fields(frame.raw_lines[index])[-1][0] for index in body)
     heading = fields(frame.raw_lines[head])[-1][0]
     assert rightmost == heading, frame._message(
         "at %dx%d the last column of content starts at %d and the last "
@@ -490,6 +502,33 @@ def test_every_leg_carries_its_kind_and_an_impl_leg_carries_none():
             % (identifier, kind, table.cells_for(identifier)[1]))
 
 
+def test_a_tight_column_gives_up_the_id_before_it_gives_up_the_kind():
+    """At 40 columns `S1/behaviour-judge-S1 judge` does not fit its column.
+
+    What must give is the id — a leg id cut in the middle still names the leg
+    to a reader who has the plan in front of them, and `judge` is one word that
+    cannot be inferred from what is left of it.
+    """
+    frame = legs_frame(AGENT_SERVICE, size=(12, 40))
+    table = Table(frame)
+    kinds = leg_kinds(AGENT_SERVICE)
+    references = {leg.get("id"): "%s/%s" % (leg.get("stage"), leg.get("id"))
+                  for leg in plan(AGENT_SERVICE)}
+    clipped = 0
+    for _, cells in sorted(table.rows.items()):
+        head = cells[1].split()[0].rstrip(ELLIPSIS)
+        named = [leg for leg, ref in references.items() if ref.startswith(head)]
+        if len(named) != 1 or kinds[named[0]] == "impl":
+            continue
+        assert kind_marker(cells[1]) == kinds[named[0]], frame._message(
+            "%s is a %s leg and its cell reads %r at 40 columns"
+            % (named[0], kinds[named[0]], cells[1]))
+        clipped += cells[1].split()[0] != references[named[0]]
+    assert clipped, frame._message(
+        "no judge or fix leg had its id cut at 40 columns, so this case "
+        "proves nothing")
+
+
 def test_the_kind_marker_is_not_drawn_like_the_leg_id_beside_it():
     frame = legs_frame(AGENT_SERVICE)
     table = Table(frame)
@@ -550,6 +589,61 @@ def test_every_leg_the_view_draws_at_eighty_is_exactly_one_line():
     rows = sorted(table.rows)
     assert rows == list(range(rows[0], rows[0] + len(rows))), frame._message(
         "the leg rows are not contiguous — something wrapped between them")
+
+
+def test_a_leg_that_claims_no_check_gets_a_mark_and_not_a_blank():
+    """A blank cell reads as a table that failed to draw; `0`, `none` and an
+    em-dash each read as a value somebody measured. The convention is
+    `runners-view`'s, one view over: one dim mark per empty cell."""
+    frame = legs_frame(AGENT_SERVICE, size=WIDE)
+    table = Table(frame)
+    claims = leg_fulfills(AGENT_SERVICE)
+    silent = [leg for leg, checks in sorted(claims.items()) if not checks]
+    assert silent, "the fixture has no leg that claims nothing"
+    marks = {table.cells_for(leg)[2] for leg in silent}
+    assert len(marks) == 1, frame._message(
+        "legs claiming no check draw %r — one absence, one spelling" % marks)
+    mark = marks.pop()
+    assert mark and len(mark) == 1 and not mark.isalnum(), frame._message(
+        "a leg claiming no check draws %r, which is not one dim mark" % mark)
+    frame.assert_attrs(mark, has="dim", row=table.row_for(silent[0]))
+
+
+def test_the_table_is_laid_out_to_the_pane_and_not_one_cell_short():
+    """The strict width helper cannot see a table laid out narrower than it may
+    be — every row simply fits. The widest row reaching the pane's own last
+    column is the other half of the claim."""
+    frame = legs_frame(AGENT_SERVICE, size=STANDARD)
+    table = Table(frame)
+    # Measured over the table's own rows: the header and the status bar are
+    # already full width, so a maximum over the whole frame would pass on a
+    # table five cells narrow.
+    widest = max(len(frame.raw_lines[index].rstrip()) for index in table.rows)
+    # The chrome reserves the screen's last column for every view.
+    assert widest == frame.cols - 1, frame._message(
+        "the widest leg row is %d cells of a %d-column screen"
+        % (widest, frame.cols))
+
+
+def test_a_cut_cell_still_says_it_was_cut_under_a_locale_without_utf8():
+    """`chrome.clip()`'s default `…` is dropped to a blank by curses under
+    `LC_ALL=C` — a silent truncation wearing a mark's clothes. Every cell here
+    is cut with the theme's ellipsis, which has an ASCII spelling."""
+    import os
+
+    from relay_control import theme as theme_tokens
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("LC_ALL", "LC_CTYPE", "LANG")}
+    env["LC_ALL"] = "C"
+    ascii_ellipsis = theme_tokens.ASCII_GLYPHS["ellipsis"]
+    frame = legs_frame(AGENT_SERVICE, size=STANDARD, env=env)
+    identifier, whole = widest_fulfills(AGENT_SERVICE)
+    cell = Table(frame).cells_for(identifier)[2]
+    assert len(cell) < len(whole), frame._message(
+        "nothing was cut, so this case proves nothing")
+    assert cell.endswith(ascii_ellipsis), frame._message(
+        "under LC_ALL=C the cut cell reads %r, with no mark to say it was cut"
+        % cell)
 
 
 def test_the_fulfills_column_never_runs_into_the_screen_edge():

@@ -339,19 +339,25 @@ def _head_row(layout):
 def _leg_row(pane, leg, layout):
     """One leg as one line: status, stage and id with its kind, what it fulfils.
 
-    Every cell is clipped to its own column, so the row is exactly as wide as
-    the grid however long a coach's prose is (ACC-LEGS-003). The glyph keeps
-    its own status attribute whatever the word beside it says — the glyph is
-    the leg's state, the word may be the coach's (ACC-TUI-006).
+    Every cell is clipped to its own column with the *theme's* ellipsis, so the
+    row is exactly as wide as the grid however long a coach's prose is
+    (ACC-LEGS-003) and the mark survives a locale that cannot encode `…` —
+    `chrome.clip()`'s default is dropped to a blank by curses there, which is a
+    silent truncation wearing a mark's clothes.
+
+    The glyph keeps its own status attribute whatever the word beside it says:
+    the glyph is the leg's state, the word may be the coach's (ACC-TUI-006).
     """
     status_width, stage_width, fulfills_width = layout
+    ellipsis = pane.theme.glyph("ellipsis")
     lead, attr = _lead(pane, leg)
     parts = [(lead, attr)]
 
     room = status_width - len(lead)
     if room > 0:
         note = raw_status_note(leg)
-        parts.append((chrome.clip(_status_word(leg), room).ljust(room + GAP),
+        parts.append((chrome.clip(_status_word(leg), room, ellipsis)
+                      .ljust(room + GAP),
                       _note_attr(pane, note) if note else attr))
     else:
         parts.append((" " * GAP, theme_tokens.BODY))
@@ -360,7 +366,7 @@ def _leg_row(pane, leg, layout):
         marker = _marker(leg)
         suffix = " " + marker if marker else ""
         reference = chrome.clip(_reference(leg),
-                                max(1, stage_width - len(suffix)))
+                                max(1, stage_width - len(suffix)), ellipsis)
         parts.append((reference, theme_tokens.EMPHASIS if leg.get("isActive")
                       else theme_tokens.BODY))
         if marker:
@@ -372,13 +378,15 @@ def _leg_row(pane, leg, layout):
             parts.append((" " * pad, theme_tokens.BODY))
 
     if fulfills_width:
-        # An empty cell is the empty list: this leg claims no check. Nothing is
-        # invented in its place — a dash or a `0` would be a value the plan
-        # does not carry (ACC-DATA-007's rule, one layer up).
+        # A cell with no source is one dim mark, never a blank: a blank cell
+        # reads as a table that failed to draw, and `0`, `none` or an em-dash
+        # each read as a value somebody measured. The convention is
+        # `runners-view`'s, one view over, and it is the same sentence
+        # `pane.empty()` says at pane scale.
         checks = ", ".join(leg.get("fulfills") or [])
-        if checks:
-            parts.append((chrome.clip(checks, fulfills_width),
-                          theme_tokens.MUTED))
+        parts.append((chrome.clip(checks, fulfills_width, ellipsis),
+                      theme_tokens.MUTED) if checks
+                     else (pane.theme.glyph("bullet"), theme_tokens.ABSENT))
     return parts
 
 
@@ -397,8 +405,9 @@ def draw(canvas, model, state):
     if pane is None:                        # too small for a pane at all
         return
     if not legs:
-        # A filter row of five zeroes is filler, not information.
-        pane.header(None)
+        # A filter row of five zeroes is filler, not information. `none`, in
+        # the meta and in words in the body, is how every pane says this.
+        pane.header("none")
         pane.empty("no legs planned yet")
         return
 
@@ -408,18 +417,22 @@ def draw(canvas, model, state):
         pane.segments(row, _filter_row(pane, _counts(legs), active))
         row += 1
 
+    if not shown:
+        # An empty filter is not an empty pane: the row above says how many of
+        # each there are, and the body says which one is showing and that it is
+        # empty. Never `1-0 of 36`, and no column heads — a heading over an
+        # empty table labels nothing (ACC-OVER-001's rule, one view over).
+        pane.header("none")
+        pane.line(row, "no leg is %s" % FILTERS[active][0].lower(),
+                  theme_tokens.ABSENT)
+        return
+
     layout = _layout(pane, legs, pane.body_width)
     # A heading is never the last row drawn: with no room for a leg under them
     # the column labels give their row up to the content they were labelling.
     if pane.body_height - row >= 2:
         pane.segments(row, _head_row(layout))
         row += 1
-
-    if not shown:
-        pane.header(None)
-        pane.line(row, "no leg is %s" % FILTERS[active][0].lower(),
-                  theme_tokens.ABSENT)
-        return
 
     drawn, hidden = chrome.paginate(shown, pane.body_height - row)
     # Never a range the pane did not draw: too short for a single leg says how
