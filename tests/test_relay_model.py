@@ -10,6 +10,7 @@ does not preserve mtimes, so every test that cares about ordering works against
 a copy in `tmp_path` with the recorded mtimes stamped back on (see `relay()`).
 """
 
+import ast
 import json
 import os
 import re
@@ -165,8 +166,8 @@ def sweep_for_relay_readers(root):
         text = path.read_text(errors="replace")
         swept[rel] = text
         lines = text.splitlines()
-        named = [l.strip() for l in lines if RELAY_FILE_NAMES.search(l)]
-        reads = [l.strip() for l in lines if RELAY_READS.search(l)]
+        named = [line.strip() for line in lines if RELAY_FILE_NAMES.search(line)]
+        reads = [line.strip() for line in lines if RELAY_READS.search(line)]
         if named and reads:
             offenders[rel] = (named + reads)[:4]
     return swept, offenders
@@ -228,14 +229,14 @@ def test_the_only_reader_sweep_can_see_a_new_reader(shape, body):
 
 def test_stale_currentleg_does_not_force_a_done_leg_to_running(relay):
     model = relay_model.build(relay("stale-currentleg"))
-    by_id = {l["id"]: l for l in model["legs"]}
+    by_id = {leg["id"]: leg for leg in model["legs"]}
 
     # state.json still names it; legs.json says done. legs.json wins.
     assert model["relay"]["currentLegDeclared"] == "open-and-green-mr"
     assert by_id["open-and-green-mr"]["status"] == "completed"
 
-    running = [l for l in model["legs"] if l["status"] == "running"]
-    assert len(running) == 1, [l["id"] for l in running]
+    running = [leg for leg in model["legs"] if leg["status"] == "running"]
+    assert len(running) == 1, [leg["id"] for leg in running]
     assert running[0]["id"] == "cutover-flip"
     assert model["activeLeg"]["id"] == "cutover-flip"
     assert model["legCounts"]["running"] == 1
@@ -245,28 +246,28 @@ def test_agent_service_reports_one_running_leg_not_two(relay):
     """The defect as observed: currentLeg named a done leg and the renderer
     forced it to display running, giving two In Progress legs."""
     model = relay_model.build(relay("agent-service"))
-    by_id = {l["id"]: l for l in model["legs"]}
+    by_id = {leg["id"]: leg for leg in model["legs"]}
 
     assert model["relay"]["currentLegDeclared"] == "open-and-green-mr"
     assert by_id["open-and-green-mr"]["status"] == "completed"
 
-    running = [l for l in model["legs"] if l["status"] == "running"]
-    assert len(running) == 1, [l["id"] for l in running]
+    running = [leg for leg in model["legs"] if leg["status"] == "running"]
+    assert len(running) == 1, [leg["id"] for leg in running]
     assert running[0]["id"] == "code-judge-S3-r2"
     assert model["activeLeg"]["id"] == "code-judge-S3-r2"
 
 
 def test_active_leg_is_the_first_running_leg_in_plan_order(relay):
     model = relay_model.build(relay("agent-service"))
-    running = [l for l in model["legs"] if l["status"] == "running"]
+    running = [leg for leg in model["legs"] if leg["status"] == "running"]
     assert model["activeLeg"]["id"] == running[0]["id"]
-    assert model["activeLeg"]["order"] == min(l["order"] for l in running)
+    assert model["activeLeg"]["order"] == min(leg["order"] for leg in running)
 
 
 def test_currentleg_naming_a_missing_leg_is_not_invented(relay):
     model = relay_model.build(relay("ghost-currentleg"))
     assert model["relay"]["currentLegDeclared"] == "a-leg-that-does-not-exist"
-    assert [l["id"] for l in model["legs"]] == ["one", "two"]
+    assert [leg["id"] for leg in model["legs"]] == ["one", "two"]
     assert model["activeLeg"] is None          # nothing is running
     assert model["activeRunner"] is None
     assert any("a-leg-that-does-not-exist" in w for w in model["warnings"])
@@ -294,7 +295,7 @@ def test_blocked_leg_keeps_its_raw_status(relay):
     """`blocked` is not one of the four leg states, so it maps to pending —
     but the word the coach wrote survives for a view that wants it."""
     model = relay_model.build(relay("agent-service"))
-    by_id = {l["id"]: l for l in model["legs"]}
+    by_id = {leg["id"]: leg for leg in model["legs"]}
     assert by_id["cutover-flip"]["status"] == "pending"
     assert by_id["cutover-flip"]["rawStatus"] == "blocked"
 
@@ -310,14 +311,24 @@ def test_active_leg_and_active_runner_never_disagree(name, relay):
     if leg is None or runner is None:
         assert leg is None and runner is None, (name, leg, runner)
     else:
+        # ACC-DATA-003 is identity, not string equality — and this test is the
+        # one the amendment was written about: `runner["leg"] == leg["id"]`
+        # HELD throughout the duplicate-id defect, because both twins answer to
+        # the one id. `activeRunner = dict(row)` passes it too. The equality is
+        # kept because it names the failure readably; the identity is what
+        # decides.
         assert runner["leg"] == leg["id"], name
+        assert any(row is runner for row in model["runners"]), name
+        assert any(row is leg for row in model["legs"]), name
 
 
 def test_active_runner_is_present_when_a_leg_runs(relay):
     model = relay_model.build(relay("agent-service"))
     assert model["activeRunner"]["leg"] == "code-judge-S3-r2"
     assert model["activeRunner"]["status"] == "running"
-    assert model["activeRunner"] in model["runners"]
+    # `in` on a list of dicts is `==`, which a detached copy satisfies. The
+    # runner must BE one of the rows (ACC-DATA-003).
+    assert any(row is model["activeRunner"] for row in model["runners"])
 
 
 def test_no_active_runner_when_nothing_runs(relay):
@@ -332,7 +343,7 @@ def test_runner_active_count_equals_running_legs(relay):
     legs displayed as running."""
     for name in ALL_FIXTURES:
         model = relay_model.build(relay(name))
-        running = sum(1 for l in model["legs"] if l["status"] == "running")
+        running = sum(1 for leg in model["legs"] if leg["status"] == "running")
         assert model["runnerCounts"]["active"] == running, name
 
 
@@ -432,7 +443,7 @@ def test_check_vocabulary(raw, expected):
 
 def test_kind_of_uses_explicit_kind_then_id(relay):
     model = relay_model.build(relay("agent-service"))
-    kinds = {l["id"]: l["kind"] for l in model["legs"]}
+    kinds = {leg["id"]: leg["kind"] for leg in model["legs"]}
     assert kinds["cutover-flip"] == "impl"
     assert kinds["code-judge-S3-r2"] == "judge"      # no `kind` field; id says judge
     assert kinds["fix-agenttype-write-paths"] == "fix"
@@ -441,13 +452,13 @@ def test_kind_of_uses_explicit_kind_then_id(relay):
 
 def test_fix_kind_from_repairs(relay):
     model = relay_model.build(relay("all-done"))
-    kinds = {l["id"]: l["kind"] for l in model["legs"]}
+    kinds = {leg["id"]: leg["kind"] for leg in model["legs"]}
     assert kinds["b"] == "fix"
 
 
 def test_cancelled_leg_normalises(relay):
     model = relay_model.build(relay("all-done"))
-    by_id = {l["id"]: l for l in model["legs"]}
+    by_id = {leg["id"]: leg for leg in model["legs"]}
     assert by_id["c"]["status"] == "cancelled"
     assert model["legCounts"]["cancelled"] == 1
     assert model["relay"]["phase"] == "complete"
@@ -581,7 +592,7 @@ def test_baton_prose_is_read_on_demand_not_carried_in_the_model(relay):
 
 def test_a_baton_without_a_leg_is_reported_not_silently_dropped(relay):
     model = relay_model.build(relay("agent-service"))
-    legs = {l["id"] for l in model["legs"]}
+    legs = {leg["id"] for leg in model["legs"]}
     assert "s2-test-quality" not in legs                 # baton exists, leg does not
     assert any("s2-test-quality" in w for w in model["warnings"])
 
@@ -820,13 +831,25 @@ def test_no_runner_column_carries_a_display_placeholder(name, relay):
 
 @pytest.mark.parametrize("name", ALL_FIXTURES)
 def test_no_runner_column_carries_a_display_placeholder_in_place(name):
-    """And with the fixture read where it lies, inside this repository, so the
-    commit-reading branch of `build()` runs. A commit *subject* quoted into a
-    log entry may legitimately contain an em-dash — that is a recorded
-    decision, and it is why this sweep is over the runner columns rather than
-    over every string in the model."""
+    """And with the fixture read where it lies, on the real wall clock and with
+    no mtime stamping — the two things the `tmp_path` copy above cannot have.
+
+    It does NOT reach the commit-reading branch, and it used to say it did. No
+    fixture under `tests/fixtures/` holds a `.git` of its own, and `_in_a_repo`
+    stops the walk at the relay's own project, so reading one in place asks git
+    nothing at all (`test_the_fixture_in_place_is_asked_no_git_question_at_all`
+    in `test_progress_log.py` is that fact, spied at the seam). The corpus
+    sweeps below are what reach that branch; this one is the clock-and-mtime
+    half. A docstring that overclaims is how a reader concludes a property is
+    covered when it is not, so the claim is asserted here rather than narrated.
+
+    A commit *subject* quoted into a log entry may legitimately contain an
+    em-dash — that is a recorded decision, and it is why this sweep is over the
+    runner columns rather than over every string in the model."""
+    target = FIXTURES / name
+    assert relay_model._in_a_repo(target, target) is False, target
     _assert_no_placeholder_columns(
-        relay_model.build(FIXTURES / name)["runners"], f"{name} (in place)")
+        relay_model.build(target)["runners"], f"{name} (in place)")
 
 
 def test_no_runner_column_carries_a_display_placeholder_when_unsourced(unsourced):
@@ -1164,8 +1187,14 @@ def test_the_corpus_can_reach_what_the_sweeps_guard(git_corpus, unsourced_in_a_r
     # The retired rule, made falsifiable: an em-dash the model quotes rather
     # than invents. Against this corpus the pre-amendment
     # "no em-dash anywhere in the model" test goes red, which is why it is gone.
+    #
+    # The constant is asserted first, because it is the thing that carries the
+    # property: a corpus whose only em-dash was edited out of it still passes
+    # `subjects` below, on the other relay's subject, while the test that names
+    # this constant loses its point silently.
+    assert EM_DASH in CORPUS_EM_DASH_SUBJECT, CORPUS_EM_DASH_SUBJECT
     subjects = [e["m"] for e in commits if EM_DASH in e["m"]]
-    assert subjects, [e["m"] for e in commits]
+    assert len(subjects) >= 2, [e["m"] for e in commits]
 
 
 @pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
@@ -1203,11 +1232,18 @@ def test_a_quoted_commit_subject_may_carry_an_em_dash(corpus_relay):
     in it; this asserts the amended rule in the same place."""
     relay_dir, _ = corpus_relay
     model = relay_model.build(relay_dir, now=None)
+    # The constant is what carries the property this test is named for, so it
+    # is asserted rather than assumed. Without this line the em-dash could be
+    # edited out of `CORPUS_EM_DASH_SUBJECT` and every assertion below would
+    # still hold - a test that cannot tell a corpus that exercises the property
+    # from one that does not.
+    assert EM_DASH in CORPUS_EM_DASH_SUBJECT, CORPUS_EM_DASH_SUBJECT
     quoted = [e for e in model["log"]
               if e["kind"] == "commit" and CORPUS_EM_DASH_SUBJECT in e["m"]]
     assert quoted, [e["m"] for e in model["log"] if e["kind"] == "commit"]
     # Quoted whole: the em-dash survives and the subject is not truncated at it.
     assert quoted[0]["m"].endswith(CORPUS_EM_DASH_SUBJECT)
+    assert EM_DASH in quoted[0]["m"], quoted[0]["m"]
 
 
 @pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
@@ -1394,6 +1430,11 @@ def test_explicit_log_is_returned_verbatim(relay):
         "plan approved",
     ]
     assert model["logSource"] == "dashboard"
+    # ACC-DATA-006: "the same object", not merely an equal one. `==` is blind
+    # to `entries.append(dict(entry))`, so the model-level guard for this check
+    # asserts identity as well - the full account lives beside the other
+    # ACC-DATA-006 tests in `test_progress_log.py`.
+    assert all(a is b for a, b in zip(model["log"], model["extras"]["log"]))
 
 
 def test_the_log_is_derived_when_the_coach_writes_none(relay):
@@ -1436,7 +1477,7 @@ def test_missing_relay_directory_raises_a_clear_error(tmp_path):
 
 def test_legs_only(relay):
     model = relay_model.build(relay("legs-only"))
-    assert [l["id"] for l in model["legs"]] == ["solo"]
+    assert [leg["id"] for leg in model["legs"]] == ["solo"]
     assert model["legs"][0]["status"] == "running"
     assert model["activeLeg"]["id"] == "solo"
     assert model["activeRunner"]["leg"] == "solo"
@@ -1514,9 +1555,9 @@ def test_top_level_keys_are_stable(name, relay):
 def test_stage_order_and_names(relay):
     model = relay_model.build(relay("agent-service"))
     assert [s["id"] for s in model["stages"]] == ["S1", "S2", "S3", "S4"]
-    orders = [l["order"] for l in model["legs"]]
+    orders = [leg["order"] for leg in model["legs"]]
     assert orders == sorted(orders)
-    stages = [l["stage"] for l in model["legs"]]
+    stages = [leg["stage"] for leg in model["legs"]]
     assert stages == sorted(stages, key=lambda s: ["S1", "S2", "S3", "S4"].index(s))
     assert model["legs"][0]["stageName"] == "Reconcile the branch stack"
 
@@ -1553,10 +1594,90 @@ def test_build_never_writes_to_the_relay_directory(relay):
     assert before == after
 
 
+#: The test modules this sweep owns. `tests/frame*.py` is deliberately absent:
+#: it belongs to another check and a sweep that fails on somebody else's file
+#: is a sweep that gets deleted.
+SWEPT_TEST_MODULES = ("test_relay_model.py", "test_progress_log.py")
+
+
+def _duplicate_top_level_names(source):
+    """Top-level `def`/`class` names defined more than once, with their lines."""
+    tree = ast.parse(source)
+    seen, duplicates = {}, {}
+    for node in tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                 ast.ClassDef)):
+            continue
+        if node.name in seen:
+            duplicates.setdefault(node.name, [seen[node.name]]).append(node.lineno)
+        else:
+            seen[node.name] = node.lineno
+    return seen, duplicates
+
+
+def test_no_test_module_defines_one_name_twice():
+    """A second `def` of a name silently deletes the first (ACC-DATA-*, all).
+
+    Python's last definition wins, so a test re-using an existing test's name
+    removes that test from the suite with no diagnostic anywhere: the count
+    goes down by one, every remaining test passes, and the property the deleted
+    test guarded is unguarded. It is the purest form of a guard that does not
+    guard, and it leaves no trace in a passing run.
+
+    `ruff`'s F811 would report it, but F811 is turned off for
+    `test_progress_log.py` in `ruff.toml` — it fires 39 times there on pytest's
+    fixture-argument protocol, which is not a redefinition — so the guard is
+    made directly here rather than lost with the noise. This form is also
+    stricter than the rule it replaces: F811 says nothing about a name
+    redefined after a use, and this does.
+
+    Non-vacuous by construction: it fails if it swept no file, if a module
+    defined nothing, or if the detector cannot see a duplicate that is there.
+    """
+    swept = {}
+    for name in SWEPT_TEST_MODULES:
+        path = Path(__file__).resolve().parent / name
+        assert path.is_file(), path
+        names, duplicates = _duplicate_top_level_names(path.read_text())
+        assert duplicates == {}, (name, duplicates)
+        assert len(names) > 50, (name, len(names))
+        swept[name] = len(names)
+
+    assert len(swept) == len(SWEPT_TEST_MODULES), swept
+    # And the detector can see one: without this the sweep above passes on an
+    # `_duplicate_top_level_names` that returns `{}` unconditionally.
+    _, planted = _duplicate_top_level_names(
+        "def test_a():\n    pass\n\n\ndef test_a():\n    pass\n")
+    assert planted == {"test_a": [1, 5]}, planted
+
+
 def test_module_does_not_import_curses():
+    """The model is the data layer: a renderer imports it, never the reverse.
+
+    The source check is the readable half. The second line here used to be
+    `assert "curses" not in sys.modules or True`, which cannot fail — and which
+    could not have been written as it was meant even so, because by the time
+    this file runs some other test in the suite may legitimately have imported
+    curses. The honest form of "the module never pulls it in" is a fresh
+    interpreter that imports nothing else, so that is what it asks: `import
+    curses` spelled any way at all — a dynamic `__import__`, an
+    `importlib.import_module`, a transitive import through another module —
+    leaves `curses` in that interpreter's `sys.modules` and fails here, while
+    the source check alone sees only the literal spelling.
+    """
     source = (REPO / "scripts" / "relay_model.py").read_text()
     assert "import curses" not in source
-    assert "curses" not in sys.modules or True     # the module never pulls it in
+
+    probe = ("import sys, json;"
+             "sys.path.insert(0, sys.argv[1]);"
+             "import relay_model;"
+             "print(json.dumps(sorted(m for m in sys.modules"
+             " if m == 'curses' or m.startswith('curses.'))))")
+    out = subprocess.run([sys.executable, "-c", probe, str(REPO / "scripts")],
+                         capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    pulled = json.loads(out.stdout.strip().splitlines()[-1])
+    assert pulled == [], pulled
 
 
 # --------------------------------------------------------------------------
@@ -1692,7 +1813,12 @@ def test_state_pointers_of_the_wrong_type_never_raise(tmp_path, bad):
         state={"currentLeg": bad, "currentStage": bad, "phase": bad})
     model = relay_model.build(target)
     assert isinstance(model, dict)
-    assert model["relay"]["currentLegDeclared"] in (None, str(bad))
+    # Not `in (None, str(bad))`: that accepts both possible answers, so no
+    # coercion of this field could ever fail it. A pointer that is not a string
+    # is absent, and — when it is present and merely the wrong type — named.
+    assert model["relay"]["currentLegDeclared"] is None, model["relay"]
+    if bad is not None:
+        assert any("`currentLeg`" in w for w in model["warnings"]), model["warnings"]
     assert model["relay"]["currentStage"] is None or isinstance(
         model["relay"]["currentStage"]["id"], str)
 
@@ -1716,8 +1842,12 @@ def test_dashboard_fields_of_the_wrong_type_never_raise(tmp_path):
     model = relay_model.build(target)
     assert isinstance(model, dict)
     assert isinstance(model["relay"]["path"], str)
-    assert model["relay"]["title"] in (None, "a") or isinstance(
-        model["relay"]["title"], str)
+    # The second disjunct used to subsume the first, so this accepted any
+    # string at all: a title of `["a"]` rendered as `'["a"]'` passed a test
+    # named for coercion. A list is not a title; it is absent and named.
+    assert model["relay"]["title"] is None, model["relay"]["title"]
+    assert any("`title`" in w and "list" in w for w in model["warnings"]), \
+        model["warnings"]
 
 
 def test_build_of_an_empty_path_is_refused(tmp_path):
@@ -2219,6 +2349,28 @@ def test_the_read_bound_leaves_room_for_the_largest_relay_file_on_disk():
 # every relay-file read goes through one door
 # --------------------------------------------------------------------------
 
+#: The marker a read carries when it is guarded at its own site rather than by
+#: `_read_relay_file`. There is exactly one, and the test below says so: an
+#: exemption nobody counts is how an allow-list becomes an exemption for
+#: everything.
+GUARDED_READ_MARKER = "# guarded read:"
+
+#: Every way this module could read a path outside the one guarded helper.
+#: `scandir(`, `listdir(` and `os.walk(` were absent for this sweep's whole
+#: life, and `os.scandir` is the module's ONE directory listing — so the single
+#: read the sweep most needed to see was the one idiom it could not.
+UNGUARDED_READ = re.compile(
+    r"\.read_text\(|\.read_bytes\(|(?<!os\.)(?<!\w)open\(|\.glob\(|"
+    r"\.iterdir\(|scandir\(|listdir\(|os\.walk\(")
+
+
+def unguarded_reads(source):
+    """Lines of `source` that read a path outside `_read_relay_file`."""
+    return [f"{n}: {line.strip()}"
+            for n, line in enumerate(source.splitlines(), 1)
+            if UNGUARDED_READ.search(line) and GUARDED_READ_MARKER not in line]
+
+
 def test_every_relay_file_read_goes_through_the_one_guarded_helper():
     """The guard only guards while it is the only way in.
 
@@ -2226,14 +2378,37 @@ def test_every_relay_file_read_goes_through_the_one_guarded_helper():
     and it grew a third read that had neither. One helper is the thing a test
     can hold the module to, so this test holds it: no unguarded reader appears
     anywhere in `relay_model.py`.
+
+    The detector is asserted too. A sweep is worth what its detector can see,
+    and this one could not see a directory listing at all — which is the shape
+    of the module's one read outside the helper, `os.scandir` on the batons
+    directory. That read is guarded where it stands and says so with
+    `GUARDED_READ_MARKER`; the marker is counted, so an exemption cannot spread
+    quietly, and the detector is shown a planted reader of every idiom it
+    claims to know.
     """
     source = (REPO / "scripts" / "relay_model.py").read_text()
-    unguarded = re.compile(
-        r"\.read_text\(|\.read_bytes\(|(?<!os\.)(?<!\w)open\(|\.glob\(|\.iterdir\(")
-    offenders = [f"{n}: {line.strip()}"
-                 for n, line in enumerate(source.splitlines(), 1)
-                 if unguarded.search(line)]
-    assert offenders == [], offenders
+    assert unguarded_reads(source) == [], unguarded_reads(source)
+
+    # The exemption, counted. One read is guarded at its site; a second one
+    # appearing is a decision somebody has to make, not a line to slip in.
+    assert source.count(GUARDED_READ_MARKER) == 1, source.count(GUARDED_READ_MARKER)
+    marked = [line for line in source.splitlines() if GUARDED_READ_MARKER in line]
+    assert "os.scandir(" in marked[0], marked
+
+    # And the detector sees each idiom, so `offenders == []` above means "there
+    # are none", not "the regex no longer matches anything".
+    planted = ["    data = path.read_text()",
+               "    data = path.read_bytes()",
+               "    fh = open(path)",
+               "    for p in path.glob('*.md'): pass",
+               "    for p in path.iterdir(): pass",
+               "    for e in os.scandir(path): pass",
+               "    for name in os.listdir(path): pass",
+               "    for root, dirs, files in os.walk(path): pass"]
+    for line in planted:
+        assert unguarded_reads(line) == [f"1: {line.strip()}"], line
+        assert unguarded_reads(line + "   " + GUARDED_READ_MARKER + " why") == []
 
 
 # --------------------------------------------------------------------------
@@ -2756,14 +2931,74 @@ def test_active_leg_and_active_runner_agree_on_every_fixture(name, relay):
 
 @pytest.mark.parametrize("name", ALL_FIXTURES)
 def test_active_leg_and_active_runner_agree_on_every_fixture_in_place(name):
-    """The same fixtures where they really live, inside this repository.
+    """The same fixtures where they really live, on the real wall clock.
 
-    Every other reading of them is of a copy in `tmp_path`, which sits outside
-    any git repository — so the branch of `build()` that reads commits never
-    runs there. Neither half of this invariant depends on mtimes, so the
-    fixture needs no stamping and can be read where it lies.
+    Neither half of this invariant depends on mtimes, so the fixture needs no
+    stamping and can be read where it lies. What that adds over the `tmp_path`
+    copy above is the real clock and the real path — NOT the commit-reading
+    branch of `build()`, which this reading does not reach either: a fixture
+    holds no `.git` of its own and `_in_a_repo` stops the walk at the relay's
+    own project. The wording here used to imply otherwise, so the bound is
+    asserted rather than described. `ACC-DATA-003` over a relay that does reach
+    git is `test_active_leg_and_active_runner_agree_in_a_repository` below.
     """
-    assert_active_agrees(relay_model.build(FIXTURES / name), f"{name} (in place)")
+    target = FIXTURES / name
+    assert relay_model._in_a_repo(target, target) is False, target
+    assert_active_agrees(relay_model.build(target), f"{name} (in place)")
+
+
+#: How many of `ALL_FIXTURES` carry a running leg. `assert_active_agrees`
+#: returns early — silently, and correctly — when a relay has no active leg,
+#: so a fixture set that drifted to all-done would turn both sweeps above into
+#: sweeps of early returns with nothing said about it. This is the count that
+#: says how much of the sweep is real, and it is asserted, not assumed.
+FIXTURES_WITH_AN_ACTIVE_LEG = 6
+
+
+def test_the_active_leg_sweeps_are_not_sweeps_of_early_returns():
+    """The non-vacuity guard for the two sweeps above (ACC-DATA-003).
+
+    `assert_active_agrees` asserts the whole disjunction, and one arm of it —
+    "both are absent" — is satisfied by returning. That is the right shape for
+    the helper and the wrong shape to leave uncounted: a relay with nothing
+    running exercises none of the identity assertions, so a sweep over ten
+    fixtures says as little as a sweep over zero if none of them is running.
+    """
+    active = [name for name in ALL_FIXTURES
+              if relay_model.build(FIXTURES / name, now=None)["activeLeg"]]
+    assert len(active) == FIXTURES_WITH_AN_ACTIVE_LEG, active
+    # And the identity arm really runs on each of them: a leg is active and a
+    # runner row is the one it derives.
+    for name in active:
+        model = relay_model.build(FIXTURES / name, now=None)
+        assert model["activeRunner"] is not None, name
+        assert any(row is model["activeRunner"] for row in model["runners"]), name
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+@pytest.mark.parametrize("label", GIT_CORPUS_LABELS)
+def test_active_leg_and_active_runner_agree_in_a_repository(label, git_corpus):
+    """ACC-DATA-003 over a relay where the commit branch of `build()` runs.
+
+    Every other reading of this invariant is of a relay outside any repository
+    of its own, so `_settle_commits` never runs and no runner row's `commit`
+    ever came from git. That is the same hole ACC-DATA-007's five sweeps had,
+    and it is closed here with the same corpus rather than left to be found
+    again on the next check.
+    """
+    model = relay_model.build(git_corpus[label], now=None)
+    assert_active_agrees(model, label)
+    # Non-vacuity, in the shape this corpus exists to provide: the relay really
+    # reached git, so the row the invariant is about carries a settled column.
+    assert any(row["commit"] for row in model["runners"]), model["runners"]
+
+
+def test_the_git_corpus_has_an_active_leg_to_agree_about(git_corpus):
+    """And at least one of the two corpus relays runs a leg, so the sweep above
+    is not two early returns."""
+    active = [label for label, target in git_corpus.items()
+              if relay_model.build(target, now=None)["activeLeg"]]
+    assert active, list(git_corpus)
 
 
 def test_duplicate_leg_ids_do_not_split_active_leg_from_active_runner(tmp_path):
@@ -2873,7 +3108,13 @@ def test_two_running_legs_are_reported_and_warned_about(tmp_path):
     assert model["legCounts"]["running"] == 2
     assert_active_agrees(model, "two running")
     assert model["activeLeg"]["id"] == "a"        # first in plan order
-    assert any("a" in w and "b" in w for w in model["warnings"]), model["warnings"]
+    # Quoted, not merely present: `"a" in w and "b" in w` is satisfied by any
+    # sentence with the letters in it — "two legs are both marked running"
+    # passes it while naming neither leg, which is the whole point of the
+    # warning. The model quotes an id it is naming, so the test asks for that.
+    named = [w for w in model["warnings"] if "'a'" in w and "'b'" in w]
+    assert len(named) == 1, model["warnings"]
+    assert "running" in named[0], named[0]
 
 
 def test_active_runner_is_the_same_object_as_its_runner_row(relay):

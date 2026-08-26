@@ -234,6 +234,32 @@ def test_explicit_log_is_returned_verbatim(relay):
     assert model["logSource"] == "dashboard"
 
 
+def test_an_explicit_dict_entry_is_the_coachs_own_object_not_a_copy(relay):
+    """ACC-DATA-006's "unchanged, as the same objects" - the half a `==`
+    assertion cannot see.
+
+    `entries.append(dict(entry))` is `==` to the entry it copies and is not it,
+    and both guards for this check compared with `==`, so the model could have
+    been handing views a copy of the coach's log at every gate and every one of
+    them would have stayed green. The contract's word is *unchanged*: the model
+    does not edit what the coach wrote, and the strongest statement of "did not
+    edit" is "did not touch".
+
+    `model["extras"]` is the parsed `dashboard.json` itself, so the objects the
+    coach wrote are reachable from the model and identity is assertable from
+    outside. Held together with the `==` guard above: identity alone would miss
+    an entry edited in place, and `==` alone misses a copy.
+    """
+    target = relay("tokens")
+    model = relay_model.build(target, now=NOW)
+    written = model["extras"]["log"]
+    assert model["logSource"] == "dashboard"
+    assert len(written) == 3 and all(isinstance(e, dict) for e in written)
+    assert len(model["log"]) == len(written)
+    for i, (returned, original) in enumerate(zip(model["log"], written)):
+        assert returned is original, (i, id(returned), id(original))
+
+
 def test_explicit_log_wins_even_though_a_baton_could_be_derived(relay):
     """The tokens fixture has a baton on disk. The coach's log still wins."""
     target = relay("tokens")
@@ -311,8 +337,10 @@ def test_a_log_entry_that_is_not_an_object_is_named_and_still_readable(relay):
 
     assert model["logSource"] == "dashboard"
     assert len(model["log"]) == 3
-    # The dict entry is untouched: verbatim means verbatim where it can be.
+    # The dict entry is untouched: verbatim means verbatim where it can be,
+    # and "untouched" is identity - a copy is `==` to it and is not it.
     assert model["log"][0] == {"t": "1h ago", "m": "a proper entry", "cls": "note"}
+    assert model["log"][0] is model["extras"]["log"][0]
     assert model["log"][1] == {"t": None, "m": "a bare string the coach wrote",
                                "cls": None}
     # A non-string entry is RENDERED, never replaced by a placeholder: what the
@@ -425,12 +453,21 @@ def test_the_fixture_in_place_is_asked_no_git_question_at_all():
 
 
 def _host_repo_subjects():
-    """Commit subjects of the repository the fixtures happen to live in."""
+    """Commit subjects of the repository the fixtures happen to live in.
+
+    Every failure mode of this read returns the empty list, and the caller
+    asserts once per subject — so an empty list is a test that asserts nothing
+    and reports success. `--format=%s` mutated to `--format=%H` is the same
+    hole with the list still full: the needles stop being subjects and
+    `subject not in messages` is true forever. Both are closed at the call
+    site, which asserts what came back before using it.
+    """
     if not HAS_GIT or not (REPO / ".git").exists():
         return []
     out = subprocess.run(
         ["git", "-C", str(REPO), "log", "--no-color", "--format=%s"],
         capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
     return [s for s in out.stdout.splitlines() if s.strip()]
 
 
@@ -447,7 +484,15 @@ def test_no_host_repo_commit_subject_reaches_the_fixture_log():
     what happened in the fixture's relay, whatever `kind` it arrives under."""
     model = relay_model.build(FIXTURES / "agent-service", now=NOW)
     messages = " | ".join(e["m"] for e in model["log"])
-    for subject in _host_repo_subjects():
+    subjects = _host_repo_subjects()
+    # The needles, asserted before they are used: an empty list makes the loop
+    # below assert nothing at all, and a list of shas makes it assert nothing
+    # that matters. This repository's commits are `leg-id: prose` — real
+    # subjects, with spaces in them, and there are many.
+    assert len(subjects) >= 10, subjects
+    assert sum(" " in s for s in subjects) >= 10, subjects
+    assert messages, model["log"]
+    for subject in subjects:
         assert subject not in messages, subject
 
 
@@ -564,9 +609,13 @@ def test_an_empty_relay_has_no_log(relay):
 
 
 def test_a_malformed_relay_has_no_log(relay):
+    """Both admissible answers used to be accepted here, so a model that
+    derived a Progress Log out of unparseable input passed a test named for
+    having none. There is nothing datable in this fixture: no log, and
+    `logSource` None so a view says "none" rather than `1-0 of 0`."""
     model = relay_model.build(relay("malformed"), now=NOW)
-    assert isinstance(model["log"], list)
-    assert model["logSource"] in (None, "derived")
+    assert model["log"] == [], model["log"]
+    assert model["logSource"] is None
 
 
 def test_the_same_directory_and_the_same_now_yield_the_same_log(relay):
@@ -607,7 +656,7 @@ def test_a_relay_with_hundreds_of_batons_is_bounded(tmp_path):
         path.write_text("STATUS: success\n")
         os.utime(path, (NOW - 500 + i, NOW - 500 + i))
     (relay_dir / "legs.json").write_text(json.dumps(
-        {"relay": "big", "stages": [{"id": "S1", "legs": [l["id"] for l in legs]}],
+        {"relay": "big", "stages": [{"id": "S1", "legs": [leg["id"] for leg in legs]}],
          "legs": legs}))
 
     started = time.perf_counter()
@@ -1012,7 +1061,7 @@ def test_the_entry_bound_cannot_re_invert_the_commit_bound(tmp_path):
     legs = [{"id": f"leg-{i:03d}", "stage": "S1", "status": "done"}
             for i in range(250)]
     (relay_dir / "legs.json").write_text(json.dumps(
-        {"relay": "huge", "stages": [{"id": "S1", "legs": [l["id"] for l in legs]}],
+        {"relay": "huge", "stages": [{"id": "S1", "legs": [leg["id"] for leg in legs]}],
          "legs": legs}))
 
     _git(project, "init", "-q", "-b", "main")
@@ -1420,7 +1469,14 @@ def test_an_unclaimed_commit_before_the_earliest_record_is_absent(tmp_path):
     relay_dir = _long_lived_branch(tmp_path / "older", 40)
     model = relay_model.build(relay_dir, now=NOW)
     floor = min(e["t"] for e in relay_events(model))
-    for entry in entries_of(model, "commit"):
+    commits = entries_of(model, "commit")
+    # A `for` over an empty list asserts nothing and reports success, and this
+    # section's own evidence rule says a test that goes green when the log
+    # empties is not evidence. Both populations are required to be here, so
+    # the invariant below is a statement about a log that has something in it.
+    assert [e for e in commits if e["leg"]], [e["m"] for e in commits]
+    assert [e for e in commits if not e["leg"]], [e["m"] for e in commits]
+    for entry in commits:
         assert entry["leg"] or entry["t"] >= floor, entry["m"]
 
 
@@ -1462,7 +1518,7 @@ def test_a_narrowed_walk_that_stops_above_the_window_is_thrown_away(tmp_path):
     legs = [{"id": "alpha", "stage": "S1", "status": "done"}]
     legs += [{"id": f"spare-{i}", "stage": "S1", "status": "done"} for i in range(3)]
     (relay_dir / "legs.json").write_text(json.dumps(
-        {"relay": "late", "stages": [{"id": "S1", "legs": [l["id"] for l in legs]}],
+        {"relay": "late", "stages": [{"id": "S1", "legs": [leg["id"] for leg in legs]}],
          "legs": legs}))
     _git(project, "init", "-q", "-b", "main")
     _git(project, "commit", "-q", "--allow-empty", "--allow-empty-message",
@@ -1552,6 +1608,87 @@ def test_the_budget_never_discards_an_attributed_commit(tmp_path):
         sorted(set(claimed.values()) - set(credited))
     assert len(commits) <= len(events), (len(commits), len(events))
     assert len(model["log"]) <= relay_model.LOG_MAX_ENTRIES
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_claimed_commit_is_kept_where_the_budget_is_zero(tmp_path):
+    """ACC-DATA-009: an attributed commit is not a budget line.
+
+    This is the shape that tells `attributed + rest[:budget - len(attributed)]`
+    apart from `(attributed + rest)[:budget]`. A RUNNING leg's baton claiming a
+    commit contributes no EVENT - a baton is skipped as a landing while its leg
+    is still running, and a first leg has no previous landing to start from -
+    so the relay has records, a window, and a budget of ZERO, while the
+    repository confirms the commit the baton claims. The claim is the evidence,
+    so the entry is there.
+
+    The test above this one cannot see the difference: it has 250 events
+    against 60 claims, and every budget it computes is larger than the number
+    of claims, so truncating the claims with it removes nothing. Here the
+    budget is smaller than the claims, which is the only arrangement in which
+    the two expressions disagree.
+    """
+    relay_dir = _one_leg_in(tmp_path / "proj", commits=3, baton=False)
+    project = relay_dir.parent
+    claimed = _short_sha(project)
+    _land(relay_dir, "alpha", NOW - 10, claimed)
+
+    model = relay_model.build(relay_dir, now=NOW)
+    commits = entries_of(model, "commit")
+    attributed = [e for e in commits if e["leg"]]
+    # The premise, asserted rather than assumed: a relay one leg in derives no
+    # event at all, so the budget is zero and cannot buy this commit.
+    assert relay_events(model) == [], relay_events(model)
+    assert len(attributed) > len(relay_events(model))
+    assert [e["commit"] for e in commits] == [claimed], [e["m"] for e in commits]
+    assert commits[0]["leg"] == "alpha"
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_claimed_commits_outnumbering_the_budget_are_all_kept(tmp_path):
+    """The same rule where the budget is real but too small (ACC-DATA-009).
+
+    Three legs in flight at once, each holding a baton that claims a commit.
+    Two of them have a previous landing to start from, so the relay derives two
+    events and buys two unattributed commits with them - and it confirms three
+    claims. Every claim appears; the budget is spent on the remainder, which
+    here is nothing.
+
+    A zero budget alone would leave `(attributed + rest)[:budget]` half caught:
+    a mutant that special-cased the empty case would pass it. This one needs
+    the rule itself.
+    """
+    project = tmp_path / "three-in-flight"
+    relay_dir = project / ".relay"
+    (relay_dir / "batons").mkdir(parents=True)
+    legs = ["alpha", "beta", "gamma"]
+    (relay_dir / "legs.json").write_text(json.dumps(
+        {"relay": "three-in-flight",
+         "stages": [{"id": "S1", "legs": legs}],
+         "legs": [{"id": leg, "stage": "S1", "status": "running"} for leg in legs]}))
+    (relay_dir / "state.json").write_text(json.dumps({}))
+
+    _git(project, "init", "-q", "-b", "main")
+    _git(project, "commit", "-q", "--allow-empty", "-m", "chore: the project existed first",
+         when=NOW - 9000)
+    _git(project, "checkout", "-q", "-b", "feat/the-run")
+    claimed = {}
+    for n, leg in enumerate(legs):
+        _git(project, "commit", "-q", "--allow-empty",
+             "-m", f"{leg}: the leg's own work", when=NOW - 5000 + n * 100)
+        claimed[leg] = _short_sha(project)
+    for n, leg in enumerate(legs):
+        _land(relay_dir, leg, NOW - 4000 + n * 100, claimed[leg])
+
+    model = relay_model.build(relay_dir, now=NOW)
+    commits = entries_of(model, "commit")
+    credited = {e["commit"]: e["leg"] for e in commits if e["leg"]}
+    events = relay_events(model)
+    # The premise: fewer events than claims, so a budget spent on attribution
+    # has to discard one of them.
+    assert 0 < len(events) < len(claimed), (len(events), len(claimed))
+    assert credited == {sha: leg for leg, sha in claimed.items()}, \
+        sorted(set(claimed.values()) - set(credited))
 
 
 # --------------------------------------------------------------------------
@@ -1876,7 +2013,7 @@ def test_no_attributed_commit_is_dropped_above_the_entry_half_bound(tmp_path):
     legs = [{"id": f"leg-{i:03d}", "stage": "S1", "status": "done"}
             for i in range(count)]
     (relay_dir / "legs.json").write_text(json.dumps(
-        {"relay": "many", "stages": [{"id": "S1", "legs": [l["id"] for l in legs]}],
+        {"relay": "many", "stages": [{"id": "S1", "legs": [leg["id"] for leg in legs]}],
          "legs": legs}))
 
     _git(project, "init", "-q", "-b", "main")
@@ -2910,6 +3047,15 @@ def assert_the_model_agrees_with_itself(model, relay_dir):
     Sha SETS, not `(leg, sha)` pairs, because two batons claiming one sha is a
     contradiction on disk that the model resolves deliberately - the leg that
     landed first is credited, once.
+
+    RETURNS the arm it took: `"no-log"`, `"dashboard-log"`, `"no-repository"`
+    or `"compared"`. Three of the four are early returns, and an early return
+    is indistinguishable from a passing comparison in a green run. NO fixture
+    reading of this invariant reaches `"compared"` - no fixture holds a `.git`
+    of its own - so without the label, twenty parametrised cases report success
+    having compared nothing, forever.
+    `test_the_agreement_invariant_is_compared_and_not_only_returned_from` is
+    what reads the label.
     """
     rows = {r["leg"]: r["commit"] for r in model["runners"] if r["commit"]}
     if model["logSource"] != "derived":
@@ -2917,15 +3063,16 @@ def assert_the_model_agrees_with_itself(model, relay_dir):
         # verbatim, and their prose is not the model's derivation. There is
         # nothing derived here to agree or disagree with.
         assert [e for e in model["log"] if e.get("kind") == "commit"] == []
-        return
+        return "dashboard-log" if model["logSource"] == "dashboard" else "no-log"
     entries = {e["commit"]: e["leg"] for e in entries_of(model, "commit") if e["leg"]}
     if not _reads_a_repository(relay_dir):
         assert entries == {}, entries      # nothing here can confirm a claim
-        return
+        return "no-repository"
     assert set(rows.values()) <= set(entries), \
         sorted(set(rows.values()) - set(entries))
     assert {(leg, sha) for sha, leg in entries.items() if leg in rows} <= \
         {(leg, sha) for leg, sha in rows.items()}
+    return "compared"
 
 
 @pytest.mark.parametrize("name", ALL_FIXTURES)
@@ -2938,11 +3085,64 @@ def test_the_log_and_the_rows_agree_on_every_fixture(relay, name):
 @pytest.mark.parametrize("name", ALL_FIXTURES)
 def test_the_log_and_the_rows_agree_on_every_fixture_read_in_place(name):
     """The same fixtures read WHERE THEY LIVE - inside this repository, which
-    is a real git repository with real commits and none of them theirs. A copy
-    in `tmp_path` has no repository around it, so a copy alone cannot tell
-    whether a settled claim reaches the log."""
+    is a real git repository with real commits and none of them theirs.
+
+    What this adds over the copy above is the real path, and the answer it
+    asserts is that NONE of the host repository's commits reach a fixture's
+    log: `_in_a_repo` stops the walk at the relay's own project, and no fixture
+    holds a `.git`. It does NOT settle a claim against a repository, and the
+    wording here used to say it did - so the arm is asserted rather than
+    narrated. The reading that does settle a claim is
+    `test_the_log_and_the_rows_agree_in_the_git_corpus` below.
+    """
     target = FIXTURES / name
-    assert_the_model_agrees_with_itself(relay_model.build(target, now=NOW), target)
+    arm = assert_the_model_agrees_with_itself(
+        relay_model.build(target, now=NOW), target)
+    assert arm != "compared", (name, arm)
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_the_log_and_the_rows_agree_in_the_git_corpus(corpus_relay):
+    """The invariant with the comparison actually made (ACC-DATA-009).
+
+    The frozen agent-service batons on a repository that really holds the
+    commits they claim: twenty rows, real settled shas, and a log derived from
+    the same claims. This is the fixture corpus reading that the twenty
+    parametrised cases above cannot be.
+    """
+    relay_dir, _ = corpus_relay
+    model = relay_model.build(relay_dir, now=None)
+    assert {r["commit"] for r in model["runners"] if r["commit"]}, model["runners"]
+    assert assert_the_model_agrees_with_itself(model, relay_dir) == "compared"
+
+
+def test_the_agreement_invariant_is_compared_and_not_only_returned_from(
+        corpus_relay):
+    """Non-vacuity for `assert_the_model_agrees_with_itself` (ACC-DATA-009).
+
+    The helper has three arms and two of them return before comparing
+    anything. In a green run an early return and a passing comparison look
+    exactly alike, so this counts them: every fixture reading takes an early
+    arm - that is a property of the fixtures, stated here rather than
+    discovered by a judge - and the corpus reading takes the comparing one. If
+    the corpus ever stops reaching a repository, this fails here instead of
+    quietly turning every reading of the invariant into an early return.
+    """
+    arms = {name: assert_the_model_agrees_with_itself(
+                relay_model.build(FIXTURES / name, now=NOW), FIXTURES / name)
+            for name in ALL_FIXTURES}
+    assert "compared" not in set(arms.values()), arms
+    # The three fixtures that derive a log at all reach the deepest arm a
+    # fixture can reach. Six deriving nothing and one quoting a coach is the
+    # rest of the parametrisation, and it is worth knowing that is what those
+    # nineteen green cases are.
+    assert sum(arm == "no-repository" for arm in arms.values()) == 3, arms
+    assert sum(arm == "dashboard-log" for arm in arms.values()) == 1, arms
+    assert sum(arm == "no-log" for arm in arms.values()) == 6, arms
+
+    relay_dir, _ = corpus_relay
+    assert assert_the_model_agrees_with_itself(
+        relay_model.build(relay_dir, now=None), relay_dir) == "compared"
 
 
 @pytest.mark.skipif(not HAS_GIT, reason="git is not installed")

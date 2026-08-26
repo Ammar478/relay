@@ -789,7 +789,7 @@ def _read_batons(relay_dir, warnings):
         # `os.scandir` rather than a glob, so a directory that cannot be listed
         # is an error this function sees rather than an empty result it cannot
         # tell from a relay whose runners have written nothing.
-        with os.scandir(bdir) as entries:
+        with os.scandir(bdir) as entries:   # guarded read: OSError below
             names = sorted(e.name for e in entries if e.name.endswith(".md"))
     except OSError as exc:
         warnings.append(f"the batons directory could not be listed "
@@ -835,7 +835,7 @@ def _runner_rows(batons, leg_rows, active_leg, now, warnings):
         baton = batons.get(leg["id"])
         return (0, baton["mtime"], leg["order"]) if baton else (1, 0.0, leg["order"])
 
-    ordered = sorted(done, key=key) + sorted(running, key=lambda l: l["order"])
+    ordered = sorted(done, key=key) + sorted(running, key=lambda leg: leg["order"])
 
     rows, prev_finished, active_index = [], None, None
     for n, leg in enumerate(ordered, 1):
@@ -1878,7 +1878,7 @@ def build(relay_dir, now=_NO_CLOCK):
     stage_names = {s["id"]: s["name"] for s in stages}
 
     leg_counts = {"total": len(leg_rows)}
-    leg_counts.update({s: sum(1 for l in leg_rows if l["status"] == s)
+    leg_counts.update({s: sum(1 for row in leg_rows if row["status"] == s)
                        for s in LEG_STATES})
 
     # RULE: the active leg is the first leg in plan order whose own status is
