@@ -817,16 +817,62 @@ def _runner_rows(batons, leg_rows, active_leg, now, warnings):
     answer to one id - that is exactly how the Active Leg pane and the Active
     Runner pane came to name different legs - and identity is the only match
     that cannot be confused by it (ACC-DATA-003).
+
+    RULE: A BATON IS A ROW (ACC-DATA-009, amended 2026-08-26). A baton on disk
+    is the record that a runner worked, and the PLAN is not the run's history.
+    `legs.json` disagreeing with a baton is ordinary coach bookkeeping and
+    comes in two shapes, both of which used to cost the leg its row while the
+    log went on attributing its commit - the self-contradiction ACC-DATA-009
+    calls its spine:
+
+    * THE LEG IS NOT LISTED AT ALL. Coaches rename and merge legs mid-relay and
+      orphan the batons of the legs they renamed; this run did it at least four
+      times, and it is how the live agent-service relay came to credit
+      `55732a4` to `s2-test-quality` with no row to match it. The row is drawn
+      from the baton alone and a warning names the inconsistency, because the
+      row is then the leg's ONLY trace in the model.
+    * THE LEG IS LISTED AND IS NOT MARKED DONE. A runner lands, writes its
+      baton and commits; the coach marks the leg `done` afterwards, and between
+      those two moments `legs.json` says `pending` while a baton sits on disk.
+      This was found live, by this leg's own agreement invariant, on the leg
+      running beside it. No warning: nothing is inconsistent to a reader - the
+      Legs pane shows what was planned and the runner pane shows who has
+      worked - and warning here would fire on every live read of every relay.
+
+    What `legs.json` would have supplied for an unlisted leg - its stage and
+    its plan order - is absent rather than invented (ACC-DATA-007).
     """
     known = {leg["id"] for leg in leg_rows}
-    for stem in sorted(batons):
-        if stem not in known:
-            warnings.append(
-                f"batons/{stem}.md has no leg entry in legs.json; "
-                "it gets no runner row")
+    orphans = []
+    for i, stem in enumerate(sorted(batons)):
+        if stem in known:
+            continue
+        warnings.append(
+            f"batons/{stem}.md has no leg entry in legs.json; its runner row "
+            "is drawn from the baton alone, and the leg's stage and plan "
+            "order are unknown")
+        orphans.append({
+            "id": stem,
+            "stage": None,
+            "stageName": None,
+            "kind": kind_of({"id": stem}),
+            # A baton is a landing: the runner wrote it after it worked. Its
+            # own STATUS line decides the row's status below, exactly as it
+            # does for a leg the plan does list.
+            "status": "completed",
+            # After every planned leg, so a tie on baton mtime is broken the
+            # same way on every build. `i` keeps orphans in their own sorted
+            # order rather than collapsing them onto one rank.
+            "order": len(leg_rows) + i,
+            "isActive": False,
+        })
 
-    done = [leg for leg in leg_rows if leg["status"] == "completed"]
     running = [leg for leg in leg_rows if leg["status"] == "running"]
+    # A leg a runner has worked: the plan says it completed, OR a baton on disk
+    # says so whatever the plan says. The running leg is drawn last, below.
+    done = [leg for leg in leg_rows
+            if leg["status"] != "running"
+            and (leg["status"] == "completed" or leg["id"] in batons)] + orphans
 
     # ORDER: batoned runners in the order their batons landed — the only record
     # of sequence on disk. Completed legs with no baton follow in plan order,
@@ -862,7 +908,12 @@ def _runner_rows(batons, leg_rows, active_leg, now, warnings):
 
         rows.append({
             "n": n,
-            "leg": leg["id"],
+            # ACC-DATA-007: a field with no source is None. `_leg_rows` carries
+            # the empty string for a leg with no usable id so a view renders an
+            # empty cell and `build()` reads it as "not a candidate for the
+            # active leg"; here it would be an INVENTED value, and `""` is in
+            # this module's own `PLACEHOLDERS`.
+            "leg": leg["id"] or None,
             "stage": leg["stage"],
             "stageName": leg["stageName"],
             "kind": leg["kind"],
@@ -1356,7 +1407,7 @@ def _resolve_shas(repo, shas):
             if line.rsplit(" ", 1)[-1:] == ["commit"]}
 
 
-def _settle_commits(repo, batons):
+def _settle_commits(repo, batons, warnings):
     """Settle every baton's claimed commit against the relay's own repository.
 
     A leg is credited with a commit only when its baton claims the sha as its
@@ -1364,14 +1415,42 @@ def _settle_commits(repo, batons):
     (ACC-DATA-009). Both halves are load-bearing: this relay's own judges wrote
     reports quoting another relay's shas in claim-shaped sentences, and those
     shas are not objects here.
+
+    WHATEVER THE MODEL CANNOT USE, IT SAYS SO (ACC-DATA-009). Both ways of
+    failing to settle a claim used to be silent, and silence is what makes a
+    gap into a trap:
+
+    * NOTHING COULD BE ASKED - the relay owns no repository (a relay directory
+      that is its own project and holds no `.git`, which is every fixture and
+      every copied relay), or git could not answer. The baton's own word then
+      stands on the runner row unconfirmed while the log attributes nothing, so
+      the two panes read as though the repository had denied the commit. A
+      supervisor is told the difference.
+    * THE REPOSITORY DENIED IT - the relay is in a repository and that
+      repository does not have the sha. The row and the log both lose the
+      commit, which is correct and was invisible: a `.relay` that is its own
+      repository root answers git with itself, and every claim a leg made
+      against the surrounding repository vanished without a word.
     """
-    resolved = _resolve_shas(
-        repo, {sha for b in batons.values() for sha in b["claims"]})
+    claims = {sha for b in batons.values() for sha in b["claims"]}
+    resolved = _resolve_shas(repo, claims)
     if resolved is None:
+        if claims:
+            why = ("this relay is not inside a repository of its own"
+                   if repo is None else "its repository could not be asked")
+            warnings.append(
+                "the commit claims in this relay's batons cannot be confirmed "
+                f"({why}); the runner rows quote them as their batons wrote "
+                "them and the log attributes none of them")
         return
-    for baton in batons.values():
+    for leg, baton in sorted(batons.items()):
         baton["commit"] = next((sha for sha in baton["claims"] if sha in resolved),
                                None)
+        if baton["commit"] is None and baton["claims"]:
+            warnings.append(
+                f"batons/{leg}.md claims commit {baton['claims'][0]}, which "
+                "this relay's repository does not have; the leg's runner row "
+                "and the log carry no commit for it")
 
 
 def _parse_commits(out):
@@ -1749,7 +1828,6 @@ def _derived_log(relay_dir, repo, runners, batons, checks, now):
     # from `events`. `events` is what this function has so far DERIVED, and a
     # relay one leg in derives nothing while holding two records.
     records = _relay_records(relay_dir, runners, batons, checks, events)
-    has_records = records[0]
     commits = _commit_entries(repo, batons, records, len(events), now)
 
     # The outer entry bound, applied once and last. It decides how much of the
@@ -1769,22 +1847,36 @@ def _derived_log(relay_dir, repo, runners, batons, checks, now):
     #    relay's recorded events either way - each one is claimed by a baton,
     #    and every baton is an event.
     # 2. The relay's own events, newest first, in whatever room is left.
-    # 3. Unattributed commits, with what remains, and never more of them than
-    #    there are events to bury - unless the relay has no records at all,
-    #    which has nothing to bury and nothing to count against (ACC-DATA-009).
-    #    The predicate is the relay's records, not this function's output: a
-    #    relay one leg in has records and no entries, and it is not the
-    #    degenerate case.
+    # 3. Unattributed commits, with what remains. There is deliberately no
+    #    second "never more of them than there are events to bury" clause here.
+    #    There was one, and a mutation deleting it left the suite green because
+    #    it could not change an outcome: `_commit_entries` already hands back
+    #    at most `len(events) - len(attributed)` unattributed commits, and
+    #    `kept` is a prefix of `events`, so the room left after `kept` can only
+    #    exceed that count when `kept` IS all of `events` - and then the two
+    #    bounds are the same bound. One bound, at the seam that owns it.
     attributed = [e for e in commits if e["leg"]]
-    room = LOG_MAX_ENTRIES - len(attributed)
+    # THE BOUND YIELDS TO ATTRIBUTION, AT ANY SIZE (ACC-DATA-009, amended
+    # 2026-08-26). `LOG_MAX_ENTRIES - len(attributed)` goes NEGATIVE past 300
+    # attributed commits, and a negative slice is a silent truncation from the
+    # far end: at 400 confirmed claims the merge was cut back to 300 entries
+    # newest-first and 101 of them left the log while the runner rows went on
+    # naming them. That is the failure this check exists to forbid, and it does
+    # not become acceptable at three hundred entries.
+    #
+    # So the bound is spent, never overspent: the room left AFTER attribution
+    # is what the relay's own events and the unclaimed remainder share, and
+    # where attribution alone fills it there is no room left to share. The
+    # merged list is bounded by construction - `len(kept) + spare +
+    # len(attributed)` can never exceed `LOG_MAX_ENTRIES` unless attribution
+    # alone already does - so there is no trailing slice to re-decide it.
+    room = max(0, LOG_MAX_ENTRIES - len(attributed))
     kept = events[:room]
     spare = room - len(kept)
-    if has_records:
-        spare = min(spare, max(0, len(kept) - len(attributed)))
     entries = kept + attributed + [e for e in commits if not e["leg"]][:spare]
 
     entries.sort(key=lambda e: (-e["t"], LOG_KIND_ORDER[e["kind"]], e["m"]))
-    return entries[:LOG_MAX_ENTRIES]
+    return entries
 
 
 def _log(extras, relay_dir, repo, runners, batons, checks, now, warnings):
@@ -1944,7 +2036,7 @@ def build(relay_dir, now=_NO_CLOCK):
     path = written if written is not None else project
 
     batons = _read_batons(relay_dir, warnings)
-    _settle_commits(repo, batons)
+    _settle_commits(repo, batons, warnings)
     runners, runner_counts, active_runner = _runner_rows(
         batons, leg_rows, active_leg, now, warnings)
 

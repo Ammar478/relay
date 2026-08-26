@@ -713,7 +713,12 @@ def unsourced(tmp_path):
 
 @pytest.fixture
 def unsourced_rows(unsourced):
-    """`{leg id: row}` for the unsourced relay. The unnamed leg keys on ``""``.
+    """`{leg id: row}` for the unsourced relay. The unnamed leg keys on `None`.
+
+    ACC-DATA-007: a runner row names the leg it belongs to or says it cannot.
+    The row used to key on `""`, which is an INVENTED value and is in this
+    module's own `PLACEHOLDERS` - the leg row keeps `""` so a view renders an
+    empty cell, and the runner row carries absence as absence.
 
     Built with `now=None`: this fixture is about columns with NO source, and a
     wall clock is a source for the running runner's elapsed time.
@@ -737,13 +742,13 @@ def test_n_is_the_row_s_landing_position_not_a_fabricated_number(unsourced):
 def test_a_leg_with_no_id_gets_no_invented_name(unsourced_rows):
     """The unnamed leg still earns a runner row — it is a leg the coach
     planned and a runner completed — but the model does not name it."""
-    assert "" in unsourced_rows, sorted(unsourced_rows)
-    assert unsourced_rows[""]["status"] == "completed"
+    assert None in unsourced_rows, sorted(unsourced_rows, key=str)
+    assert unsourced_rows[None]["status"] == "completed"
     assert unsourced_rows["batoned"]["leg"] == "batoned"     # a real id survives
 
 
 def test_a_leg_with_no_stage_has_a_stage_of_none(unsourced_rows):
-    for leg in ("stageless", ""):
+    for leg in ("stageless", None):
         assert unsourced_rows[leg]["stage"] is None, leg
         assert unsourced_rows[leg]["stageName"] is None, leg
     assert unsourced_rows["batoned"]["stage"] == "S1"        # a real stage survives
@@ -754,7 +759,7 @@ def test_start_is_none_until_a_previous_baton_has_landed(unsourced_rows):
     # The first runner to land: nothing handed off to it.
     assert unsourced_rows["batoned"]["start"] is None
     # No baton at all: nothing on disk says when it ran.
-    for leg in ("batonless", "stageless", ""):
+    for leg in ("batonless", "stageless", None):
         assert unsourced_rows[leg]["start"] is None, leg
     # A real handoff survives: the previous baton's landing time.
     assert unsourced_rows["handoff"]["start"] == pytest.approx(
@@ -766,7 +771,7 @@ def test_start_is_none_until_a_previous_baton_has_landed(unsourced_rows):
 def test_duration_is_none_unless_both_ends_are_known(unsourced_rows):
     assert unsourced_rows["batoned"]["duration"] is None     # start unknown
     assert unsourced_rows["live"]["duration"] is None        # no clock passed
-    for leg in ("batonless", "stageless", ""):
+    for leg in ("batonless", "stageless", None):
         assert unsourced_rows[leg]["duration"] is None, leg
         assert unsourced_rows[leg]["finished"] is None, leg
     # Both ends known: 60 seconds, and not a zero standing in for absence.
@@ -774,14 +779,14 @@ def test_duration_is_none_unless_both_ends_are_known(unsourced_rows):
 
 
 def test_commit_is_none_when_no_baton_claims_one(unsourced_rows):
-    for leg in ("quiet", "batonless", "stageless", "", "live"):
+    for leg in ("quiet", "batonless", "stageless", None, "live"):
         assert unsourced_rows[leg]["commit"] is None, leg
     assert unsourced_rows["batoned"]["commit"] == "1a2b3c4"
 
 
 def test_batonlines_is_none_without_a_baton_and_a_real_count_with_one(
         unsourced_rows):
-    for leg in ("batonless", "stageless", "", "live"):
+    for leg in ("batonless", "stageless", None, "live"):
         assert unsourced_rows[leg]["batonLines"] is None, leg
         assert unsourced_rows[leg]["batonPath"] is None, leg
     assert unsourced_rows["quiet"]["batonLines"] > 0          # not a zero
@@ -1396,6 +1401,35 @@ def test_a_measured_zero_elapsed_is_kept_and_is_not_absence(relay):
     dash["elapsed"] = "n/a"
     (target / "dashboard.json").write_text(json.dumps(dash))
     assert "elapsed" not in relay_model.build(target)["metrics"]
+
+
+def test_a_bool_is_not_a_measurement(relay):
+    """`True` is not a token count and `False` is not zero tokens.
+
+    `isinstance(True, int)` is True in Python, so deleting `_scalar`'s two-line
+    bool guard makes `"input": true` a metric with the value `true` - a view
+    then renders `Input true` - and `"elapsed": false` a measured zero, which
+    is the exact "nothing spent" / "not measured" collapse ACC-DATA-008 exists
+    to prevent. Deleting that guard left the whole suite green: no fixture had
+    a bool anywhere a metric is read.
+    """
+    target = relay("tokens")
+    dash = json.loads((target / "dashboard.json").read_text())
+    dash["tokens"] = {"input": True, "cached": False, "output": 12}
+    dash["elapsed"] = False
+    (target / "dashboard.json").write_text(json.dumps(dash))
+
+    metrics = relay_model.build(target)["metrics"]
+    assert metrics["tokens"] == {"output": 12}, metrics
+    assert "elapsed" not in metrics, metrics
+    # ...at the seam too, where the guard actually lives.
+    assert relay_model._scalar(True) is None
+    assert relay_model._scalar(False) is None
+    assert relay_model._scalar(0) == 0
+    # `_whole` carries the same guard for the same reason: a check's `round` is
+    # a count, and `True` is not a round number.
+    assert relay_model._whole(True) is None
+    assert relay_model._whole(0) == 0
 
 
 def test_a_tokens_object_with_nothing_measurable_in_it_carries_no_key(relay):
@@ -2267,7 +2301,7 @@ def test_fuzz_over_malformed_relay_directories(tmp_path):
             # The corpus is only evidence while it still contains the two
             # cases, so it says so out loud rather than trusting the literal
             # above to stay that way.
-            assert [r["leg"] for r in model["runners"]] == ["", "real", "real"], (
+            assert [r["leg"] for r in model["runners"]] == [None, "real", "real"], (
                 bad_id, bad_claim)
             assert model["runners"][0]["status"] == "running"    # nameless, running
             assert model["activeLeg"]["id"] == "real"            # and not chosen
@@ -3310,12 +3344,19 @@ def test_active_leg_and_active_runner_agree_on_every_fixture_in_place(name):
     assert_active_agrees(relay_model.build(target), f"{name} (in place)")
 
 
-#: How many of `ALL_FIXTURES` carry a running leg. `assert_active_agrees`
+#: Which of `ALL_FIXTURES` carry no running leg. `assert_active_agrees`
 #: returns early — silently, and correctly — when a relay has no active leg,
 #: so a fixture set that drifted to all-done would turn both sweeps above into
-#: sweeps of early returns with nothing said about it. This is the count that
-#: says how much of the sweep is real, and it is asserted, not assumed.
-FIXTURES_WITH_AN_ACTIVE_LEG = 6
+#: sweeps of early returns with nothing said about it. This says how much of
+#: the sweep is real, and it is asserted, not assumed.
+#:
+#: NAMED, NOT COUNTED. This was `FIXTURES_WITH_AN_ACTIVE_LEG = 6`, and a leg
+#: running beside this one added a fixture WITH a running leg — which made the
+#: count wrong while making the sweep bigger. A count cannot tell those two
+#: apart; the fixtures that make the sweep vacuous can be named, and a new
+#: fixture then has to be added here to be excused.
+FIXTURES_WITHOUT_AN_ACTIVE_LEG = {"all-done", "empty", "ghost-currentleg",
+                                  "malformed"}
 
 
 def test_the_active_leg_sweeps_are_not_sweeps_of_early_returns():
@@ -3329,7 +3370,10 @@ def test_the_active_leg_sweeps_are_not_sweeps_of_early_returns():
     """
     active = [name for name in ALL_FIXTURES
               if relay_model.build(FIXTURES / name, now=None)["activeLeg"]]
-    assert len(active) == FIXTURES_WITH_AN_ACTIVE_LEG, active
+    assert set(active) == set(ALL_FIXTURES) - FIXTURES_WITHOUT_AN_ACTIVE_LEG, \
+        active
+    assert FIXTURES_WITHOUT_AN_ACTIVE_LEG <= set(ALL_FIXTURES), \
+        "no fixture is excused that is not there"
     # And the identity arm really runs on each of them: a leg is active and a
     # runner row is the one it derives.
     for name in active:
@@ -3432,7 +3476,10 @@ def test_a_nameless_running_leg_beside_duplicate_ids_still_cannot_split_them(tmp
     assert model["activeRunner"]["stage"] == "S1"
     # The nameless leg still gets its own runner row; it is simply never the
     # active one.
-    assert sorted(r["leg"] for r in model["runners"]) == ["", "twin", "twin"]
+    assert sorted((r["leg"] or "") for r in model["runners"]) == \
+        ["", "twin", "twin"]
+    assert [r["leg"] for r in model["runners"] if r["leg"] is None], \
+        "the nameless leg's row names no leg rather than an empty string"
     assert all(r["status"] == "running" for r in model["runners"])
 
 
@@ -3503,3 +3550,274 @@ def test_an_attention_item_of_the_wrong_shape_never_raises(tmp_path, bad):
         assert isinstance(item["label"], str) and isinstance(item["text"], str)
         assert item["action"] is None or isinstance(item["action"], str)
     assert any(item["text"] == "real" for item in model["attention"])
+
+
+# --------------------------------------------------------------------------
+# THE VOCABULARIES AND BOUNDS ARE STATED HERE, NOT READ FROM THE MODULE
+#
+# THE CLASS THE ROUND-6 CODE JUDGE FOUND, and the reason 18 of its 21 hand
+# mutations left the suite green. Every one of these was a constant whose
+# expected value the tests fetched from the module itself:
+#
+#     STATUS_ALIASES["pending"] shrunk 8 -> 2        green
+#     BATON_STATUS and PLACEHOLDERS shrunk           green
+#     LOG_MAX_COMMITS -> 40                          green
+#     LOG_MAX_ENTRIES -> 250                         green
+#     GIT_TIMEOUT -> 300.0                           green
+#     MAX_RELAY_FILE_BYTES changed                   green
+#
+# A test that reads its expectation from the module cannot fail when the module
+# changes, and reading it is often the RIGHT thing elsewhere in this file - a
+# fixture that must be larger than a bound has to know the bound. So the class
+# is closed once, here, where the values are written out in full and owe
+# nothing to the module: an edit to any of them is red until a human writes the
+# new value down beside the old one's reasons.
+#
+# `test_the_module_declares_no_constant_this_file_has_not_pinned` is what keeps
+# it closed: a constant added later is red until it is pinned too.
+# --------------------------------------------------------------------------
+
+#: The four leg states and the four check states, in the order the module
+#: declares them - `LEG_STATES` is iterated to build `legCounts`, so its
+#: MEMBERS are the vocabulary and its ORDER is a view's column order.
+PINNED_STATE_TUPLES = {
+    "LEG_STATES": ("completed", "running", "pending", "cancelled"),
+    "CHECK_STATES": ("passed", "failed", "blocked", "pending"),
+}
+
+#: Sort ranks. A check pane leads with what is wrong; an attention band leads
+#: with what needs a human. Shrinking either to `{}` is a silent reordering.
+PINNED_ORDERS = {
+    "CHECK_ORDER": {"failed": 0, "blocked": 1, "pending": 2, "passed": 3},
+    "ATTENTION_ORDER": {"bad": 0, "warn": 1, "note": 2, "calm": 3},
+    "LOG_KIND_ORDER": {"check": 0, "baton": 1, "commit": 2, "start": 3},
+}
+
+#: What a coach types where there is no value. Every one of these reads as
+#: absence, and `""` among them is why a runner row may not carry `""` as a
+#: leg id (ACC-DATA-007).
+PINNED_PLACEHOLDERS = {"", "-", "--", "—", "–", "n/a", "na", "none", "null",
+                       "tbd", "?"}
+
+#: ACC-DATA-004. The nine spellings the check names by name are in here, and
+#: so are the ones it does not: a `pending` alias maps to `pending` through the
+#: FALLBACK whether or not the table knows it, so the whole `pending` set was
+#: deletable with every behavioural assertion still green.
+PINNED_STATUS_ALIASES = {
+    "completed": {"completed", "complete", "done", "finished", "shipped",
+                  "landed", "passed", "merged"},
+    "running": {"running", "in_progress", "in-progress", "inprogress",
+                "active", "wip", "started", "underway"},
+    "cancelled": {"cancelled", "canceled", "skipped", "dropped", "abandoned",
+                  "superseded"},
+    "pending": {"pending", "todo", "queued", "planned", "not_started", "new",
+                "blocked", "waiting"},
+}
+
+#: The same fallback hole, twice over: an unknown check word is `pending` and
+#: an unknown phase word is None, so neither table's members are visible in a
+#: result alone.
+PINNED_CHECK_ALIASES = {
+    "passed": {"passed", "pass", "ok", "green", "satisfied", "evidenced"},
+    "failed": {"failed", "fail", "red", "broken"},
+    "blocked": {"blocked", "block", "unevidenced", "cannot_verify",
+                "unverifiable"},
+}
+
+PINNED_PHASE_ALIASES = {
+    "running": {"running", "active", "in_progress", "in-progress", "executing"},
+    "judging": {"judging", "judge", "gating", "gate", "reviewing", "review"},
+    "blocked": {"blocked", "stalled", "paused", "halted", "waiting", "stuck"},
+    "complete": {"complete", "completed", "done", "finished", "shipped"},
+    "pending": {"pending", "planning", "proposed", "draft", "not_started",
+                "awaiting_approval", "approved"},
+}
+
+#: ACC-DATA-007. What a runner wrote on its baton's `STATUS:` line, mapped onto
+#: a row status. A word missing here falls back to the leg's own state, so a
+#: shrunk table is invisible in a row that was completed anyway.
+PINNED_BATON_STATUS = {"success": "completed", "ok": "completed",
+                       "partial": "partial", "failed": "failed",
+                       "failure": "failed"}
+
+#: The labels an attention item may carry that mean a human is being asked for
+#: something (ACC-ATTN-001's vocabulary).
+PINNED_BAD_LABELS = {"NEEDS YOUR CALL", "STALLED", "BLOCKED", "STOP",
+                     "DECISION"}
+
+#: The level and wording each baton status lands in the Progress Log with.
+PINNED_BATON_LOG = {
+    "completed": ("calm", "{leg} landed"),
+    "partial": ("warn", "{leg} landed partial, with work left undone"),
+    "failed": ("bad", "{leg} failed"),
+}
+
+#: Every numeric bound in the module, with what each one is for. All four were
+#: mutable with the suite green: the tests that scale a fixture against a bound
+#: read the bound, so shrinking it shrinks the fixture with it.
+PINNED_BOUNDS = {
+    # How far back the git walk looks. Below LOG_MAX_ENTRIES on purpose, so an
+    # entirely attributed log still fits the entry bound.
+    "LOG_MAX_COMMITS": 200,
+    # How many entries the Progress Log keeps - and it yields to attribution
+    # (ACC-DATA-009): every confirmed claim appears however many there are.
+    "LOG_MAX_ENTRIES": 300,
+    # Seconds any one git process may take. build() runs inside a 2 s repaint
+    # loop, so this is the difference between a slow pane and a frozen one.
+    "GIT_TIMEOUT": 3.0,
+    # The most a relay file may weigh before the model refuses to read it: 1
+    # MiB, twenty times the largest relay file this project has written.
+    "MAX_RELAY_FILE_BYTES": 1024 * 1024,
+    # The read loop's chunk. MAX_RELAY_FILE_BYTES is an exact multiple of it,
+    # which is what makes the in-loop bound and the size pre-check agree.
+    "_READ_CHUNK": 1 << 16,
+}
+
+#: The shapes a relay path may turn out to be, and the words a warning carries
+#: for each. Pinned as the WORDS: `_SHAPES` holds `stat` predicates, and the
+#: labels are what a supervisor reads.
+PINNED_SHAPE_WORDS = ["a directory", "a FIFO", "a socket",
+                      "a character device", "a block device",
+                      "a symbolic link", "a regular file"]
+
+#: The three sentence forms that read as a leg claiming a commit as its own
+#: work (ACC-DATA-009), and the two other patterns the module compiles.
+PINNED_PATTERNS = {
+    "_SHA": r"(?<![0-9a-f])([0-9a-f]{7,40})(?![0-9a-f])",
+    "COMMIT_CLAIM_RES": [
+        r"(?:^|(?<=[.;])\s|(?<=,)\s)\W*(?:\*\*)?(?:merge\s+|final\s+)?"
+        r"commit(?:\*\*)?\s*:?\s*(?:\*\*)?\s*`?"
+        r"(?<![0-9a-f])([0-9a-f]{7,40})(?![0-9a-f])",
+        r"committed(?:\*\*)?\s+as\s*(?:\*\*)?\s*`?"
+        r"(?<![0-9a-f])([0-9a-f]{7,40})(?![0-9a-f])",
+        r"git\s+commit\b[^\n]{0,60}?`?"
+        r"(?<![0-9a-f])([0-9a-f]{7,40})(?![0-9a-f])",
+    ],
+    "STATUS_RE": r"^\W*(?:\*\*)?status(?:\*\*)?\s*:\s*(\w+)",
+    "LABEL_RE": r"^([A-Z][A-Z0-9 /_-]{1,40}):\s*(.+)$",
+}
+
+#: The module's public surface. A name leaving it is an import a view loses.
+PINNED_ALL = ["build", "baton_text", "normalise_status", "normalise_check",
+              "normalise_phase", "kind_of", "RelayNotFound", "LEG_STATES",
+              "CHECK_STATES"]
+
+
+def test_the_state_tuples_are_what_this_file_says_they_are():
+    for name, expected in PINNED_STATE_TUPLES.items():
+        assert getattr(relay_model, name) == expected, name
+
+
+def test_the_sort_orders_are_what_this_file_says_they_are():
+    for name, expected in PINNED_ORDERS.items():
+        assert getattr(relay_model, name) == expected, name
+
+
+def test_the_placeholder_vocabulary_is_what_this_file_says_it_is():
+    assert relay_model.PLACEHOLDERS == PINNED_PLACEHOLDERS
+    # ...and it is the vocabulary `_text` actually reads, spelling by spelling.
+    for word in PINNED_PLACEHOLDERS:
+        assert relay_model._text(f"  {word.upper()}  ") is None, word
+
+
+def test_the_status_vocabulary_is_what_this_file_says_it_is():
+    assert relay_model.STATUS_ALIASES == PINNED_STATUS_ALIASES
+    # Every spelling, not only the nine ACC-DATA-004 names: a `pending` alias
+    # is indistinguishable from an unknown word in the RESULT, so membership is
+    # asserted through the mapping of every word in every set.
+    for canon, aliases in PINNED_STATUS_ALIASES.items():
+        for alias in aliases:
+            assert relay_model.normalise_status(alias) == canon, alias
+            assert relay_model.normalise_status(alias.upper()) == canon, alias
+
+
+def test_the_check_and_phase_vocabularies_are_what_this_file_says_they_are():
+    assert relay_model.CHECK_ALIASES == PINNED_CHECK_ALIASES
+    assert relay_model.PHASE_ALIASES == PINNED_PHASE_ALIASES
+    for canon, aliases in PINNED_CHECK_ALIASES.items():
+        for alias in aliases:
+            assert relay_model.normalise_check(alias) == canon, alias
+    for canon, aliases in PINNED_PHASE_ALIASES.items():
+        for alias in aliases:
+            assert relay_model.normalise_phase(alias) == canon, alias
+
+
+def test_the_baton_vocabularies_are_what_this_file_says_they_are():
+    assert relay_model.BATON_STATUS == PINNED_BATON_STATUS
+    assert relay_model.BATON_LOG == PINNED_BATON_LOG
+    assert relay_model.BAD_LABELS == PINNED_BAD_LABELS
+
+
+def test_the_bounds_are_what_this_file_says_they_are():
+    for name, expected in PINNED_BOUNDS.items():
+        assert getattr(relay_model, name) == expected, name
+    # The two relationships the values exist in, stated rather than implied.
+    assert relay_model.LOG_MAX_COMMITS < relay_model.LOG_MAX_ENTRIES
+    assert relay_model.MAX_RELAY_FILE_BYTES % relay_model._READ_CHUNK == 0
+
+
+def test_the_path_shapes_and_the_patterns_are_what_this_file_says_they_are():
+    assert [word for _, word in relay_model._SHAPES] == PINNED_SHAPE_WORDS
+    assert relay_model._SHA == PINNED_PATTERNS["_SHA"]
+    assert [p.pattern for p in relay_model.COMMIT_CLAIM_RES] == \
+        PINNED_PATTERNS["COMMIT_CLAIM_RES"]
+    assert relay_model.STATUS_RE.pattern == PINNED_PATTERNS["STATUS_RE"]
+    assert relay_model.LABEL_RE.pattern == PINNED_PATTERNS["LABEL_RE"]
+    assert relay_model.__all__ == PINNED_ALL
+
+
+def test_the_open_flags_are_the_three_this_module_needs():
+    """Pinned as a composition rather than as an integer: the numbers differ
+    between platforms and the guarantee does not. O_NONBLOCK is the whole guard
+    against a FIFO with no writer, and O_NOCTTY keeps a terminal device from
+    becoming this process's controlling terminal."""
+    assert relay_model._OPEN_FLAGS == (
+        os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOCTTY", 0))
+    assert relay_model._OPEN_FLAGS & getattr(os, "O_NONBLOCK", 0)
+
+
+#: Module-level names this file deliberately does not pin, with why. Anything
+#: else new is red until it is written down above.
+UNPINNED_MODULE_NAMES = {
+    "_NO_CLOCK": "a sentinel object; its identity is its whole content",
+    "_OPEN_FLAGS": "pinned as a composition in its own test, not as an integer",
+    "_SHAPES": "pinned as its words in `PINNED_SHAPE_WORDS`",
+    "COMMIT_CLAIM_RES": "pinned as its patterns in `PINNED_PATTERNS`",
+    "STATUS_RE": "pinned as its pattern in `PINNED_PATTERNS`",
+    "LABEL_RE": "pinned as its pattern in `PINNED_PATTERNS`",
+    "_SHA": "pinned as its pattern in `PINNED_PATTERNS`",
+    "PLACEHOLDERS": "pinned in `PINNED_PLACEHOLDERS`",
+    "STATUS_ALIASES": "pinned in `PINNED_STATUS_ALIASES`",
+    "CHECK_ALIASES": "pinned in `PINNED_CHECK_ALIASES`",
+    "PHASE_ALIASES": "pinned in `PINNED_PHASE_ALIASES`",
+    "BATON_STATUS": "pinned in `PINNED_BATON_STATUS`",
+    "BATON_LOG": "pinned in `PINNED_BATON_LOG`",
+    "BAD_LABELS": "pinned in `PINNED_BAD_LABELS`",
+    "__all__": "pinned in `PINNED_ALL`",
+}
+
+
+def test_the_module_declares_no_constant_this_file_has_not_pinned():
+    """The guard that keeps the class closed rather than the seven instances.
+
+    Every module-level assignment in `relay_model.py` that is not a function or
+    a class is either pinned above or named in `UNPINNED_MODULE_NAMES` with a
+    reason. A constant added later - a new bound, a new alias table - is red
+    until somebody writes its value down here, which is the only thing that
+    makes any of these tests capable of failing when the module changes.
+    """
+    tree = ast.parse((REPO / "scripts" / "relay_model.py").read_text())
+    declared = []
+    for node in tree.body:
+        targets = ([node.target] if isinstance(node, ast.AnnAssign)
+                   else getattr(node, "targets", []))
+        for target in targets:
+            if isinstance(target, ast.Name):
+                declared.append(target.id)
+    assert declared, "the module declares module-level names"
+
+    pinned = (set(PINNED_STATE_TUPLES) | set(PINNED_ORDERS)
+              | set(PINNED_BOUNDS) | set(UNPINNED_MODULE_NAMES))
+    assert set(declared) - pinned == set(), sorted(set(declared) - pinned)
+    # ...and nothing here pins a name the module no longer has.
+    assert pinned - set(declared) == set(), sorted(pinned - set(declared))
