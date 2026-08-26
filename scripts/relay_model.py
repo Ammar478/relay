@@ -71,11 +71,11 @@ model derives one from the records that carry a real order: baton mtimes,
 `git log` on the relay's branch, and the check transitions in `state.json`.
 Entries with no honest timestamp are pinned to the leg that claimed them and
 flagged `exact: False`; entries with no honest time at all are not invented.
-Commits are bounded to the relay's own window - the branch it runs on, or the
-run's own earliest event where there is no branch - and a commit a baton
-attributes to a leg is kept before any other, and is never dropped for being
-older than that window, so the log tells the run's story rather than the
-repository's (ACC-DATA-009).
+A commit a baton claims and the repository confirms is this run's work on any
+repository topology at all - no window, no floor, no branch point - and it is
+fetched by name so that no walk can lose it. A commit no leg claims is bounded
+by the relay's earliest record, so the log tells the run's story rather than the
+repository's (ACC-DATA-009, simplified 2026-08-26).
 
 Determinism
 -----------
@@ -1040,12 +1040,14 @@ def _attention(checks, extras, leg_counts):
 # entries. Batons are already bounded by the number of legs.
 #
 # These three are the outer safety net, sized for the repaint budget rather
-# than for the run. Whether a commit belongs to the log at all is decided by
-# the relay's own window in `_relay_commits` and the attribution budget in
+# than for the run. Whether an UNCLAIMED commit belongs to the log at all is
+# decided by the relay's record floor and the attribution budget in
 # `_commit_entries` (ACC-DATA-009), which are much tighter bounds in practice
-# and are not a replacement for these. The entry bound is applied to the
-# relay's own events before the budget is worked out, so that the loosest bound
-# in the module cannot re-order what the tightest one decided.
+# and are not a replacement for these. A claimed commit is decided by neither:
+# it is this run's work on the strength of the claim and the repository. The
+# entry bound is applied to the relay's own events before the budget is worked
+# out, so that the loosest bound in the module cannot re-order what the
+# tightest one decided.
 #
 # WHAT THE WALK DROPS, and why in that order. `git log` walks back from HEAD,
 # so `LOG_MAX_COMMITS` keeps the NEWEST commits of the window and drops the
@@ -1053,11 +1055,11 @@ def _attention(checks, extras, leg_counts):
 # entries of its first legs'. That is the one direction git bounds cheaply -
 # asking for the OLDEST two hundred means walking all of them, on every
 # repaint - and it is affordable here because a leg's landing entry names its
-# own commit sha whatever the walk returned. What a dropped entry costs the log
-# is the commit's SUBJECT LINE, not the attribution. With the two floors of
-# ACC-DATA-009 settled and the budget forbidden to buy attribution, this is the
-# last bound left standing over an attributed commit, and it is deliberately
-# the loosest one.
+# own commit sha whatever the walk returned. It does not even cost the subject
+# line any more: a claimed commit the walk did not reach is fetched by name
+# (`_claimed_commits`), because ACC-DATA-009 admits it on the strength of the
+# claim and the repository, and no bound on a walk may take it away. So this
+# bound stands over UNCLAIMED commits only, and is deliberately the loosest.
 LOG_MAX_COMMITS = 200
 LOG_MAX_ENTRIES = 300
 GIT_TIMEOUT = 3.0
@@ -1065,8 +1067,9 @@ GIT_TIMEOUT = 3.0
 # The names a repository's default branch goes by, as full refs so nothing has
 # to be resolved from a shorthand that could mean two things. A commit
 # reachable from one of these was in the project before the relay's branch
-# existed; the run's own commits are exactly the ones its branch adds on top,
-# which is the branch point ACC-DATA-009 opens the window at.
+# existed, so a walk that excludes them looks back no further than the branch
+# point. That is ALL the branch point is now (ACC-DATA-009, simplified
+# 2026-08-26): a bound on the walk, never a decision about what belongs.
 GIT_DEFAULT_REFS = (
     "refs/heads/main",
     "refs/heads/master",
@@ -1201,6 +1204,22 @@ def _project_dir(written, relay_dir, warnings):
     tree - a `~` that resolves to the host repository is clamped like any other
     ancestor.
 
+    RULE: a value that names a directory the read may not USE is warned about
+    on the same terms (ACC-DATA-009). `_in_a_repo` reaches the relay directory
+    and its immediate parent and nowhere else, so an ancestor, a `~`, or a
+    different real repository that happens to hold every claimed commit each
+    clamped back to the relay directory - which found no `.git`, and the relay
+    was read as one that owns no repository: no commit in the log, no baton's
+    claim settled, and `relay.path` reporting the value all the while as though
+    it were in use. Silence is not an acceptable answer to "I could not use
+    what you wrote". A clone of a relay's own repository inherits its coach's
+    `path` and is exactly this case, which is why it is warned about rather
+    than merely clamped.
+
+    The two shapes a relay actually has decide what is usable, and they are the
+    two `_in_a_repo` allows: the relay directory itself (a fixture relay, which
+    is its own project) and its immediate parent (the live `<project>/.relay`).
+
     Never raises: `written` is untrusted, and every shape of it that cannot be
     read from is the same answer here.
     """
@@ -1213,12 +1232,21 @@ def _project_dir(written, relay_dir, warnings):
         usable = os.path.isdir(expanded)
     except (OSError, TypeError, ValueError):
         expanded, usable = written, False
-    if usable:
-        return expanded
-    warnings.append(f"dashboard.json: `path` {written!r} is not a directory; "
-                    "commits are being read from the relay's own project "
-                    "instead")
-    return derived
+    if not usable:
+        warnings.append(f"dashboard.json: `path` {written!r} is not a directory; "
+                        "commits are being read from the relay's own project "
+                        "instead")
+        return derived
+    try:
+        target = pathlib.Path(expanded).resolve()
+    except (OSError, ValueError):
+        target = None
+    if target not in (resolved, resolved.parent):
+        warnings.append(f"dashboard.json: `path` {written!r} does not name this "
+                        "relay's own project; commits are being read from "
+                        f"{derived!r} instead")
+        return derived
+    return expanded
 
 
 def _git(relay_dir, *args, stdin=None):
@@ -1296,31 +1324,90 @@ def _settle_commits(relay_dir, project, batons):
                                None)
 
 
-def _git_log(relay_dir, exclude=()):
-    """[(epoch, short sha, subject)] for HEAD, newest first.
+def _parse_commits(out):
+    """[(epoch, short sha, subject)] from the one commit format asked for here.
 
-    `exclude` is refs whose history is not this run's: git walks back from HEAD
-    and stops at every commit reachable from one of them, so what comes back is
-    the branch's own commits - everything from its branch point onwards.
+    Shared by the two reads below, so a commit the walk returned and a commit
+    fetched by name arrive in the same shape - cut to the same seven characters
+    a baton's claim is cut to (`commit_claims`), which is what makes a claim
+    and a commit compare as equals rather than by prefix. A line that is not
+    that shape is skipped rather than guessed at.
+
+    RULE: the subject takes everything after the second separator, and an empty
+    one is still a commit. A subject may legally contain `\x1f` and a commit
+    may legally have no subject at all; a parser that drops either is a bound
+    on a walk deciding what belongs, which on a claimed commit is precisely
+    what ACC-DATA-009 no longer permits.
     """
-    out = _git(relay_dir, "log", "--no-color", f"--max-count={LOG_MAX_COMMITS}",
-               "--format=%ct%x1f%h%x1f%s", "HEAD",
-               *(("--not", *exclude) if exclude else ()))
     commits = []
     for line in (out or "").splitlines():
-        parts = line.split("\x1f")
-        if len(parts) != 3 or not parts[2].strip():
+        parts = line.split("\x1f", 2)
+        if len(parts) != 3:
             continue
         try:
             when = float(parts[0])
         except ValueError:
             continue
-        commits.append((when, parts[1].strip()[:7], parts[2].strip()))
+        sha = parts[1].strip()[:7]
+        if sha:
+            commits.append((when, sha, parts[2].strip()))
     return commits
+
+
+def _git_log(relay_dir, exclude=()):
+    """[(epoch, short sha, subject)] for HEAD, newest first.
+
+    `exclude` is refs the walk need not look past: git stops at every commit
+    reachable from one of them, so a walk excluding the default branch comes
+    back with what this branch adds on top of its branch point. That is a bound
+    on the WALK and never a decision about what belongs (ACC-DATA-009, as
+    simplified 2026-08-26) - see `_relay_commits`, which throws a narrowed walk
+    away when it does not reach the window the caller has to fill.
+    """
+    return _parse_commits(_git(
+        relay_dir, "log", "--no-color", f"--max-count={LOG_MAX_COMMITS}",
+        "--format=%ct%x1f%h%x1f%s", "HEAD",
+        *(("--not", *exclude) if exclude else ())))
+
+
+def _claimed_commits(relay_dir, shas):
+    """The commits `shas` names, whatever the walk did or did not reach.
+
+    THE RULE ACC-DATA-009 WAS SIMPLIFIED TO (2026-08-26): a commit a baton
+    claims and the repository confirms is this run's work - no window, no
+    floor, no branch point. The walk cannot be what fetches it, because every
+    topology that has broken this check broke it by narrowing the walk:
+    `origin/HEAD` naming the run's own branch, a trunk called `develop` or
+    `trunk`, and - the one that broke it in this repository - a branch already
+    merged into its trunk, where everything HEAD carries is reachable from the
+    trunk too and the walk comes back with nothing. Asking git for the objects
+    BY NAME is immune to all of it: a sha the repository has is a sha
+    `--no-walk` prints, from any HEAD, on any branch, in any clone.
+
+    REACHABILITY IS DELIBERATELY NOT A CONDITION, and it is a real case rather
+    than a hypothetical one: the live agent-service relay has two claimed shas
+    (`096a713`, `5c9caf2`, merges that landed on `develop`) that its HEAD
+    cannot reach. The claim is the evidence and the repository confirms the
+    object, so the log carries them - which is also what its runner rows say.
+
+    One process for every sha rather than one per sha, and none at all when
+    the walk already reached them: `shas` is what the walk MISSED.
+    """
+    if not shas:
+        return []
+    return _parse_commits(_git(
+        relay_dir, "log", "--no-color", "--no-walk",
+        "--format=%ct%x1f%h%x1f%s", *shas, "--"))
 
 
 def _default_branch_refs(relay_dir):
     """The default-branch refs this repository actually has, in full form.
+
+    ALL THAT IS LEFT OF THE BRANCH POINT (ACC-DATA-009, simplified 2026-08-26).
+    Five legs failed this check with a branch point that DECIDED what belonged,
+    and each fix was falsified by a repository topology the last one had not
+    seen. The deciding is gone; what survives is a bound on how far back the
+    walk looks, so getting it wrong costs a `git log` and never a commit.
 
     `for-each-ref` resolves the patterns and prints only what exists, so a
     repository with no `main` yields an empty list rather than an error, and no
@@ -1369,8 +1456,9 @@ def _relay_records(relay_dir, runners, batons, checks, events):
 
     `floor` is the earliest of those records, or None when none of them can be
     timed - a relay can have a record whose time is unreadable, and a window
-    with no floor is still a window: the branch point and the budget both still
-    apply. Three sources, in decreasing order of how well they date themselves:
+    with no floor is still a window: the budget still applies, and a claimed
+    commit never needed a floor to begin with. Three sources, in decreasing
+    order of how well they date themselves:
 
     * a baton's mtime is when its runner landed. Every baton counts, including
       the running leg's, which is exactly the one the entry list drops.
@@ -1411,92 +1499,46 @@ def _is_judged(check):
             or bool(check["judgedBy"]))
 
 
-def _relay_commits(relay_dir, project):
-    """(commits, branched) for this run, newest first (ACC-DATA-009).
+def _relay_commits(relay_dir, project, floor, claimed):
+    """Every commit the log may DRAW ON, newest first (ACC-DATA-009).
 
-    A project's history is far longer and far busier than the relay that
-    supervises one slice of it, so a window decides which commits are the run's
-    at all. Two bounds make it, and this function applies neither: it reports
-    what each one has to say and the caller composes them.
+    This function makes both populations reachable; `_commit_entries` decides
+    which of them belongs. Nothing about the repository's topology is decided
+    here any more - that is the whole of the 2026-08-26 simplification, and the
+    reason five previous fixes each died to a topology the last had not seen.
 
-    * `commits` is already bounded by TOPOLOGY. When the relay runs on a branch
-      of its own, the walk excludes everything reachable from the default
-      branch, so what comes back is what this branch adds on top of its branch
-      point. `branched` says so. A commit from before the branch point is not
-      this run's work however loudly a baton talks about it, so no claim can
-      reach back past this bound.
-    * the second bound is the floor of the relay's own RECORDS, which
-      `_relay_records` derives from disk rather than from the log being built.
-      It is not read here at all - it is why `branched` is worth reporting.
-      A project's history from before the relay started is not part of this run
-      (ACC-DATA-009), and the caller needs both answers to know which of the
-      two floors is in force.
+    * every sha in `claimed` the repository confirms, fetched BY NAME so that
+      no walk, and therefore no topology, can lose it (`_claimed_commits`).
+    * the walk back from HEAD, which is where the commits nobody claims come
+      from. `--max-count` bounds it, and the default-branch refs narrow it to
+      what the run's branch adds on top of its branch point when that
+      narrowing is free.
 
-    The two bounds compose PER POPULATION, and the caller composes them: a
-    commit some baton claims is floored at the branch point, a commit nobody
-    claims is floored at the relay's earliest record, and where there is no
-    branch the record floor is the only floor either population has. See
-    `_commit_floors`, which is where that rule is written down once.
+    RULE: the narrowed walk is kept only when it REACHES `floor` - the relay's
+    earliest record, which is where the unclaimed population is bounded. A
+    narrowed walk that stops above the floor is deciding what belongs, which is
+    exactly what the branch point may no longer do, so it is thrown away and
+    the full walk is used instead. A walk hitting `LOG_MAX_COMMITS` reaches as
+    far back as any walk here ever does and counts as covering the window.
 
-    `branched` is reported rather than folded in here because this function
-    knows the topology and not the records, and the two floors need both.
-
-    A relay with no records at all has neither bound. It has no window and
-    nothing to count against, and the outer `--max-count` walk is all that is
-    left; showing a fresh relay its recent commits is better than showing it
-    nothing.
-
-    Two git invocations in the common case, both bounded by `GIT_TIMEOUT`: the
-    ref probe walks nothing, and a walk that comes back empty means HEAD is the
-    default branch, which is the unbranched case.
+    `floor` is None where nothing bounds the unclaimed population - a relay
+    with no records at all - and there the walk is not narrowed either:
+    everything it can reach is eligible, so nothing may narrow it.
     """
     if not _in_a_repo(relay_dir, project):
-        return [], False
-    defaults = _default_branch_refs(relay_dir)
-    if defaults:
-        branch = _git_log(relay_dir, exclude=defaults)
-        if branch:
-            return branch, True
-    return _git_log(relay_dir), False
-
-
-def _commit_floors(since, branched):
-    """The TWO floors of ACC-DATA-009: `(claimed, unclaimed)`, in epoch seconds.
-
-    `since` is the floor of the relay's own records and `branched` says the
-    walk is already floored at the branch point. There is one floor per
-    POPULATION, because the two populations are evidenced differently:
-
-    * a commit some leg's baton CLAIMS is floored at the BRANCH POINT. A runner
-      commits before it writes its baton, so a first leg's commit predates
-      every record the relay has, and the branch point is the only bound that
-      admits it. Where the walk is already floored there, no time floor is left
-      to apply and this one is None.
-    * a commit NO leg claims is floored at the relay's EARLIEST RECORD. A run
-      supervised on a branch that already existed does not own what that branch
-      carried before it started: that is the project's history, which is what
-      ACC-DATA-009's title forbids.
-
-    RULE: where there is no branch there is no branch point, and the record
-    floor is the only floor either population has - so a claim is NOT exempt
-    from it there. That exemption is what let a merge dated a day before the
-    relay began into the live relay's log, on the strength of a baton that only
-    mentioned the sha.
-
-    Neither floor is the budget's, and the budget may not stand in for either:
-    a commit must be absent because it is out of window, never because the
-    budget ran out before reaching it. Attribution decides what the budget
-    buys; it also decides which floor applies, and nothing else.
-
-    Nothing on disk tells a first leg's unclaimed second commit from a
-    long-lived branch's pre-relay work - both sit after the branch point and
-    before every record - so the contract picks the side that never lets
-    another run's history in, and pays for it in the first leg's unclaimed
-    extras. Making the branch point the floor for both, as the 2026-08-25
-    amendment first said, pulls a long-lived branch's pre-relay work into the
-    log; that clause was corrected the same day.
-    """
-    return (None if branched else since), since
+        return []
+    commits = []
+    refs = _default_branch_refs(relay_dir) if floor is not None else []
+    if refs:
+        narrowed = _git_log(relay_dir, exclude=refs)
+        if narrowed and (len(narrowed) >= LOG_MAX_COMMITS
+                         or narrowed[-1][0] <= floor):
+            commits = narrowed
+    if not commits:
+        commits = _git_log(relay_dir)
+    walked = {sha for _, sha, _ in commits}
+    return commits + _claimed_commits(
+        relay_dir, [sha for sha in sorted(claimed) if sha not in walked])
 
 
 def _floored(commits, floor):
@@ -1515,9 +1557,10 @@ def _commit_entries(relay_dir, project, batons, records, budget, now):
     """Commit entries for the log: the run's own commits first (ACC-DATA-009).
 
     `records` is `(has_records, floor)` from `_relay_records`: what the relay
-    has recorded about itself, read off disk. It decides the window (see
-    `_relay_commits`), and `budget` is how many unattributed commits may sit
-    beside the relay's own events.
+    has recorded about itself, read off disk. It is the floor of the unclaimed
+    population here and the walk's coverage test in `_relay_commits`, and
+    `budget` is how many unattributed commits may sit beside the relay's own
+    events.
 
     RULE: `has_records` decides whether there is a window, and it is NOT
     "did the derivation produce an entry". A relay whose only records are a
@@ -1539,14 +1582,24 @@ def _commit_entries(relay_dir, project, batons, records, budget, now):
     first, which above 150 relay events starts discarding attributed commits
     oldest-first and re-inverts the property at scale.
 
-    RULE: TWO floors, one per population, and neither of them is the budget
-    (`_commit_floors`). A commit some baton claims is floored at the BRANCH
-    POINT, already applied topologically by the walk; a commit nobody claims is
-    floored at the relay's EARLIEST RECORD; where there is no branch, the
-    record floor is the only floor either has. A commit must be absent from the
-    log because it is out of window, never because the budget ran out before
-    reaching it - the two are indistinguishable on the pane and only one of
-    them is the property.
+    RULE: ONE floor, and it governs one population (ACC-DATA-009, simplified
+    2026-08-26). A commit a baton claims and the repository confirms is this
+    run's work - no window, no floor, no branch point, and no topology can make
+    that untrue, because the claim and the object are the whole of the
+    evidence. A commit NO leg claims is floored at the relay's earliest record,
+    because nothing else attests that it belongs to this run.
+
+    This replaces two floors that both depended on the repository's topology.
+    They were correct for the repository each was written against and wrong for
+    the next one: the branch-point floor emptied the log of every claimed
+    commit the day this relay's branch was merged into `main`, while the runner
+    rows went on naming all twenty of them. A model that contradicts itself is
+    a worse failure than one that omits, and under the rule above it cannot:
+    the runner row and the commit entry read the same settled claim.
+
+    A commit must still be absent from the log because it is out of window,
+    never because the budget ran out before reaching it - the two are
+    indistinguishable on the pane and only one of them is the property.
 
     Only commits are budgeted. A baton, a handoff or a check transition is
     never dropped to make room: they are the events a supervisor came to the
@@ -1555,8 +1608,6 @@ def _commit_entries(relay_dir, project, batons, records, budget, now):
     `_relay_commits`.
     """
     has_records, since = records
-    commits, branched = _relay_commits(relay_dir, project)
-    commits = sorted(commits, key=lambda c: -c[0])
     # Attribution comes from the batons rather than from the runner rows, for
     # the same reason the landings above do: a baton is what happened, and a
     # leg that `legs.json` forgot - or has not marked done yet - has no runner
@@ -1572,16 +1623,20 @@ def _commit_entries(relay_dir, project, batons, records, budget, now):
     for leg, baton in sorted(batons.items(), key=lambda kv: (kv[1]["mtime"], kv[0])):
         if baton["commit"]:
             by_commit.setdefault(baton["commit"], leg)
+
+    # The claims are handed to the walk, not filtered out of it afterwards: a
+    # claimed commit no walk on this topology would have reached is fetched by
+    # name, which is what makes the rule above hold on ANY topology.
+    commits = sorted(
+        _relay_commits(relay_dir, project, since if has_records else None,
+                       by_commit),
+        key=lambda c: -c[0])
     if has_records:
-        # The window, applied to each population at its own floor. The walk is
-        # ALREADY floored at the branch point where the run owns a branch, so
-        # `claimed_floor` is None there and the claim reaches back to it; the
-        # record floor still applies to everything nobody claimed.
-        claimed_floor, unclaimed_floor = _commit_floors(since, branched)
-        attributed = _floored(
-            [c for c in commits if by_commit.get(c[1])], claimed_floor)
+        # One floor, one population. A claim carries its own evidence and is
+        # kept unconditionally; the record floor bounds everything else.
+        attributed = [c for c in commits if by_commit.get(c[1])]
         rest = _floored(
-            [c for c in commits if not by_commit.get(c[1])], unclaimed_floor)
+            [c for c in commits if not by_commit.get(c[1])], since)
         kept = attributed + rest[:max(0, budget - len(attributed))]
         # `git log` already yields newest first; sorting states the intent and
         # is stable, so equal commit times keep git's own order and the merge

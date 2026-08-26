@@ -13,6 +13,7 @@ fixture imported from `test_relay_model` does; do not write a second one.
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -30,6 +31,8 @@ import relay_model  # noqa: E402
 # checks: a second copy of it here is how the last hole survived its own repair.
 from test_relay_model import (  # noqa: E402,F401  (fixtures are used by name)
     AGENT_SERVICE_BATON_MTIMES,
+    ALL_FIXTURES,
+    FIXTURES,
     CORPUS_FORK_POINT,
     CORPUS_OWN,
     CORPUS_QUOTED,
@@ -1445,17 +1448,49 @@ def test_a_commit_dated_exactly_at_the_earliest_record_is_in_the_window(tmp_path
     assert entry["t"] == min(e["t"] for e in relay_events(model))
 
 
-def test_the_two_floors_are_derived_from_the_records_and_the_topology():
-    """`_commit_floors` at its own seam, with no repository in sight: the two
-    floors differ only where the run owns a branch, and where it does not, a
-    claim is NOT exempt from the record floor. That exemption is what let a
-    merge dated a day before the relay began into the live relay's log, on the
-    strength of a baton that only mentioned it."""
-    assert relay_model._commit_floors(1000.0, True) == (None, 1000.0)
-    assert relay_model._commit_floors(1000.0, False) == (1000.0, 1000.0)
-    # A relay whose records cannot be timed has a window and no floor.
-    assert relay_model._commit_floors(None, True) == (None, None)
-    assert relay_model._commit_floors(None, False) == (None, None)
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_narrowed_walk_that_stops_above_the_window_is_thrown_away(tmp_path):
+    """The branch point's ONLY remaining job, at its own seam (ACC-DATA-009,
+    simplified 2026-08-26): it bounds how far back the walk looks and decides
+    nothing. Here the run's branch was cut AFTER the relay's earliest record,
+    so the narrowed walk stops above the floor and would be deciding that the
+    project's traffic from while the relay ran does not belong. It is thrown
+    away and the full walk is used - one extra `git log`, no lost commit."""
+    project = tmp_path / "late"
+    relay_dir = project / ".relay"
+    (relay_dir / "batons").mkdir(parents=True)
+    legs = [{"id": "alpha", "stage": "S1", "status": "done"}]
+    legs += [{"id": f"spare-{i}", "stage": "S1", "status": "done"} for i in range(3)]
+    (relay_dir / "legs.json").write_text(json.dumps(
+        {"relay": "late", "stages": [{"id": "S1", "legs": [l["id"] for l in legs]}],
+         "legs": legs}))
+    _git(project, "init", "-q", "-b", "main")
+    _git(project, "commit", "-q", "--allow-empty", "--allow-empty-message",
+         "-m", "before: long before the relay", when=NOW - 90000)
+    _land(relay_dir, "alpha", NOW - 5000)                 # the earliest record
+    _git(project, "commit", "-q", "--allow-empty",
+         "-m", "while: on main while the relay ran", when=NOW - 4000)
+    _git(project, "checkout", "-q", "-b", "feat/cut-late")
+    _git(project, "commit", "-q", "--allow-empty",
+         "-m", "late: on the branch the relay cut", when=NOW - 3000)
+    for i in range(3):
+        _land(relay_dir, f"spare-{i}", NOW - 2500 + i)    # budget for both
+
+    refs = relay_model._default_branch_refs(relay_dir)
+    assert refs, "the repository has a default branch to narrow the walk with"
+    narrowed = [c[2] for c in relay_model._git_log(relay_dir, exclude=refs)]
+    assert narrowed == ["late: on the branch the relay cut"]
+
+    floor = NOW - 5000
+    walked = [c[2] for c in relay_model._relay_commits(
+        relay_dir, str(project), floor, {})]
+    assert "while: on main while the relay ran" in walked, walked
+
+    model = relay_model.build(relay_dir, now=NOW)
+    assert commit_named(model, "while: on main while the relay ran") is not None, \
+        [e["m"] for e in entries_of(model, "commit")]
+    assert commit_named(model, "late: on the branch the relay cut") is not None
+    assert commit_named(model, "before: long before the relay") is None
 
 
 # --------------------------------------------------------------------------
@@ -1613,9 +1648,11 @@ def test_a_running_first_leg_with_no_baton_still_bounds_the_commits(tmp_path):
 
 @pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
 def test_a_branch_with_no_default_branch_and_a_running_first_leg(tmp_path):
-    """The third door. `trunk`, with no `main`, no `master` and no `origin/*`,
-    so there is no branch point to floor at either - the records are the only
-    bound left, and they have to be enough on their own."""
+    """The third door. `trunk` is the ONLY ref this repository has - no `main`,
+    no `master`, no `origin/*` and no second branch - so there is nothing to
+    narrow the walk with either. The records are the only bound left and they
+    have to be enough on their own, which is what the simplified rule says for
+    every commit nobody claims."""
     relay_dir = _one_leg_in(tmp_path / "proj", branch="trunk")
     project = relay_dir.parent
     assert _git(project, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == "trunk"
@@ -2009,8 +2046,8 @@ def test_the_window_is_applied_though_the_derivation_produced_no_entry(tmp_path)
 
     # The walk really does have forty commits to bound - otherwise the
     # assertion below would pass for the wrong reason.
-    commits, branched = relay_model._relay_commits(relay_dir, project)
-    assert len(commits) == 40 and branched is False
+    commits = relay_model._relay_commits(relay_dir, project, records[1], {})
+    assert len(commits) == 40
 
     assert records[0] is True                       # records...
     assert relay_model._commit_entries(
@@ -2045,7 +2082,11 @@ def test_the_window_opens_when_legs_json_recorded_the_running_leg(tmp_path):
     _land(relay_dir, "alpha", NOW - 5000)          # claims no commit
 
     model = relay_model.build(relay_dir, now=NOW)
-    assert relay_model._default_branch_refs(relay_dir), "main exists"
+    # HEAD is `main` itself, so the walk bound is HEAD's own ref and narrows
+    # nothing: the records are the whole window for what nobody claims.
+    assert relay_model._default_branch_refs(relay_dir) == ["refs/heads/main"]
+    assert relay_model._git_log(
+        relay_dir, exclude=relay_model._default_branch_refs(relay_dir)) == []
     assert len(relay_events(model)) == 2            # alpha landed, beta started
     assert commit_named(model, "alpha: the first leg's own work") is not None, \
         [e["m"] for e in entries_of(model, "commit")]
@@ -2184,16 +2225,22 @@ def test_the_walk_stops_at_its_own_bound_and_keeps_the_newest(past_the_walk_boun
 
 
 @pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
-def test_a_claimed_commit_past_the_walk_bound_still_keeps_its_leg(
+def test_a_claimed_commit_past_the_walk_bound_is_fetched_by_name(
         past_the_walk_bound):
-    """What the cap costs the log, stated exactly. `first`'s commit is past the
-    bound and has no commit entry - but its landing entry and its runner row
-    both still name the sha, so what was lost is the commit's subject line and
-    not the attribution."""
+    """INVERTED 2026-08-26. `first`'s commit is past the walk's own cap, so no
+    walk this module can afford will ever return it - and the cap is a bound on
+    a WALK, which ACC-DATA-009 no longer lets decide what belongs. The claim is
+    confirmed by the repository, so the commit is asked for BY NAME and the
+    entry is there with its subject line, its time and its leg. What the cap
+    used to cost the log was that entry, with the runner row beside it still
+    naming the sha; the two panes now say the same thing at any cap."""
     relay_dir, oldest, newest = past_the_walk_bound
     model = relay_model.build(relay_dir, now=NOW)
-    assert oldest not in {e["commit"] for e in entries_of(model, "commit")}
-    assert newest in {e["commit"] for e in entries_of(model, "commit")}
+    named = {e["commit"]: e for e in entries_of(model, "commit")}
+    assert oldest in named, sorted(named)[:5]
+    assert named[oldest]["leg"] == "first"
+    assert named[oldest]["m"].endswith("run work 0")     # the subject, not a stub
+    assert newest in named
     landings = [e for e in model["log"]
                 if e["kind"] == "baton" and e["leg"] == "first"]
     assert [e["commit"] for e in landings] == [oldest]
@@ -2202,19 +2249,22 @@ def test_a_claimed_commit_past_the_walk_bound_still_keeps_its_leg(
 
 
 @pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
-@pytest.mark.parametrize("cap,admitted", [
-    (relay_model.LOG_MAX_COMMITS + BEYOND_THE_WALK - 1, False),
-    (relay_model.LOG_MAX_COMMITS + BEYOND_THE_WALK, True)])
-def test_the_walk_bound_is_what_drops_it_and_nothing_else(
-        past_the_walk_bound, monkeypatch, cap, admitted):
-    """The boundary itself, one commit either side of it, and the evidence that
-    neither floor nor budget is involved: the same relay, the same batons, the
-    same window - only the cap moves, and the commit appears with it."""
+@pytest.mark.parametrize("cap", [
+    relay_model.LOG_MAX_COMMITS + BEYOND_THE_WALK - 1,
+    relay_model.LOG_MAX_COMMITS + BEYOND_THE_WALK])
+def test_no_cap_on_the_walk_can_decide_whether_a_claim_is_in_the_log(
+        past_the_walk_bound, monkeypatch, cap):
+    """The boundary itself, one commit either side of it. This test used to
+    assert that the claimed commit appeared with the cap and vanished without
+    it; that is precisely a bound on a walk deciding what belongs, and the
+    2026-08-26 simplification forbids it. The same relay, the same batons, the
+    same window, the cap either side of the commit - and the claim is in the
+    log either way, still credited to `first`."""
     relay_dir, oldest, _newest = past_the_walk_bound
     monkeypatch.setattr(relay_model, "LOG_MAX_COMMITS", cap)
     model = relay_model.build(relay_dir, now=NOW)
-    named = {e["commit"] for e in entries_of(model, "commit")}
-    assert (oldest in named) is admitted, sorted(named)[:5]
+    named = {e["commit"]: e["leg"] for e in entries_of(model, "commit")}
+    assert named.get(oldest) == "first", sorted(named)[:5]
 
 
 # --------------------------------------------------------------------------
@@ -2342,3 +2392,885 @@ def test_a_tilde_path_cannot_widen_the_repository_bound(nested_relay, monkeypatc
     assert os.path.expanduser("~") == str(host)     # the tilde really resolves
     assert entries_of(model, "commit") == [], \
         [e["m"] for e in entries_of(model, "commit")]
+
+
+# --------------------------------------------------------------------------
+# THE CLAIM IS THE EVIDENCE, ON EVERY TOPOLOGY (ACC-DATA-009, simplified
+# 2026-08-26 after a fifth failure)
+#
+#   > A commit a baton claims and the repository confirms is this run's work.
+#   > Full stop - no window, no floor, no branch point. A commit no leg claims
+#   > is bounded by the relay's earliest record. The branch point survives only
+#   > as the outer bound of the `git log` WALK - a performance bound on how far
+#   > back to look, never a decision about what belongs.
+#
+# WHY THIS SECTION EXISTS AT ALL, AND WHY IT KEPT THE MATRIX. Five legs each
+# defined the branch point more carefully than the last, and a judge falsified
+# each one with a repository topology the previous had not seen: a plain clone,
+# `origin/HEAD` naming the run's own branch, a trunk called `develop` or
+# `trunk`, and finally the coach merging this relay's branch into `main`
+# mid-run, which made the merge-base against the trunk HEAD itself and emptied
+# the log of every commit twenty runner rows were still naming. A rule that
+# depends on topology is the wrong rule, so the matrix below now asserts the
+# INVARIANT rather than the branch point: on every one of these topologies the
+# claimed commit is in the log, and the log and the runner rows say the same
+# thing.
+#
+# So these build the ref topologies DELIBERATELY - with `update-ref`,
+# `symbolic-ref` and a real merge, and once with a real `git clone` - rather
+# than taking whatever `git init` happens to leave behind.
+#
+# THE FIXTURE'S LOAD-BEARING DETAIL: alpha's commit is 60 s OLDER than alpha's
+# baton, because a runner commits before it writes one. It therefore predates
+# every record the relay has, so nothing but the claim can admit it - which is
+# exactly what the simplified rule says admits it, on any topology at all.
+# --------------------------------------------------------------------------
+
+def _branch_point_relay(project, base="main", branch="feat/the-run"):
+    """A relay one leg in, on a branch of its own, claiming its own commit."""
+    relay_dir = project / ".relay"
+    (relay_dir / "batons").mkdir(parents=True)
+    (relay_dir / "legs.json").write_text(json.dumps(
+        {"relay": "branch-point",
+         "stages": [{"id": "S1", "legs": ["alpha", "beta"]}],
+         "legs": [{"id": "alpha", "stage": "S1", "status": "done"},
+                  {"id": "beta", "stage": "S1", "status": "running"}]}))
+    _git(project, "init", "-q", "-b", base)
+    (project / "README").write_text("the project\n")
+    _git(project, "add", "README", when=NOW - 9000)
+    _git(project, "commit", "-q", "-m", "before: the project existed first",
+         when=NOW - 9000)
+    _git(project, "checkout", "-q", "-b", branch)
+    _git(project, "commit", "-q", "--allow-empty",
+         "-m", "alpha: the first leg's own work", when=NOW - 5060)
+    _land(relay_dir, "alpha", NOW - 5000, _short_sha(project))
+    return relay_dir
+
+
+def _remote_ref(project, name, rev):
+    """A remote-tracking ref, without needing a remote to fetch from."""
+    _git(project, "update-ref", f"refs/remotes/origin/{name}", rev)
+
+
+def _origin_head(project, name):
+    _git(project, "symbolic-ref", "refs/remotes/origin/HEAD",
+         f"refs/remotes/origin/{name}")
+
+
+def _topology_none(project, base, branch):
+    """`git init` and nothing else: one local base branch, no remote."""
+
+
+def _topology_clone(project, base, branch):
+    """What `git clone -b <branch>` leaves behind: `origin/HEAD` NAMES the
+    cloned branch, and the branch has a remote-tracking ref of its own."""
+    _remote_ref(project, branch, "HEAD")
+    _remote_ref(project, base, base)
+    _origin_head(project, branch)
+
+
+def _topology_origin_head_on_the_base(project, base, branch):
+    """The same refs, with `origin/HEAD` naming the base branch instead."""
+    _remote_ref(project, branch, "HEAD")
+    _remote_ref(project, base, base)
+    _origin_head(project, base)
+
+
+def _topology_only_the_branchs_own_remote(project, base, branch):
+    """The branch's own remote-tracking ref and no other remote ref at all."""
+    _remote_ref(project, branch, "HEAD")
+
+
+def _topology_merged_into_the_trunk(project, base, branch):
+    """THIS REPOSITORY, on the morning of 2026-08-26. The coach merged the
+    run's branch into the trunk mid-run and the trunk moved on, so every commit
+    HEAD carries is reachable from the trunk as well: the merge-base against it
+    IS HEAD, `HEAD --not <trunk>` walks nothing at all, and the run reads as
+    having added nothing. In place the log fell from 18 commit entries to 5
+    while twenty runner rows went on naming twenty commits."""
+    _git(project, "checkout", "-q", base)
+    _git(project, "merge", "-q", "--no-ff", "-m", f"merge: {branch} into {base}",
+         branch, when=NOW - 4500)
+    _git(project, "commit", "-q", "--allow-empty",
+         "-m", "trunk: moved on after the merge", when=NOW - 4400)
+    _git(project, "checkout", "-q", branch)
+    _remote_ref(project, base, base)
+    _origin_head(project, base)
+
+
+TOPOLOGIES = {
+    "no remote at all": _topology_none,
+    "origin/HEAD names the run's own branch": _topology_clone,
+    "origin/HEAD names the base branch": _topology_origin_head_on_the_base,
+    "only the branch's own remote-tracking ref": _topology_only_the_branchs_own_remote,
+    "the branch is already merged into its trunk": _topology_merged_into_the_trunk,
+}
+
+
+def _built(tmp_path, topology, base):
+    branch = "feat/the-run"
+    relay_dir = _branch_point_relay(tmp_path / "proj", base=base, branch=branch)
+    TOPOLOGIES[topology](relay_dir.parent, base, branch)
+    return relay_model.build(relay_dir, now=NOW)
+
+
+# Four base-branch names and one that is nobody's convention. A branch point is
+# a property of the TOPOLOGY - where the run's branch forked from the rest of
+# the repository - and not of what the branch it forked from is called. Two of
+# these were reported by the round-4 code judge: on `develop` and on `trunk`
+# the leg's own claimed commit left the log entirely.
+BASE_NAMES = ["main", "master", "develop", "trunk", "zx9-nobodys-convention"]
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+@pytest.mark.parametrize("base", BASE_NAMES)
+@pytest.mark.parametrize("topology", sorted(TOPOLOGIES))
+def test_a_leg_claimed_commit_survives_every_ref_topology(tmp_path, topology, base):
+    """One relay, one leg, one claimed commit, five ref topologies and five
+    base branch names. The commit predates every record, so nothing but the
+    claim can admit it - and the claim is evidence on every topology, which is
+    the whole of the rule this leg implements. Each of these five broke a
+    previous leg's branch point; none of them can reach the claim."""
+    model = _built(tmp_path, topology, base)
+    entry = commit_named(model, "alpha: the first leg's own work")
+    assert entry is not None, [e["m"] for e in entries_of(model, "commit")]
+    assert entry["leg"] == "alpha"
+    assert commit_named(model, "before: the project existed first") is None
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+@pytest.mark.parametrize("base", BASE_NAMES)
+@pytest.mark.parametrize("topology", sorted(TOPOLOGIES))
+def test_the_log_never_contradicts_the_runner_rows(tmp_path, topology, base):
+    """THE INVARIANT, asserted directly rather than through any one topology.
+
+    A runner row and a commit entry are two panes reporting the same fact, and
+    a model that contradicts itself is a worse failure than one that omits: the
+    clone defect had 18 rows naming a commit the log did not carry. Where the
+    run owns a branch, the two sets are the same set."""
+    model = _built(tmp_path, topology, base)
+    claimed = {r["commit"] for r in model["runners"] if r["commit"]}
+    attributed = {e["commit"] for e in entries_of(model, "commit") if e["leg"]}
+    assert claimed, "the fixture's leg claims a commit"
+    assert claimed == attributed, model["warnings"]
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_repository_with_no_other_ref_keeps_the_claim_all_the_same(tmp_path):
+    """INVERTED 2026-08-26, by the contract's own simplification. With the base
+    branch deleted the run's branch is the only ref there is, so there is no
+    branch point and nothing to narrow the walk with. Under the rule this
+    replaces, that cost alpha its commit - it predates alpha's baton, and the
+    record floor governed claims too. Under the rule now in force the claim IS
+    the evidence, so the commit stays and the pane stops disagreeing with the
+    runner row beside it."""
+    relay_dir = _branch_point_relay(tmp_path / "proj")
+    _git(relay_dir.parent, "branch", "-q", "-D", "main")
+    assert _git(relay_dir.parent, "for-each-ref", "--format=%(refname)"
+                ).stdout.split() == ["refs/heads/feat/the-run"]
+    assert relay_model._default_branch_refs(relay_dir) == []
+    model = relay_model.build(relay_dir, now=NOW)
+    entry = commit_named(model, "alpha: the first leg's own work")
+    assert entry is not None, [e["m"] for e in entries_of(model, "commit")]
+    assert entry["leg"] == "alpha"
+    # ...and the project's own history is still nobody's: it is unclaimed, and
+    # the record floor is what bounds an unclaimed commit.
+    assert commit_named(model, "before: the project existed first") is None
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_detached_head_at_the_branch_tip_still_owns_its_branch(tmp_path):
+    """HEAD on no branch, at the tip of the branch the run has been landing on.
+    Nothing about the repository changed but the symbolic ref, so nothing about
+    the run's window may change either: the branch ref at HEAD names where the
+    run is and is not a fork away from it."""
+    relay_dir = _branch_point_relay(tmp_path / "proj")
+    _git(relay_dir.parent, "checkout", "-q", "--detach", "HEAD")
+    assert _git(relay_dir.parent, "rev-parse", "--abbrev-ref",
+                "HEAD").stdout.strip() == "HEAD"
+    model = relay_model.build(relay_dir, now=NOW)
+    entry = commit_named(model, "alpha: the first leg's own work")
+    assert entry is not None, [e["m"] for e in entries_of(model, "commit")]
+    assert entry["leg"] == "alpha"
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_origin_head_naming_the_run_s_own_branch_empties_the_walk_not_the_log(
+        tmp_path):
+    """The seam the clone defect lived at, asserted at the seam. `origin/HEAD`
+    resolves to the run's own branch after `git clone -b <branch>`, so the
+    narrowed walk excludes HEAD itself and comes back with NOTHING. That used
+    to be the answer; now it is only a walk that failed, and the claim is
+    fetched by name regardless."""
+    relay_dir = _branch_point_relay(tmp_path / "proj")
+    project = relay_dir.parent
+    _topology_clone(project, "main", "feat/the-run")
+    refs = relay_model._default_branch_refs(relay_dir)
+    assert "refs/remotes/origin/HEAD" in refs
+    assert relay_model._git_log(relay_dir, exclude=refs) == [], "the walk sees nothing"
+
+    model = relay_model.build(relay_dir, now=NOW)
+    entry = commit_named(model, "alpha: the first leg's own work")
+    assert entry is not None, [e["m"] for e in entries_of(model, "commit")]
+    assert entry["leg"] == "alpha"
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_sibling_branch_on_the_run_s_own_line_keeps_the_window_open(tmp_path):
+    """The live agent-service relay's shape. Each leg commits on a branch of
+    its own and the run's branch collects them, so refs sit ON the run's own
+    line - one at HEAD, one a commit back. A previous leg read the contract's
+    'nearest ref' literally over every ref in the repository, took the nearest
+    of these as the branch point, closed the window to nothing and dropped
+    every leg-claimed commit while 15 rows went on claiming them. Neither half
+    of that can happen now: the walk is narrowed by the DEFAULT-branch refs
+    only, and a claim does not depend on the walk at all."""
+    relay_dir = _branch_point_relay(tmp_path / "proj")
+    project = relay_dir.parent
+    _git(project, "commit", "-q", "--allow-empty",
+         "-m", "beta: the second leg's own work", when=NOW - 4060)
+    _land(relay_dir, "beta", NOW - 4000, _short_sha(project))
+    _git(project, "update-ref", "refs/heads/leg/alpha", "HEAD~1")
+    _git(project, "update-ref", "refs/heads/leg/beta", "HEAD")
+
+    model = relay_model.build(relay_dir, now=NOW)
+    attributed = {e["leg"] for e in entries_of(model, "commit") if e["leg"]}
+    assert attributed == {"alpha", "beta"}, [e["m"] for e in entries_of(model, "commit")]
+    claimed = {r["commit"] for r in model["runners"] if r["commit"]}
+    assert claimed == {e["commit"] for e in entries_of(model, "commit") if e["leg"]}
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_clone_of_the_repository_shows_the_log_the_source_tree_shows(tmp_path):
+    """The defect end to end, on a real clone rather than a constructed ref
+    shape - because `git clone -b <branch>` is how anyone obtains a repository,
+    and the Progress Log was empty on a clone of the repository the TUI ships
+    in. The relay's `dashboard.json` names the SOURCE project, which is what a
+    coach's dashboard says and what a clone inherits: unusable there, so the
+    clone reads its own project and says so."""
+    src = tmp_path / "src"
+    relay_dir = _branch_point_relay(src)
+    (relay_dir / "dashboard.json").write_text(json.dumps({"path": str(src)}))
+    clone = tmp_path / "clone"
+    _git(tmp_path, "clone", "-q", "-b", "feat/the-run", str(src), str(clone))
+    shutil.copytree(relay_dir, clone / ".relay")
+    assert _git(clone, "symbolic-ref", "refs/remotes/origin/HEAD"
+                ).stdout.strip() == "refs/remotes/origin/feat/the-run"
+
+    here = relay_model.build(relay_dir, now=NOW)
+    there = relay_model.build(clone / ".relay", now=NOW)
+    assert [e["m"] for e in entries_of(here, "commit")], "the source tree's log"
+    assert ([e["m"] for e in entries_of(there, "commit")]
+            == [e["m"] for e in entries_of(here, "commit")])
+    assert [w for w in there["warnings"] if "`path`" in w], there["warnings"]
+    assert [w for w in here["warnings"] if "`path`" in w] == []
+
+
+# --------------------------------------------------------------------------
+# a `path` the model cannot use is warned about, not silently obeyed
+# (ACC-DATA-009)
+#
+# `_in_a_repo` clamps a written `path` that is not the relay's own project back
+# to the relay directory, which is the right bound and the wrong silence: the
+# read then finds no repository, the log carries no commit, no baton's claim is
+# settled - and `relay.path` goes on reporting the value as though it were in
+# use. A value that names a directory the model may not read from is as
+# unusable as one that names no directory at all, and the model warns about
+# every other unusable field it reads.
+# --------------------------------------------------------------------------
+
+@pytest.fixture
+def other_project(tmp_path):
+    """A second real repository holding every commit the relay's batons claim.
+
+    The worst shape of the defect: a path that is a directory, that is a
+    repository, and that answers every question asked of it - with another
+    project's history.
+    """
+    return tmp_path / "elsewhere"
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+@pytest.mark.parametrize("kind", ["an ancestor", "a home directory",
+                                  "another repository"])
+def test_a_path_that_is_not_the_relays_own_project_is_warned_about(
+        home_relay, other_project, kind):
+    """Three values a coach can write that the model cannot read from, and one
+    warning apiece. Each is a directory, so none of them is caught by the
+    `not a directory` warning that already exists."""
+    home = home_relay.parent.parent
+    if kind == "another repository":
+        _git(home, "clone", "-q", str(home_relay.parent), str(other_project))
+    written = {"an ancestor": str(home),
+               "a home directory": "~",
+               "another repository": str(other_project)}[kind]
+    (home_relay / "dashboard.json").write_text(json.dumps({"path": written}))
+
+    model = relay_model.build(home_relay, now=NOW)
+    said = [w for w in model["warnings"] if "`path`" in w]
+    assert len(said) == 1, model["warnings"]
+    assert written in said[0], said[0]
+    assert model["relay"]["path"] == written        # reported as the coach wrote it
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_path_the_model_cannot_use_falls_back_to_the_relays_own_project(
+        home_relay):
+    """Warned about AND ignored, exactly as a `path` that names no directory
+    is: the read falls back to the relay's own project, which is the widest
+    bound `_in_a_repo` would have allowed the written value anyway. Silence
+    left the log empty and the claims unsettled instead."""
+    (home_relay / "dashboard.json").write_text(json.dumps(
+        {"path": str(home_relay.parent.parent)}))
+    model = relay_model.build(home_relay, now=NOW)
+    entry = commit_named(model, "alpha: the leg's work")
+    assert entry is not None, model["warnings"]
+    assert entry["leg"] == "alpha"
+    rows = {r["leg"]: r for r in model["runners"]}
+    assert rows["alpha"]["commit"] == entry["commit"]
+    assert rows["beta"]["commit"] is None, "deadbee is not an object here"
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_the_two_shapes_a_relay_actually_has_are_not_warned_about(
+        home_relay, repo_relay):
+    """The bound narrows, so what it must not break is asserted beside it: a
+    live relay is `<project>/.relay` and a fixture relay is its own project,
+    and a `path` naming either of those is a coach getting it right."""
+    for relay_dir, written in ((home_relay, str(home_relay.parent)),
+                               (repo_relay, str(repo_relay))):
+        (relay_dir / "dashboard.json").write_text(json.dumps({"path": written}))
+        model = relay_model.build(relay_dir, now=NOW)
+        assert [w for w in model["warnings"] if "`path`" in w] == [], written
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+@pytest.mark.parametrize("base", ["main", "trunk"])
+def test_a_remote_tracking_ref_behind_its_own_branch_is_still_the_run_s(
+        tmp_path, base):
+    """The ordinary state of a branch with unpushed work, and the only shape
+    where where a ref POINTS cannot say whose it is: `origin/<branch>` and the
+    `origin/HEAD` that names it both sit at a commit HEAD has moved past, so
+    only the NAME is left to read. Taken as branch points they open the window
+    after the first leg's commit, and that leg's row goes on claiming what the
+    log dropped.
+
+    Both halves bite, and on different bases. `origin/HEAD` is one of the
+    default-branch refs, so it reaches the walk wherever the repository has
+    one; `origin/<branch>` reaches it where the repository has none."""
+    relay_dir = _branch_point_relay(tmp_path / "proj", base=base)
+    project = relay_dir.parent
+    _git(project, "commit", "-q", "--allow-empty",
+         "-m", "beta: the second leg's own work", when=NOW - 4060)
+    _land(relay_dir, "beta", NOW - 4000, _short_sha(project))
+    _remote_ref(project, "feat/the-run", "HEAD~1")     # where it was last pushed
+    _remote_ref(project, base, base)
+    _origin_head(project, "feat/the-run")
+
+    model = relay_model.build(relay_dir, now=NOW)
+    assert {e["leg"] for e in entries_of(model, "commit") if e["leg"]} == \
+        {"alpha", "beta"}, [e["m"] for e in entries_of(model, "commit")]
+    claimed = {r["commit"] for r in model["runners"] if r["commit"]}
+    assert claimed == {e["commit"] for e in entries_of(model, "commit") if e["leg"]}
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_branch_another_branch_has_absorbed_keeps_everything_it_earned(tmp_path):
+    """INVERTED 2026-08-26. A ref that reaches every commit HEAD has: `next`
+    merged the run's branch and moved on, so the merge-base with it is HEAD
+    itself and every narrowed walk comes back empty. Under the rule this
+    replaces, alpha's claimed commit was then floored at the relay's records
+    and lost, because a runner commits before it writes its baton; that is the
+    shape the coach's own merge into `main` put this repository into, and it is
+    what emptied its Progress Log. The claim now stands on its own evidence,
+    and the unclaimed commits are still bounded by the records."""
+    relay_dir = _branch_point_relay(tmp_path / "proj", base="trunk")
+    project = relay_dir.parent
+    _git(project, "commit", "-q", "--allow-empty",
+         "-m", "after: the relay did this while it ran", when=NOW - 4000)
+    _git(project, "branch", "-q", "next")
+    _git(project, "checkout", "-q", "next")
+    _git(project, "commit", "-q", "--allow-empty",
+         "-m", "next: carried the run's work onward", when=NOW - 3000)
+    _git(project, "checkout", "-q", "feat/the-run")
+    assert _git(project, "branch", "--contains", "HEAD", "--format=%(refname)"
+                ).stdout.split() == ["refs/heads/feat/the-run", "refs/heads/next"]
+
+    model = relay_model.build(relay_dir, now=NOW)
+    entry = commit_named(model, "alpha: the first leg's own work")
+    assert entry is not None, [e["m"] for e in entries_of(model, "commit")]
+    assert entry["leg"] == "alpha"
+    assert commit_named(model, "after: the relay did this while it ran") is not None
+    # `next`'s own commit is not on HEAD's line at all, and the project's
+    # history predates every record: neither is this run's.
+    assert commit_named(model, "next: carried the run's work onward") is None
+    assert commit_named(model, "before: the project existed first") is None
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_stash_is_not_a_bound_on_the_walk(tmp_path):
+    """`git stash` writes `refs/stash`, and a stash commit's parent is HEAD.
+    Used as a bound on the walk it stops it at HEAD, and a supervisor's
+    Progress Log loses its unclaimed commits for exactly as long as somebody
+    leaves work stashed. Only the DEFAULT-branch refs bound the walk, so git's
+    own bookkeeping - `refs/stash`, `refs/notes/*`, `refs/bisect/*` - cannot
+    reach it. Asserted on a repository with no default branch, where a scan
+    over every ref would have had nothing else to choose from."""
+    relay_dir = _branch_point_relay(tmp_path / "proj", base="trunk")
+    project = relay_dir.parent
+    (project / "README").write_text("uncommitted work\n")
+    _git(project, "stash", "push", "-q", "-m", "work in progress", when=NOW - 4000)
+    assert _git(project, "rev-parse", "--verify", "refs/stash").stdout.strip()
+    assert relay_model._default_branch_refs(relay_dir) == []
+
+    model = relay_model.build(relay_dir, now=NOW)
+    entry = commit_named(model, "alpha: the first leg's own work")
+    assert entry is not None, [e["m"] for e in entries_of(model, "commit")]
+    assert entry["leg"] == "alpha"
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_an_annotated_tag_at_head_is_not_a_bound_on_the_walk(tmp_path):
+    """A release cut on the run's own branch. A tag at HEAD used as a walk
+    bound stops the walk at HEAD, and an ANNOTATED tag points at a tag object
+    rather than at the commit, so a scan over every ref had to peel it before
+    it could even tell. Only the default-branch refs bound the walk, so there
+    is nothing here to peel and nothing to get wrong."""
+    relay_dir = _branch_point_relay(tmp_path / "proj", base="trunk")
+    project = relay_dir.parent
+    _git(project, "tag", "-a", "-m", "the release", "v1.0", when=NOW - 4000)
+    assert _git(project, "cat-file", "-t", "refs/tags/v1.0").stdout.strip() == "tag"
+    assert relay_model._default_branch_refs(relay_dir) == []
+
+    model = relay_model.build(relay_dir, now=NOW)
+    entry = commit_named(model, "alpha: the first leg's own work")
+    assert entry is not None, [e["m"] for e in entries_of(model, "commit")]
+    assert entry["leg"] == "alpha"
+
+
+# --------------------------------------------------------------------------
+# THE MODEL NEVER CONTRADICTS ITSELF (ACC-DATA-009, simplified 2026-08-26)
+#
+# A runner row's `commit` and a commit entry's `leg` are two panes reporting
+# one settled fact: `baton["commit"]`, the sha the baton claimed and the
+# repository confirmed. Under the rule now in force they cannot disagree by
+# construction - the same value feeds both - so the disagreement is asserted
+# DIRECTLY rather than through whichever topology last exposed it.
+#
+# It is asserted this way because every previous fix was a topology fix, and
+# the measurement that condemned each of them was always this one: 18 rows
+# claiming a commit and 0 commit entries on a clone; 20 rows claiming and 5
+# entries in place after the trunk absorbed the branch. Neither shape has to be
+# reachable by a test for the invariant to be checkable - it is checkable on
+# every relay this suite can read.
+# --------------------------------------------------------------------------
+
+# The relays this model is pointed at while it is being built. `.relay` is
+# git-ignored, and the second lives only on the machine this relay runs on, so
+# each is read where it exists and named where it does not - a live relay is
+# evidence, not a fixture, and it cannot be shipped.
+LIVE_RELAYS = [
+    REPO / ".relay",
+    Path(os.path.expanduser(
+        "~/Documents/Work/Projescts/AI internal/aihub/agent-service/.relay")),
+]
+
+
+def _reads_a_repository(relay_dir):
+    """Whether the model can confirm a claim for the relay at `relay_dir`.
+
+    The same two steps `build()` takes, in the same order: a `path` a coach
+    wrote decides which project is read, and `_in_a_repo` decides whether that
+    project holds a repository at all. Outside one, nothing on disk can confirm
+    a claim and there are no commit entries to compare rows against.
+    """
+    relay_dir = Path(relay_dir)
+    written = None
+    try:
+        written = json.loads((relay_dir / "dashboard.json").read_text()).get("path")
+    except (OSError, ValueError, AttributeError):
+        written = None
+    project = relay_model._project_dir(
+        written if isinstance(written, str) else None, relay_dir, [])
+    return relay_model._in_a_repo(relay_dir, project)
+
+
+def assert_the_model_agrees_with_itself(model, relay_dir):
+    """THE INVARIANT: the commits the rows claim and the commits the log
+    attributes are the same commits, in both directions.
+
+    Direction one: every sha a runner row carries is a commit entry. This is
+    the failure the check was rewritten for - a row naming work the log says is
+    not this run's.
+
+    Direction two: every commit entry credited to a leg that HAS a row is a sha
+    that row carries. A leg `legs.json` forgot has a baton and no row, so its
+    entry is exempt; nothing else is.
+
+    Sha SETS, not `(leg, sha)` pairs, because two batons claiming one sha is a
+    contradiction on disk that the model resolves deliberately - the leg that
+    landed first is credited, once.
+    """
+    rows = {r["leg"]: r["commit"] for r in model["runners"] if r["commit"]}
+    if model["logSource"] != "derived":
+        # ACC-DATA-006: a coach who writes `dashboard.json.log` is quoted
+        # verbatim, and their prose is not the model's derivation. There is
+        # nothing derived here to agree or disagree with.
+        assert [e for e in model["log"] if e.get("kind") == "commit"] == []
+        return
+    entries = {e["commit"]: e["leg"] for e in entries_of(model, "commit") if e["leg"]}
+    if not _reads_a_repository(relay_dir):
+        assert entries == {}, entries      # nothing here can confirm a claim
+        return
+    assert set(rows.values()) <= set(entries), \
+        sorted(set(rows.values()) - set(entries))
+    assert {(leg, sha) for sha, leg in entries.items() if leg in rows} <= \
+        {(leg, sha) for leg, sha in rows.items()}
+
+
+@pytest.mark.parametrize("name", ALL_FIXTURES)
+def test_the_log_and_the_rows_agree_on_every_fixture(relay, name):
+    """Every fixture on disk, copied and read the way a view reads one."""
+    target = relay(name)
+    assert_the_model_agrees_with_itself(relay_model.build(target, now=NOW), target)
+
+
+@pytest.mark.parametrize("name", ALL_FIXTURES)
+def test_the_log_and_the_rows_agree_on_every_fixture_read_in_place(name):
+    """The same fixtures read WHERE THEY LIVE - inside this repository, which
+    is a real git repository with real commits and none of them theirs. A copy
+    in `tmp_path` has no repository around it, so a copy alone cannot tell
+    whether a settled claim reaches the log."""
+    target = FIXTURES / name
+    assert_the_model_agrees_with_itself(relay_model.build(target, now=NOW), target)
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+@pytest.mark.parametrize("base", BASE_NAMES)
+@pytest.mark.parametrize("topology", sorted(TOPOLOGIES))
+def test_the_log_and_the_rows_agree_on_every_ref_topology(tmp_path, topology, base):
+    """The matrix again, through the invariant rather than through the
+    fixture's own subject line."""
+    relay_dir = _branch_point_relay(tmp_path / "proj", base=base,
+                                    branch="feat/the-run")
+    TOPOLOGIES[topology](relay_dir.parent, base, "feat/the-run")
+    model = relay_model.build(relay_dir, now=NOW)
+    assert {r["commit"] for r in model["runners"] if r["commit"]}, "a row claims one"
+    assert_the_model_agrees_with_itself(model, relay_dir)
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+@pytest.mark.parametrize("live", LIVE_RELAYS, ids=lambda p: p.parent.name)
+def test_the_log_and_the_rows_agree_on_a_live_relay(live):
+    """The two relays this model is actually pointed at: this one, on a branch
+    its trunk has already absorbed, and the live agent-service relay whose
+    batons claim two shas no branch here reaches. Both were measured
+    contradicting themselves on 2026-08-26 - 20 rows against 5 entries here,
+    and 0 entries at all from a clone.
+
+    Read-only, in place, with no clock injected: a live relay is evidence and
+    this suite may not write to one."""
+    if not (live / "batons").is_dir():
+        pytest.skip(f"{live} is not on this machine (a live relay is not a fixture)")
+    before = sorted((p.name, p.stat().st_mtime) for p in live.rglob("*") if p.is_file())
+    model = relay_model.build(live)
+    assert {r["commit"] for r in model["runners"] if r["commit"]}, "a row claims one"
+    assert_the_model_agrees_with_itself(model, live)
+    assert sorted((p.name, p.stat().st_mtime)
+                  for p in live.rglob("*") if p.is_file()) == before, \
+        "build() wrote to a live relay"
+
+
+# --------------------------------------------------------------------------
+# a claim is fetched by NAME, so no walk can lose it (ACC-DATA-009)
+# --------------------------------------------------------------------------
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_claimed_commits_answers_for_a_sha_and_says_nothing_for_a_stranger(
+        tmp_path):
+    """`_claimed_commits` at its own seam. It asks git for objects by name, so
+    what it returns is decided by the repository having them and by nothing
+    else - no walk, no ref, no branch."""
+    relay_dir = _branch_point_relay(tmp_path / "proj")
+    sha = _short_sha(relay_dir.parent)
+    assert [c[1] for c in relay_model._claimed_commits(relay_dir, [sha])] == [sha]
+    assert relay_model._claimed_commits(relay_dir, ["deadbee"]) == []
+
+
+def test_claimed_commits_spawns_no_process_when_the_walk_missed_nothing(
+        tmp_path, monkeypatch):
+    """The repaint cost of the guarantee, which is zero in the common case: the
+    walk usually reaches every claimed commit, and an empty list is answered
+    without asking git anything. `build()` runs once per repaint."""
+    asked = []
+    monkeypatch.setattr(relay_model, "_git",
+                        lambda *a, **k: asked.append(a) or None)
+    assert relay_model._claimed_commits(tmp_path, []) == []
+    assert asked == []
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_claimed_commit_no_branch_here_reaches_is_still_this_run_s_work(
+        tmp_path):
+    """Reachability is not a condition, and this is a live shape rather than a
+    hypothetical one: the agent-service relay's batons claim `096a713` and
+    `5c9caf2`, merges that landed on `develop`, which its own HEAD cannot
+    reach. ACC-DATA-009 admits a commit on the claim plus the repository, and
+    the repository has the object. The alternative is a runner row naming a sha
+    the log calls somebody else's work, which is the contradiction this check
+    now forbids in either direction."""
+    relay_dir = _branch_point_relay(tmp_path / "proj")
+    project = relay_dir.parent
+    _git(project, "checkout", "-q", "-b", "develop")
+    _git(project, "commit", "-q", "--allow-empty",
+         "-m", "beta: landed on develop and never came back", when=NOW - 4060)
+    sha = _short_sha(project)
+    _git(project, "checkout", "-q", "feat/the-run")
+    assert sha not in _git(project, "log", "--format=%h", "HEAD").stdout.split()
+    _land(relay_dir, "beta", NOW - 4000, sha)
+
+    model = relay_model.build(relay_dir, now=NOW)
+    entry = commit_named(model, "beta: landed on develop and never came back")
+    assert entry is not None, [e["m"] for e in entries_of(model, "commit")]
+    assert entry["leg"] == "beta"
+    assert_the_model_agrees_with_itself(model, relay_dir)
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_clone_of_a_branch_its_trunk_absorbed_reads_the_same_log(tmp_path):
+    """BOTH failures this leg closes, in one repository, end to end.
+
+    The trunk absorbed the run's branch and moved on, so `HEAD --not <trunk>`
+    walks nothing; and the clone is a real `git clone -b <branch>`, which
+    points `origin/HEAD` at the cloned branch. Measured against this repository
+    on 2026-08-26 under the rule this replaces: 5 commit entries read in place,
+    0 read from the clone, 20 runner rows claiming a commit in both.
+
+    The whole log is compared, not just its commits: `copytree` preserves the
+    baton mtimes, so every entry in both must be the same entry."""
+    src = tmp_path / "src"
+    relay_dir = _branch_point_relay(src)
+    _topology_merged_into_the_trunk(src, "main", "feat/the-run")
+    # What a coach's dashboard says, and what a clone inherits: the source.
+    (relay_dir / "dashboard.json").write_text(json.dumps({"path": str(src)}))
+    clone = tmp_path / "clone"
+    _git(tmp_path, "clone", "-q", "-b", "feat/the-run", str(src), str(clone))
+    shutil.copytree(relay_dir, clone / ".relay")
+    assert _git(clone, "symbolic-ref", "refs/remotes/origin/HEAD"
+                ).stdout.strip() == "refs/remotes/origin/feat/the-run"
+    assert _git(clone, "log", "--format=%h", "HEAD", "--not",
+                "refs/remotes/origin/main").stdout.split() == []
+
+    here = relay_model.build(relay_dir, now=NOW)
+    there = relay_model.build(clone / ".relay", now=NOW)
+
+    def rows(model):
+        return [(e["t"], e["kind"], e["m"], e["leg"], e["commit"])
+                for e in model["log"]]
+
+    assert entries_of(here, "commit"), "the source tree's log has commits"
+    assert rows(there) == rows(here)
+    for model, where in ((here, relay_dir), (there, clone / ".relay")):
+        assert_the_model_agrees_with_itself(model, where)
+    assert [w for w in there["warnings"] if "`path`" in w], there["warnings"]
+
+
+# --------------------------------------------------------------------------
+# four properties nothing here could see until a mutation went green
+# (ACC-DATA-009)
+#
+# Each of these was written because reverting the line it guards left the
+# suite green. Three of them are decisions the contract states in so many
+# words - the budget is not a bound on attribution, a relay with no records
+# has no window, `path` may only narrow the repository bound - and the fourth
+# is the seven characters a claim and a commit are compared at.
+# --------------------------------------------------------------------------
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_the_budget_cannot_bound_attribution_when_there_are_no_events(tmp_path):
+    """The contract names this defect's exact form: `kept = (attributed +
+    rest)[:budget]` is wrong "even though it leaves today's suite green". It
+    stays green because every other relay here has more events than claims.
+
+    A relay ONE LEG IN has neither. Its only leg is still running, so its baton
+    is a RECORD and not an event entry - the disambiguation ACC-DATA-009 spells
+    out - and the budget is zero. A budget that bounds attribution then drops
+    the one commit the run has to show for itself, while its runner row goes on
+    naming the sha."""
+    project = tmp_path / "one-leg"
+    relay_dir = project / ".relay"
+    (relay_dir / "batons").mkdir(parents=True)
+    (relay_dir / "legs.json").write_text(json.dumps(
+        {"relay": "one-leg", "stages": [{"id": "S1", "legs": ["alpha"]}],
+         "legs": [{"id": "alpha", "stage": "S1", "status": "running"}]}))
+    _git(project, "init", "-q", "-b", "main")
+    _git(project, "commit", "-q", "--allow-empty", "--allow-empty-message",
+         "-m", "before: the project existed first", when=NOW - 9000)
+    _git(project, "commit", "-q", "--allow-empty",
+         "-m", "alpha: the leg's own work", when=NOW - 5060)
+    _land(relay_dir, "alpha", NOW - 5000, _short_sha(project))
+
+    model = relay_model.build(relay_dir, now=NOW)
+    assert relay_events(model) == []       # a record on disk, no event entry
+    entry = commit_named(model, "alpha: the leg's own work")
+    assert entry is not None, [e["m"] for e in entries_of(model, "commit")]
+    assert entry["leg"] == "alpha"
+    # ...and the budget still buys nothing for the population it does bound.
+    assert commit_named(model, "before: the project existed first") is None
+    assert_the_model_agrees_with_itself(model, relay_dir)
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_relay_with_no_records_sees_the_project_and_not_just_its_branch(
+        tmp_path):
+    """The contract's degenerate carve-out, read exactly: a relay that has
+    recorded nothing has NO window, and "recent commits are the only story
+    there is" under the existing `--max-count` bound. Narrowing that walk to
+    the run's own branch is a window by another name - this relay would be
+    shown the one commit on its branch and nothing of the project it sits in,
+    with no record anywhere saying it should be."""
+    project = tmp_path / "fresh"
+    relay_dir = project / ".relay"
+    (relay_dir / "batons").mkdir(parents=True)
+    (relay_dir / "legs.json").write_text(json.dumps(
+        {"relay": "fresh", "stages": [{"id": "S1", "legs": ["alpha"]}],
+         "legs": [{"id": "alpha", "stage": "S1", "status": "pending"}]}))
+    _git(project, "init", "-q", "-b", "main")
+    _git(project, "commit", "-q", "--allow-empty", "--allow-empty-message",
+         "-m", "main work 0", when=NOW - 9000)
+    _git(project, "commit", "-q", "--allow-empty", "-m", "main work 1",
+         when=NOW - 8000)
+    _git(project, "checkout", "-q", "-b", "feat/fresh")
+    _git(project, "commit", "-q", "--allow-empty", "-m", "branch work",
+         when=NOW - 7000)
+
+    model = relay_model.build(relay_dir, now=NOW)
+    assert relay_events(model) == []          # nothing recorded, no window
+    subjects = sorted(e["m"].split(": ", 1)[1] for e in entries_of(model, "commit"))
+    assert subjects == ["branch work", "main work 0", "main work 1"], subjects
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_repository_that_abbreviates_wider_than_seven_still_attributes(
+        tmp_path):
+    """`%h` is not seven characters everywhere. git widens the abbreviation as
+    a repository grows, and `core.abbrev` sets it outright - so a commit that
+    is not cut to the same seven characters `commit_claims` cuts a claim to
+    never equals one. Every commit entry goes unattributed while every runner
+    row still names its sha, which is this check's own contradiction. Nothing
+    else in this suite can see it: every repository here, including this one,
+    abbreviates to seven today."""
+    relay_dir = _branch_point_relay(tmp_path / "proj")
+    project = relay_dir.parent
+    _git(project, "config", "core.abbrev", "12")
+    assert len(_git(project, "log", "-1", "--format=%h").stdout.strip()) == 12
+
+    model = relay_model.build(relay_dir, now=NOW)
+    entry = commit_named(model, "alpha: the first leg's own work")
+    assert entry is not None, [e["m"] for e in entries_of(model, "commit")]
+    assert entry["leg"] == "alpha"
+    assert len(entry["commit"]) == 7
+    assert_the_model_agrees_with_itself(model, relay_dir)
+
+
+def test_the_repository_bound_may_only_be_narrowed_by_the_project(tmp_path):
+    """`_in_a_repo` at its own seam. `project` comes from `dashboard.json.path`
+    and is untrusted, so it may NARROW the search for a `.git` and never widen
+    it: the two shapes a relay has are its own directory and `<project>/.relay`,
+    and anything else clamps back to the relay directory.
+
+    Asserted here rather than only through `build()`, because `_project_dir`
+    now refuses a foreign path before this bound is ever reached - so the two
+    guards mask each other end to end, and reverting either one alone left the
+    suite green."""
+    host = tmp_path / "host"
+    (host / ".git").mkdir(parents=True)
+    relay_dir = host / "a" / "b" / ".relay"
+    relay_dir.mkdir(parents=True)
+
+    assert relay_model._in_a_repo(relay_dir, str(host)) is False
+    assert relay_model._in_a_repo(relay_dir, "/") is False
+    assert relay_model._in_a_repo(relay_dir, str(relay_dir.parent)) is False
+    (relay_dir.parent / ".git").mkdir()       # the live `<project>/.relay`
+    assert relay_model._in_a_repo(relay_dir, str(relay_dir.parent)) is True
+    (relay_dir / ".git").mkdir()              # a relay that is its own project
+    assert relay_model._in_a_repo(relay_dir, str(relay_dir)) is True
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_commit_with_an_odd_subject_is_still_this_run_s_work(tmp_path):
+    """Two subjects git allows and the parser used to drop: one containing the
+    field separator this module asks git to use, and one that is empty. A
+    dropped line is a parser deciding what belongs, and on a claimed commit
+    ACC-DATA-009 no longer permits anything to decide but the claim and the
+    repository - so both are in the log, credited, with the subject git
+    actually recorded."""
+    project = tmp_path / "odd"
+    relay_dir = project / ".relay"
+    (relay_dir / "batons").mkdir(parents=True)
+    (relay_dir / "legs.json").write_text(json.dumps(
+        {"relay": "odd", "stages": [{"id": "S1", "legs": ["alpha", "beta"]}],
+         "legs": [{"id": "alpha", "stage": "S1", "status": "done"},
+                  {"id": "beta", "stage": "S1", "status": "done"}]}))
+    _git(project, "init", "-q", "-b", "main")
+    _git(project, "commit", "-q", "--allow-empty",
+         "-m", "alpha: a subject\x1fwith the separator in it", when=NOW - 5060)
+    _land(relay_dir, "alpha", NOW - 5000, _short_sha(project))
+    _git(project, "commit", "-q", "--allow-empty", "--allow-empty-message",
+         "-m", "", when=NOW - 4060)
+    _land(relay_dir, "beta", NOW - 4000, _short_sha(project))
+
+    model = relay_model.build(relay_dir, now=NOW)
+    by_leg = {e["leg"]: e for e in entries_of(model, "commit") if e["leg"]}
+    assert set(by_leg) == {"alpha", "beta"}, [e["m"] for e in entries_of(model, "commit")]
+    assert by_leg["alpha"]["m"].endswith("a subject\x1fwith the separator in it")
+    assert by_leg["beta"]["m"].endswith(": ")          # no subject, not invented
+    assert_the_model_agrees_with_itself(model, relay_dir)
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_two_batons_claiming_one_sha_credit_the_leg_that_landed_first(tmp_path):
+    """A contradiction on disk, not a choice for the model: two batons name the
+    same commit. The leg that landed FIRST is credited, so the log says the
+    same thing on every build, and both runner rows still carry the sha they
+    claim - the invariant compares sha sets for exactly this reason."""
+    project = tmp_path / "twice"
+    relay_dir = project / ".relay"
+    (relay_dir / "batons").mkdir(parents=True)
+    (relay_dir / "legs.json").write_text(json.dumps(
+        {"relay": "twice", "stages": [{"id": "S1", "legs": ["alpha", "beta"]}],
+         "legs": [{"id": "alpha", "stage": "S1", "status": "done"},
+                  {"id": "beta", "stage": "S1", "status": "done"}]}))
+    _git(project, "init", "-q", "-b", "main")
+    _git(project, "commit", "-q", "--allow-empty", "-m", "the one commit",
+         when=NOW - 5060)
+    sha = _short_sha(project)
+    _land(relay_dir, "alpha", NOW - 5000, sha)
+    _land(relay_dir, "beta", NOW - 4000, sha)
+
+    model = relay_model.build(relay_dir, now=NOW)
+    entry = commit_named(model, "the one commit")
+    assert entry is not None and entry["leg"] == "alpha"
+    assert {r["leg"]: r["commit"] for r in model["runners"]} == \
+        {"alpha": sha, "beta": sha}
+    assert_the_model_agrees_with_itself(model, relay_dir)
+
+
+def test_every_git_read_is_bounded_in_time(tmp_path, monkeypatch):
+    """`build()` runs once per repaint inside a 2 s budget, so an unbounded
+    `git` is a frozen TUI rather than a slow one. The bound is passed on every
+    read, and a read that hits it degrades to "git could not answer" - which is
+    the same answer as git being absent, and is already handled everywhere.
+
+    A genuinely hanging `git` is ACC-LIVE-001's business in S4; this is the
+    line that makes the bound exist at all, and nothing else here could see it
+    go missing."""
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(kwargs)
+        raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
+
+    monkeypatch.setattr(relay_model.subprocess, "run", fake_run)
+    assert relay_model._git(tmp_path, "rev-parse", "HEAD") is None
+    assert [c.get("timeout") for c in calls] == [relay_model.GIT_TIMEOUT]

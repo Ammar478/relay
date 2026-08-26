@@ -44,17 +44,15 @@ AGENT_SERVICE_BATON_MTIMES = {
     "mask-shape-coverage": 1787582967.6,
 }
 
-ALL_FIXTURES = [
-    "agent-service",
-    "stale-currentleg",
-    "tokens",
-    "no-dashboard",
-    "ghost-currentleg",
-    "legs-only",
-    "malformed",
-    "all-done",
-    "empty",
-]
+# Every relay directory under `tests/fixtures/`, DERIVED from disk rather than
+# listed by hand. ACC-DATA-001's sweep is only a sweep while it reads all of
+# them, and a hardcoded list stops being one the moment a leg adds a fixture:
+# `running-impl` landed from a leg whose boundaries excluded this module, and
+# the sweep silently covered nine directories of ten. Deriving it closes the
+# class rather than that instance - a fixture is swept the moment it exists.
+# `test_the_fixture_sweep_reads_every_fixture_on_disk` holds this to that.
+ALL_FIXTURES = sorted(p.name for p in FIXTURES.iterdir()
+                      if p.is_dir() and not p.name.startswith("."))
 
 EM_DASH = "—"
 
@@ -97,6 +95,19 @@ def test_build_returns_a_dict_for_every_fixture(relay):
     for name in ALL_FIXTURES:
         model = relay_model.build(relay(name))
         assert isinstance(model, dict), name
+
+
+def test_the_fixture_sweep_reads_every_fixture_on_disk():
+    """The sweep above, and the dozen parametrised over the same list, are
+    evidence only while the list is the whole corpus. It used to be typed out
+    by hand, so a fixture added by a leg that could not edit this file was
+    swept by nothing and the suite stayed green at nine directories of ten."""
+    on_disk = sorted(p.name for p in FIXTURES.iterdir()
+                     if p.is_dir() and not p.name.startswith("."))
+    assert on_disk, "there are fixtures on disk to sweep"
+    assert ALL_FIXTURES == on_disk
+    assert "running-impl" in ALL_FIXTURES        # the one the list had missed
+    assert len(ALL_FIXTURES) >= 10
 
 
 def test_build_accepts_a_string_path(relay):
@@ -851,6 +862,33 @@ def test_no_runner_column_carries_a_display_placeholder_when_unsourced(unsourced
 # --------------------------------------------------------------------------
 
 HAS_GIT = shutil.which("git") is not None
+
+
+def test_git_is_installed_or_this_suite_is_not_evidence():
+    """A missing git is a RED BUILD, not eighty-four quiet skips.
+
+    Every property this module and `test_progress_log` hold ACC-DATA-009 to -
+    the commit window, the branch point, a claim settled against the
+    repository, the corpus the ACC-DATA-007 sweeps read - is git-backed and
+    carries `skipif(not HAS_GIT)`. The round-4 code judge ran the suite with
+    git hidden AND round 3's defect mutated back in (`_settle_commits` writing
+    an em-dash for a claim the repository denies) and got `657 passed, 84
+    skipped, exit 0`: a green build over a live defect, with the test that
+    proves the corpus can reach what the sweeps guard the first thing skipped.
+
+    This module shells out to git as a core function, so git is a requirement
+    of the suite rather than an optional extra, and the honest way to say so is
+    to fail. The `skipif` marks stay - once this test has gone red the skips
+    are an explanation of WHICH properties went unproven rather than a
+    substitute for proving them - and the exit code is no longer green.
+
+    The same disease in the other direction: `ALL_FIXTURES` is derived from
+    disk and asserted non-empty above, because emptying it removed ninety tests
+    and left the suite green too.
+    """
+    assert HAS_GIT, ("git is not installed: every ACC-DATA-009 property in this "
+                     "suite is git-backed and would be skipped, which is a "
+                     "green build over unproven behaviour")
 
 
 def git_run(cwd, *args, when=None):
