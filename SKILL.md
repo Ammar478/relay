@@ -100,7 +100,8 @@ Rules:
 - Behavioural, not implementational. "Returns 200", not "calls `authService.login`".
 - Aim for coverage, not volume — a real feature is dozens of checks, not five —
   and spend the time, because ambiguity here becomes rework later.
-- **Write one to three standing checks in the user's own words.** Quote sentences
+- **Write one to three standing checks in the user's own words.** One of them is
+  always the sentence that says what the user runs. Quote sentences
   from the request verbatim, mark them `Standing`, and re-verify every one of them
   at **every** stage gate, not once. They are the request; the rest of the
   contract is only your reading of it.
@@ -210,7 +211,10 @@ Expect roughly a third of your total legs to be fix legs.
 
 For each failure, create a targeted fix leg, insert it at the head of the queue,
 and return to Phase 4. Repeat until every check in the stage reads `passed`, then
-the stage is **cleared** and you advance.
+the stage is **cleared** and you advance — but the check that proves the product
+starts is re-verified at every later gate. A cleared stage does not stay cleared
+for free: a later leg that reorganises the package leaves that check reading
+`passed` while the user gets an import error.
 
 **The floor.** A check passes once its behaviour holds and one mutation of the
 property it names fails the suite. A defect in the guard on that guard is written
@@ -266,11 +270,10 @@ one family caps the relay at that family's weakest capability.
 
 ## Scaling down
 
-Not every task deserves a relay. A single-file fix, a routine edit, or a question
-does not — coordination will cost more than the work. Use the harness when the
-objective spans multiple legs, needs to survive multiple context windows, or must
-be verifiably correct rather than plausibly correct. For small work, keep only
-invariant one: state what done means before you start.
+Not every task deserves a relay — a single-file fix or a question costs more to
+coordinate than to do. Use the harness when the objective spans multiple legs,
+must survive multiple context windows, or must be verifiably rather than plausibly
+correct. For small work keep only invariant one: state what done means first.
 
 ## References
 
