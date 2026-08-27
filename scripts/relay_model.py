@@ -95,6 +95,7 @@ import re
 import stat
 import subprocess
 import time
+import typing
 
 __all__ = [
     "build",
@@ -645,17 +646,78 @@ def _stage_records(legsfile, warnings):
     A stage id is used as a dictionary key by plan ordering and by the stage
     name lookup, so a list or an object there is not merely wrong, it is
     unhashable.
+
+    Duplicate ids are warned about, for the same reason `_leg_records` warns
+    about duplicate leg ids and for one more that is this check's own
+    (ACC-DATA-002): two stage entries answering to one id can only be keyed
+    once, so ONE of them decides where its legs sort and what their `stageName`
+    reads - while `model["stages"]` goes on listing both. A repeated id used to
+    be resolved last-wins and in silence, which sorted the first entry's legs
+    behind every later stage and nulled their `stageName` from a second entry
+    that carried no name. `_stage_index` resolves it first-wins now, and this
+    warning is what stops the resolution from being silent: the model cannot
+    order those legs as declared, because the file declares two orders.
     """
-    records = []
+    records, seen = [], {}
     for i, stage in enumerate(_records(legsfile.get("stages"))):
+        sid = _text_or_warn(stage.get("id"), f"legs.json: stage #{i} `id`",
+                            warnings)
+        if sid is not None:
+            seen[sid] = seen.get(sid, 0) + 1
         records.append({
-            "id": _text_or_warn(stage.get("id"), f"legs.json: stage #{i} `id`",
-                                warnings),
+            "id": sid,
             "name": _text_or_warn(stage.get("name"),
                                   f"legs.json: stage #{i} `name`", warnings),
             "legs": _strlist(stage.get("legs")),
         })
+
+    for sid, count in seen.items():
+        if count > 1:
+            warnings.append(
+                f"legs.json: stage id '{sid}' is declared by {count} stages; "
+                "ids must be unique or the legs of that stage cannot be "
+                "ordered as declared, so the first declaration gives the stage "
+                "its position and its name and the rest are ignored")
     return records
+
+
+def _stage_index(stages):
+    """{stage id -> (position, name)} for every stage `legs.json` declares.
+
+    FIRST DECLARATION WINS, and that is the whole of this function's content
+    (ACC-DATA-002). Both maps it replaces were last-wins dict comprehensions
+    written independently - one for plan order, one for `stageName`, one more
+    in `build()` for `currentStage` - and a repeated id therefore moved a
+    stage's legs to the end of the plan AND blanked their stage name AND
+    renamed the current stage, from three different lines, with no warning
+    anywhere. One map, one rule, one place to change it; `_stage_records`
+    warns that the file declared the id twice.
+
+    A stage with no usable id is left out: it cannot be looked up by any leg,
+    and `None` as a key would collide with every leg whose `stage` is missing.
+    """
+    index = {}
+    for pos, stage in enumerate(stages):
+        if stage["id"] is not None:
+            index.setdefault(stage["id"], (pos, stage["name"]))
+    return index
+
+
+def _stage_names(stages):
+    """{stage id -> declared name}, first declaration winning."""
+    return {sid: name for sid, (_, name) in _stage_index(stages).items()}
+
+
+def _stage_named(stage, position):
+    """How a warning names a stage: by its id, or by where in the file it is.
+
+    A stage whose `id` the model could not read has None there, and
+    interpolating that printed "stage None lists leg ..." - a placeholder
+    rendered as though it were a value, in a sentence whose whole job is to be
+    read. Its position in `stages` is what such a stage still honestly has,
+    and it is the same name `_stage_records` warned about it under.
+    """
+    return f"stage {stage['id']}" if stage["id"] else f"stage #{position}"
 
 
 def _leg_records(legsfile, warnings):
@@ -702,12 +764,32 @@ def _plan_order(legs, stages, warnings):
     stage the order its `legs` list declares, then any leg of that stage the
     stage list forgot, then legs whose stage is unknown. Deterministic for a
     given file, and stable when a coach appends a leg mid-relay.
+
+    This is ACC-DATA-002's definition of plan order, and plan order is what
+    picks `activeLeg` out of the running legs, so every rank below is a rank
+    the active leg pane can be moved by.
     """
-    stage_rank = {s["id"]: i for i, s in enumerate(stages) if s["id"]}
+    stage_rank = {sid: pos for sid, (pos, _) in _stage_index(stages).items()}
     within = {}
-    for stage in stages:
+    for i, stage in enumerate(stages):
         for pos, lid in enumerate(stage["legs"]):
-            within.setdefault((stage["id"], lid), pos)
+            # DECLARED, at position `pos`. The pair, rather than the bare
+            # position, is what makes the two populations rank against each
+            # other by KIND first: every leg its stage lists sorts ahead of
+            # every leg its stage forgot, whatever their positions are.
+            #
+            # FIRST POSITION WINS, on the same rule as a duplicate stage id: a
+            # `legs` array naming one leg twice declares two positions for it
+            # and the model can only use one, so it uses the first and says the
+            # file did that. Silently taking the last is a reorder nobody asked
+            # for, and `activeLeg` is what it moves.
+            if (stage["id"], lid) in within:
+                warnings.append(
+                    f"legs.json: {_stage_named(stage, i)} lists leg '{lid}' "
+                    "more than once; a leg has one position in a stage, and "
+                    "the first one it is given is the one being used")
+                continue
+            within[(stage["id"], lid)] = (0, pos)
 
     # RULE: a leg of no declared stage ranks after every declared one, and the
     # rank that does that is `len(stages)` - NOT `len(stage_rank)`.
@@ -720,24 +802,43 @@ def _plan_order(legs, stages, warnings):
     # of S1, which moves `activeLeg` (ACC-DATA-002's second rule). The ranks
     # themselves are indices into `stages`, so `len(stages)` is above all of
     # them however many ids were unusable.
-    tail = len(legs) + 1
-    decorated = []
-    for i, leg in enumerate(legs):
-        sid = leg.get("stage")
-        decorated.append((
-            (stage_rank.get(sid, len(stages)),
-             within.get((sid, leg.get("id")), tail),
-             i),
-            leg,
-        ))
+    #
+    # RULE: the within-stage rank of a leg its stage does not list is `(1, 0)`,
+    # and it is a SECOND CLASS rather than a number chosen to be large enough.
+    # It used to be `len(legs) + 1`, a bound taken from the wrong list: the
+    # positions it had to sit above are indices into a STAGE's `legs` array,
+    # and a coach who renames or merges legs mid-relay leaves ids in that array
+    # with no leg entry left - this relay has done it at least five times. Four
+    # such ids in one stage put a DECLARED leg at position 4 behind a forgotten
+    # one at `len(legs) + 1 == 3`, moving `activeLeg` from the leg the plan
+    # names to the leg it does not. No arithmetic on either list can be right
+    # here, because the two populations are not on one scale; the class tag is.
+    #
+    # RULE: the third rank ACC-DATA-002 names - "then by their position in the
+    # `legs` array itself" - is `sort`'s own STABILITY and not a term in the
+    # key. A file index in the key was carried here for a while and could not
+    # change an outcome: `sorted` preserves the order equal keys arrived in,
+    # and they arrive in file order, so the term and the guarantee said the
+    # same thing twice. It is deleted rather than defended; the tie-break is
+    # asserted directly by the tests that put two legs of one stage in a file
+    # order the stage list does not name.
+    decorated = [((stage_rank.get(leg.get("stage"), len(stages)),
+                   within.get((leg.get("stage"), leg.get("id")), (1, 0))), leg)
+                 for leg in legs]
     decorated.sort(key=lambda pair: pair[0])
 
+    # RULE: the warning names the stage the way the FILE lets it be named. A
+    # stage whose `id` the model could not read is `None`, and interpolating
+    # that printed "stage None lists leg ..." - a placeholder rendered as
+    # though it were a value, in a sentence whose whole job is to be read. The
+    # file position is what such a stage still has, and `_stage_records` warns
+    # about the same stage under the same name.
     known = {leg.get("id") for leg in legs}
-    for stage in stages:
+    for i, stage in enumerate(stages):
         for lid in stage["legs"]:
             if lid not in known:
                 warnings.append(
-                    f"legs.json: stage {stage['id']} lists leg '{lid}', "
+                    f"legs.json: {_stage_named(stage, i)} lists leg '{lid}', "
                     "which has no leg entry")
     return [leg for _, leg in decorated]
 
@@ -745,7 +846,7 @@ def _plan_order(legs, stages, warnings):
 def _leg_rows(legsfile, warnings):
     stages = _stage_records(legsfile, warnings)
     legs = _leg_records(legsfile, warnings)
-    names = {s["id"]: s["name"] for s in stages}
+    names = _stage_names(stages)
 
     rows = []
     for order, leg in enumerate(_plan_order(legs, stages, warnings)):
@@ -1136,7 +1237,30 @@ def _attention(checks, extras, leg_counts):
 # bound stands over UNCLAIMED commits only, and is deliberately the loosest.
 LOG_MAX_COMMITS = 200
 LOG_MAX_ENTRIES = 300
-GIT_TIMEOUT = 3.0
+
+# ONE DEADLINE FOR ALL THE GIT WORK IN ONE `build()`, and this is the bound
+# ACC-DATA-001's "never blocks" turned out to need (stated 2026-08-27).
+#
+# It used to be `GIT_TIMEOUT = 3.0`, a ceiling on ONE git process, and every
+# git read in a build carried its own copy of it: `rev-parse --show-toplevel`
+# to find the work tree, `cat-file --batch-check` to settle the claims, `log`
+# to walk, `log --no-walk` to fetch the claims the walk missed. Four ceilings
+# in series is not a bound on anything a caller can hold - a judge measured
+# `build()` at 10.7 s, five times the 2 s repaint budget the check itself
+# cites, while every malformed FILE shape was refused in 0.3 ms.
+#
+# So the budget is spent, never renewed: `build()` fixes one deadline and
+# every git read shares it. A read that starts with time left is capped at
+# what is left; a read that starts with none does not spawn a process at all.
+# Whatever git could not answer inside the budget degrades exactly as an
+# absent git already did - a warning, and a log built from the batons alone.
+#
+# 1.5 s, not 2.0: the repaint budget has to cover the file work and the draw
+# as well as git, and the point of a budget is that the caller can rely on it.
+# Both live relays this module reads build in ~0.06 s end to end, so the
+# margin over honest work is twenty-five fold; the budget bites only where
+# something is already wrong.
+GIT_BUDGET = 1.5
 
 # THERE IS NO BRANCH POINT IN THIS MODULE, IN ANY ROLE (ACC-DATA-009, corrected
 # 2026-08-26). A tuple of default-branch ref names used to live here, and
@@ -1190,8 +1314,45 @@ def _log_entry(t, exact, kind, level, message, now,
     }
 
 
-def _repo_dir(relay_dir):
-    """The work tree the relay's repository is READ from, or None.
+class RepoReading(typing.NamedTuple):
+    """What asking git about a relay directory answered.
+
+    `dir` is the work tree to read the relay's repository from, or None. `why`
+    is None when there is one, and otherwise SAYS WHICH WAY THE ASK FAILED, in
+    the words a supervisor reads (ACC-DATA-009: whatever the model cannot use,
+    it says so - and a warning that states a falsehood is worse than none).
+
+    The three ways are three different facts about the relay and only one of
+    them used to be reported. The bare `_repo_dir` this replaces collapsed all
+    of them into None, so
+    a missing or slow git, a `core.worktree` pointing somewhere else, and a
+    `.git` git will not accept each made a relay sitting at `<repo>/.relay`
+    report "this relay is not inside a repository of its own" - which is
+    false, and which a supervisor can only act on by looking for a repository
+    that is already there.
+    """
+
+    dir: typing.Optional[pathlib.Path]
+    why: typing.Optional[str]
+
+
+#: Nothing that could hold a repository holds one. TRUE, and the only one of
+#: the four the old wording was ever right about.
+REPO_NONE = "this relay is not inside a repository of its own"
+#: Nothing could be asked, because the directories that would answer refused
+#: to be read. `_has_git` answers None rather than False for exactly this.
+REPO_UNREADABLE = "this relay's own directory could not be read"
+#: Git was asked and did not answer: absent, broken, or slower than the build's
+#: whole git budget (`GIT_BUDGET`).
+REPO_SILENT = "git could not answer for this relay"
+#: Git answered, with a work tree that is not this relay's - `core.worktree`
+#: aimed elsewhere, or a `.git` git rejected so that it reported the
+#: surrounding project instead.
+REPO_ELSEWHERE = "git reports {top} as this relay's work tree, which is not it"
+
+
+def _repo_reading(relay_dir, deadline=None):
+    """The work tree the relay's repository is READ from, and why not.
 
     ASK GIT (ACC-DATA-009, amended 2026-08-26). This used to walk parents for
     a `.git` and stop at the relay directory's immediate parent, which encoded
@@ -1226,17 +1387,26 @@ def _repo_dir(relay_dir):
     of a directory that is not a repository at all. The precondition says
     whether to ask; only the answer decides.
 
-    Never raises: `relay_dir` may be unreadable, git may be absent, and each of
-    those means the same thing here.
+    Never raises: `relay_dir` may be unreadable and git may be absent. Those
+    are no longer the same answer, and that is what `why` carries: each of the
+    four returns below is a different fact about this relay, and reporting all
+    of them as "not inside a repository of its own" was a diagnosis that is
+    false on three of them (ACC-DATA-009, 2026-08-27).
     """
     try:
         resolved = pathlib.Path(relay_dir).resolve()
     except OSError:
-        return None
+        return RepoReading(None, REPO_UNREADABLE)
     roots = _repo_roots(resolved)
-    if not any(_has_git(root) for root in roots):
-        return None
-    out = _git(resolved, "rev-parse", "--show-toplevel")
+    # THE PRECONDITION ANSWERS IN THREE VALUES, not two. `_has_git` says True,
+    # False, or None for "I was not allowed to look", and a refusal is not a
+    # no: a relay directory with no search bit that nothing else could answer
+    # for cannot be reported as having no repository, because nobody found out.
+    held = [_has_git(root) for root in roots]
+    if not any(held):
+        return RepoReading(
+            None, REPO_UNREADABLE if any(h is None for h in held) else REPO_NONE)
+    out = _git(resolved, "rev-parse", "--show-toplevel", deadline=deadline)
     # GIT'S ANSWER, compared as it arrives. `--show-toplevel` prints the work
     # tree's REAL path - absolute and symlink-resolved even where
     # `core.worktree` names a symlink - and the question was asked from a
@@ -1249,8 +1419,16 @@ def _repo_dir(relay_dir):
     # resolved: `Path("").resolve()` is the PROCESS'S working directory, and a
     # dashboard is opened from wherever a supervisor's shell happens to be,
     # which is very often inside some other project's repository.
-    top = pathlib.Path((out or "").strip())
-    return top if top in roots else None
+    #
+    # The empty text is now told apart from a work tree that is simply not
+    # this relay's, because they are different things to be told: one says git
+    # never answered, the other says git answered about somewhere else.
+    if not (out or "").strip():
+        return RepoReading(None, REPO_SILENT)
+    top = pathlib.Path(out.strip())
+    if top not in roots:
+        return RepoReading(None, REPO_ELSEWHERE.format(top=top))
+    return RepoReading(top, None)
 
 
 def _repo_roots(resolved):
@@ -1276,7 +1454,7 @@ def _repo_roots(resolved):
 
 
 def _has_git(path):
-    """Whether `path` holds a `.git`. A refusal is not an answer, and not fatal.
+    """Whether `path` holds a `.git`: True, False, or None for "I may not look".
 
     `pathlib`'s `exists()` swallows the errors that mean "nothing is there" -
     ENOENT, ENOTDIR, ELOOP, EBADF - and lets EACCES through, because "I may not
@@ -1284,15 +1462,22 @@ def _has_git(path):
     is still a directory, so `build()` is well past its RelayNotFound guard by
     the time this runs; an exception escaping here is an uncaught traceback
     inside a 2 s repaint loop, which ACC-DATA-001 forbids as plainly as any
-    other. Answering False lets the caller go on to the next candidate: the
-    directory that could not answer is the one whose parent may hold the
-    repository, and giving up at the first refusal would cost a chmod'd live
-    relay its own history.
+    other. A refusal does not stop the caller either: the directory that could
+    not answer is the one whose parent may hold the repository, and giving up
+    at the first refusal would cost a chmod'd live relay its own history -
+    `any()` reads None as falsy, so the next candidate is still asked.
+
+    THE REFUSAL IS None RATHER THAN False, and the difference is a diagnosis
+    rather than a decision (ACC-DATA-009, 2026-08-27). Every candidate
+    answering False means the relay has no repository; every candidate
+    refusing means nobody found out, and telling a supervisor the first when
+    the second happened is a false statement about their relay. It changes no
+    control flow here - it changes which sentence `_repo_reading` returns.
     """
     try:
         return (path / ".git").exists()
     except OSError:
-        return False
+        return None
 
 
 def _project_dir(written, relay_dir, warnings, repo):
@@ -1302,7 +1487,7 @@ def _project_dir(written, relay_dir, warnings, repo):
     string is quoted back verbatim as `relay.path` - a supervisor's label for
     their own project is theirs - and this function answers the label to fall
     back to when there is none. It no longer decides where a commit is READ
-    from: `_repo_dir` asks git that, and git is right at every depth
+    from: `_repo_reading` asks git that, and git is right at every depth
     (ACC-DATA-009, amended 2026-08-26). A correct `path` used to fail to rescue
     a relay below the repository root, and was warned about into the bargain;
     an untrusted string cannot redirect a read it no longer bounds.
@@ -1369,7 +1554,19 @@ def _project_labels(container, repo):
     return labels
 
 
-def _git(relay_dir, *args, stdin=None):
+def _deadline():
+    """A fresh git budget, as an absolute `time.monotonic()` instant.
+
+    MONOTONIC, not `time.time()`: this is a duration bound and a wall clock can
+    step backwards under NTP, which would hand a build an unbounded budget at
+    exactly the moment the machine is least well. It is also not the model's
+    clock - `build()`'s `now` is what every field in the model is measured
+    against, and nothing derived from this deadline ever reaches the model.
+    """
+    return time.monotonic() + GIT_BUDGET
+
+
+def _git(relay_dir, *args, stdin=None, deadline=None):
     """`git -C <relay_dir> <args>` stdout, or None when git could not answer.
 
     Never raises: git may be absent, the directory may not be a repository, the
@@ -1377,33 +1574,47 @@ def _git(relay_dir, *args, stdin=None):
     giving up on. Any of those degrades to no commit entries, and the log is
     still worth having from the batons alone.
 
+    RULE: `deadline` is the instant ALL of this build's git work must be done
+    by (`GIT_BUDGET`), shared by every read in one `build()` rather than
+    renewed per read. What is left of it is this process's timeout, and a read
+    that starts with nothing left is not spawned: a budget that each caller may
+    spend in full is four times its own size in series, which is how `build()`
+    came to take 10.7 s inside a 2 s repaint loop. `None` means no build is
+    sharing one - a direct caller, a test - and takes a fresh budget of its
+    own, so the per-process ceiling and the per-build budget are one number
+    and cannot drift apart.
+
     RULE: the caller's git environment is dropped. `GIT_DIR` points git at a
     repository of the environment's choosing whatever `-C` says, and
     `GIT_WORK_TREE`, `GIT_COMMON_DIR`, `GIT_OBJECT_DIRECTORY` and the
     `GIT_CONFIG_*` overrides each redirect a read in their own way - so a
     dashboard opened from a shell that exports one would report a foreign
-    repository's commits as this relay's. That is the defect `_repo_dir`
+    repository's commits as this relay's. That is the defect `_repo_reading`
     bounds away by asking git, walked back in through the environment - and
-    `_repo_dir` asks git through this function, so the scrub bounds its own
+    `_repo_reading` asks git through this function, so the scrub bounds its own
     answer too.
     Every `GIT_*` name goes, rather than the handful that redirect today.
     """
     # A list argv, never a shell: `relay_dir` is a path from the caller and is
     # passed as one argument, not interpolated into a command string.
+    left = GIT_BUDGET if deadline is None else deadline - time.monotonic()
+    if left <= 0:
+        return None
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     try:
         out = subprocess.run(["git", "-C", str(relay_dir), *args],
                              input=stdin, capture_output=True, text=True,
-                             timeout=GIT_TIMEOUT, env=env)
+                             timeout=left, env=env)
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
     return out.stdout if out.returncode == 0 else None
 
 
-def _resolve_shas(repo, shas):
+def _resolve_shas(repo, shas, deadline):
     """Which of `shas` name a commit in the relay's own repository.
 
-    `repo` is the work tree git reported for the relay (`_repo_dir`), or None.
+    `repo` is the work tree git reported for the relay (`_repo_reading`), or
+    None.
 
     Returns None when the question cannot be asked at all - the relay is not
     in a repository of its own, or git could not answer - so a caller can tell
@@ -1412,7 +1623,8 @@ def _resolve_shas(repo, shas):
 
     ONE git process for every sha in the relay, not one per sha: `cat-file
     --batch-check` takes the whole list on stdin and answers in input order,
-    inside the same `GIT_TIMEOUT` as every other read here. A short sha that is
+    inside the same shared `GIT_BUDGET` as every other read here. A short sha
+    that is
     ambiguous in this repository answers `ambiguous` and is treated as
     unresolved, which is the honest reading of it.
     """
@@ -1420,7 +1632,7 @@ def _resolve_shas(repo, shas):
     if not order or repo is None:
         return None
     out = _git(repo, "cat-file", "--batch-check=%(objectname) %(objecttype)",
-               stdin="\n".join(order) + "\n")
+               stdin="\n".join(order) + "\n", deadline=deadline)
     if out is None:
         return None
     lines = out.splitlines()
@@ -1430,7 +1642,7 @@ def _resolve_shas(repo, shas):
             if line.rsplit(" ", 1)[-1:] == ["commit"]}
 
 
-def _settle_commits(repo, batons, warnings):
+def _settle_commits(reading, batons, warnings, deadline):
     """Settle every baton's claimed commit against the relay's own repository.
 
     A leg is credited with a commit only when its baton claims the sha as its
@@ -1449,6 +1661,16 @@ def _settle_commits(repo, batons, warnings):
       stands on the runner row unconfirmed while the log attributes nothing, so
       the two panes read as though the repository had denied the commit. A
       supervisor is told the difference.
+
+      AND IS TOLD WHICH ONE HAPPENED (ACC-DATA-009, 2026-08-27). `reading.why`
+      is the clause, and it comes from the ask itself rather than from a
+      guess made here: this branch used to read `if repo is None` and print
+      "this relay is not inside a repository of its own", which is a FALSE
+      statement about a relay at `<repo>/.relay` whose git is absent, slow,
+      pointed elsewhere by `core.worktree`, or holding a `.git` git will not
+      accept. A supervisor acting on that line goes looking for a repository
+      that is already there. A warning that states a falsehood is worse than
+      no warning at all.
     * THE REPOSITORY DENIED IT - the relay is in a repository and that
       repository does not have the sha. The row and the log both lose the
       commit, which is correct and was invisible: a `.relay` that is its own
@@ -1456,11 +1678,13 @@ def _settle_commits(repo, batons, warnings):
       against the surrounding repository vanished without a word.
     """
     claims = {sha for b in batons.values() for sha in b["claims"]}
-    resolved = _resolve_shas(repo, claims)
+    resolved = _resolve_shas(reading.dir, claims, deadline)
     if resolved is None:
         if claims:
-            why = ("this relay is not inside a repository of its own"
-                   if repo is None else "its repository could not be asked")
+            # `reading.why` when there was no repository to ask, and the ask's
+            # own failure when there was one: git answered `rev-parse` and then
+            # did not answer `cat-file`, which is neither of the readings above.
+            why = reading.why or "its repository could not be asked"
             warnings.append(
                 "the commit claims in this relay's batons cannot be confirmed "
                 f"({why}); the runner rows and the log's landings carry them "
@@ -1507,7 +1731,7 @@ def _parse_commits(out):
     return commits
 
 
-def _git_log(repo):
+def _git_log(repo, deadline):
     """[(epoch, short sha, subject)] for HEAD, newest first.
 
     ONE BOUND, AND IT IS A DEPTH (ACC-DATA-009, corrected 2026-08-26):
@@ -1518,10 +1742,10 @@ def _git_log(repo):
     """
     return _parse_commits(_git(
         repo, "log", "--no-color", f"--max-count={LOG_MAX_COMMITS}",
-        "--format=%ct%x1f%h%x1f%s", "HEAD"))
+        "--format=%ct%x1f%h%x1f%s", "HEAD", deadline=deadline))
 
 
-def _claimed_commits(repo, shas):
+def _claimed_commits(repo, shas, deadline):
     """The commits `shas` names, whatever the walk did or did not reach.
 
     THE RULE ACC-DATA-009 WAS SIMPLIFIED TO (2026-08-26): a commit a baton
@@ -1548,7 +1772,7 @@ def _claimed_commits(repo, shas):
         return []
     return _parse_commits(_git(
         repo, "log", "--no-color", "--no-walk",
-        "--format=%ct%x1f%h%x1f%s", *shas, "--"))
+        "--format=%ct%x1f%h%x1f%s", *shas, "--", deadline=deadline))
 
 
 def _mtime(path):
@@ -1636,10 +1860,11 @@ def _is_judged(check):
             or bool(check["judgedBy"]))
 
 
-def _relay_commits(repo, claimed):
+def _relay_commits(repo, claimed, deadline):
     """Every commit the log may DRAW ON, newest first (ACC-DATA-009).
 
-    `repo` is the work tree git reported for the relay (`_repo_dir`), or None
+    `repo` is the work tree git reported for the relay (`_repo_reading`), or
+    None
     where the relay owns no repository and there is nothing to draw on.
 
     This function makes both populations reachable; `_commit_entries` decides
@@ -1663,10 +1888,10 @@ def _relay_commits(repo, claimed):
     """
     if repo is None:
         return []
-    commits = _git_log(repo)
+    commits = _git_log(repo, deadline)
     walked = {sha for _, sha, _ in commits}
     return commits + _claimed_commits(
-        repo, [sha for sha in sorted(claimed) if sha not in walked])
+        repo, [sha for sha in sorted(claimed) if sha not in walked], deadline)
 
 
 def _floored(commits, floor):
@@ -1681,7 +1906,7 @@ def _floored(commits, floor):
     return [c for c in commits if c[0] >= floor]
 
 
-def _commit_entries(repo, batons, floor, now):
+def _commit_entries(repo, batons, floor, now, deadline):
     """Commit entries for the log: the run's own commits first (ACC-DATA-009).
 
     `floor` is the relay's earliest record, from `_record_floor`, read off
@@ -1777,7 +2002,7 @@ def _commit_entries(repo, batons, floor, now):
     # answers "all of them" where there is no floor - the carve-out needs no
     # branch of its own, and a `has_records` flag that gave it one was
     # redundant on every input (see `_record_floor`).
-    commits = _relay_commits(repo, by_commit)
+    commits = _relay_commits(repo, by_commit, deadline)
     attributed = [c for c in commits if by_commit.get(c[1])]
     rest = _floored([c for c in commits if not by_commit.get(c[1])], floor)
     # NEWEST FIRST, ON A TOTAL KEY. `git log` already yields newest first, so
@@ -1794,7 +2019,7 @@ def _commit_entries(repo, batons, floor, now):
     ]
 
 
-def _derived_log(relay_dir, repo, runners, batons, checks, now):
+def _derived_log(relay_dir, repo, runners, batons, checks, now, deadline):
     """The story of the run, from the three records that carry a real order.
 
     1. A baton's mtime is when that leg landed, and its STATUS says how. Every
@@ -1827,11 +2052,22 @@ def _derived_log(relay_dir, repo, runners, batons, checks, now):
     # previous runner's landing and is already an entry above; this one is the
     # only leg in flight, and without it the log falls silent exactly when a
     # supervisor is watching.
+    #
+    # RULE: THE LOG NAMES A LEG ONLY WHERE THE LEG HAS A NAME (ACC-DATA-005).
+    # A runner row carries `leg: None` for a leg whose `id` `legs.json` could
+    # not supply - the model refuses to invent one, and `""` is in its own
+    # `PLACEHOLDERS` - and interpolating that row into the message printed the
+    # literal string "None started", which is a placeholder rendered as though
+    # it were a value, in the one entry a supervisor watches a live relay
+    # through. The entry is still drawn, because a leg IS in flight and
+    # dropping it would be the other half of the same lie; it says what is
+    # true, which is that the relay is running a leg it cannot name.
     for row in runners:
         if row["status"] == "running" and row["start"] is not None:
             entries.append(_log_entry(
                 row["start"], False, "start", "note",
-                f"{row['leg']} started", now, leg=row["leg"]))
+                f"{row['leg']} started" if row["leg"]
+                else "an unidentified leg started", now, leg=row["leg"]))
 
     # 3. check transitions.
     anchor = {leg: baton["mtime"] for leg, baton in batons.items()}
@@ -1869,7 +2105,7 @@ def _derived_log(relay_dir, repo, runners, batons, checks, now):
     # from `events`. `events` is what this function has so far DERIVED, and a
     # relay one leg in derives nothing while holding two records.
     floor = _record_floor(relay_dir, runners, batons, checks)
-    commits = _commit_entries(repo, batons, floor, now)
+    commits = _commit_entries(repo, batons, floor, now, deadline)
 
     # The outer entry bound, applied once and last. It decides how much of the
     # log fits in a pane, and it must not decide which commits belong: that is
@@ -1920,7 +2156,8 @@ def _derived_log(relay_dir, repo, runners, batons, checks, now):
     return entries
 
 
-def _log(extras, relay_dir, repo, runners, batons, checks, now, warnings):
+def _log(extras, relay_dir, repo, runners, batons, checks, now, warnings,
+         deadline):
     """The Progress Log, and where it came from.
 
     ACC-DATA-006: a coach who writes `dashboard.json.log` is quoted verbatim,
@@ -1967,7 +2204,8 @@ def _log(extras, relay_dir, repo, runners, batons, checks, now, warnings):
             })
         return entries, "dashboard"
 
-    entries = _derived_log(relay_dir, repo, runners, batons, checks, now)
+    entries = _derived_log(relay_dir, repo, runners, batons, checks, now,
+                           deadline)
     return (entries, "derived") if entries else ([], None)
 
 
@@ -2003,6 +2241,13 @@ def build(relay_dir, now=_NO_CLOCK):
     """
     if now is _NO_CLOCK:
         now = time.time()
+    # ONE DEADLINE FOR THE WHOLE CALL'S GIT WORK, fixed here and shared by
+    # every git read below (`GIT_BUDGET`). ACC-DATA-001's "never blocks" is a
+    # bound on this call, not only on the file shapes it refuses, and four git
+    # reads each free to spend a full timeout is not a bound the caller can
+    # hold. It is not a clock the model reads: nothing derived from it reaches
+    # any field, so `now` is still the only thing determinism depends on.
+    deadline = _deadline()
     if relay_dir is None or (isinstance(relay_dir, str) and not relay_dir.strip()):
         raise RelayNotFound("no relay directory given")
     try:
@@ -2026,7 +2271,7 @@ def build(relay_dir, now=_NO_CLOCK):
                 "it is being ignored")
 
     stages, leg_rows = _leg_rows(legsfile, warnings)
-    stage_names = {s["id"]: s["name"] for s in stages}
+    stage_names = _stage_names(stages)
 
     leg_counts = {"total": len(leg_rows)}
     leg_counts.update({s: sum(1 for row in leg_rows if row["status"] == s)
@@ -2070,14 +2315,15 @@ def build(relay_dir, now=_NO_CLOCK):
     # settled against that repository before either the runner rows or the log
     # quotes it. Two panes naming different commits for one leg is the class of
     # defect this module exists to remove.
-    repo = _repo_dir(relay_dir)
+    reading = _repo_reading(relay_dir, deadline)
+    repo = reading.dir
     written = _text_or_warn(extras.get("path"), "dashboard.json: `path`",
                             warnings)
     project = _project_dir(written, relay_dir, warnings, repo)
     path = written if written is not None else project
 
     batons = _read_batons(relay_dir, warnings)
-    _settle_commits(repo, batons, warnings)
+    _settle_commits(reading, batons, warnings, deadline)
     runners, runner_counts, active_runner = _runner_rows(
         batons, leg_rows, active_leg, now, warnings)
 
@@ -2125,7 +2371,7 @@ def build(relay_dir, now=_NO_CLOCK):
         warnings.append("dashboard.json: `tokens` is not an object; ignored")
 
     log, log_source = _log(extras, relay_dir, repo, runners, batons, checks,
-                           now, warnings)
+                           now, warnings, deadline)
 
     return {
         "relay": {

@@ -40,6 +40,7 @@ from test_relay_model import (  # noqa: E402,F401  (fixtures are used by name)
     CORPUS_QUOTED,
     CORPUS_SILENT,
     HAS_GIT,
+    chmodded,
     corpus_relay,
     corpus_relay_denied,
     git_run as _git,
@@ -194,6 +195,114 @@ def test_the_running_leg_gets_a_start_entry(relay):
     # The handoff is inferred from the previous baton, not recorded for this leg.
     assert starts[0]["exact"] is False
     assert starts[0]["t"] == max(AGENT_SERVICE_BATON_MTIMES.values())
+
+
+# --------------------------------------------------------------------------
+# ACC-DATA-005 — THE LOG NEVER PRINTS A PLACEHOLDER AS THOUGH IT WERE A VALUE
+#
+# The start entry is the one entry a supervisor reads a LIVE relay through, and
+# it was built as `f"{row['leg']} started"`. A runner row carries `leg: None`
+# for a leg whose `id` `legs.json` could not supply - the model refuses to
+# invent one, and `""` is in its own `PLACEHOLDERS` - so the log printed the
+# literal string "None started".
+#
+# The whole-model placeholder sweeps could not see it: they test whether a
+# string IS a placeholder, and "None started" merely CONTAINS one. That is the
+# right rule for a quoted commit subject and the wrong one for a sentence the
+# model composed itself, so the sweep below is over composed sentences only.
+# --------------------------------------------------------------------------
+
+#: `None` as a word. `NoneType` is a type name the warnings legitimately quote
+#: and the boundary keeps it out; `None` on its own is always an interpolation
+#: that should never have been made.
+INTERPOLATED_NONE = re.compile(r"\bNone\b")
+
+
+@pytest.mark.parametrize("bad", [None, 7, True, 1.5, ["x"], {"k": 1}, "", "   ",
+                                 "none", "N/A", "--"],
+                         ids=repr)
+def test_a_running_leg_with_no_usable_id_is_named_honestly_not_as_None(
+        tmp_path, bad):
+    """The entry is still drawn - a leg IS in flight, and dropping it would be
+    the other half of the same lie - and it says what is true."""
+    relay_dir = tmp_path / f"nameless-{abs(hash(repr(bad)))}"
+    (relay_dir / "batons").mkdir(parents=True)
+    relay_dir.joinpath("legs.json").write_text(json.dumps(
+        {"relay": "nameless",
+         "legs": [{"id": "alpha", "status": "done"},
+                  {"id": bad, "status": "running"}]}))
+    _land(relay_dir, "alpha", NOW - 4000)
+
+    model = relay_model.build(relay_dir, now=NOW)
+    starts = entries_of(model, "start")
+
+    assert len(starts) == 1, starts
+    assert starts[0]["m"] == "an unidentified leg started"
+    # ...and the entry still carries no invented id in its own field either.
+    assert starts[0]["leg"] is None
+    assert starts[0]["t"] == NOW - 4000
+
+
+def test_a_running_leg_that_does_have_an_id_is_still_named_by_it(tmp_path):
+    """The other side of the branch: the honest wording must not swallow the
+    ordinary case, which is every live relay this module reads."""
+    relay_dir = tmp_path / "named"
+    (relay_dir / "batons").mkdir(parents=True)
+    relay_dir.joinpath("legs.json").write_text(json.dumps(
+        {"relay": "named",
+         "legs": [{"id": "alpha", "status": "done"},
+                  {"id": "beta", "status": "running"}]}))
+    _land(relay_dir, "alpha", NOW - 4000)
+
+    starts = entries_of(relay_model.build(relay_dir, now=NOW), "start")
+    assert [e["m"] for e in starts] == ["beta started"]
+    assert [e["leg"] for e in starts] == ["beta"]
+
+
+def _composed(model):
+    """Every sentence the MODEL wrote, as opposed to quoted.
+
+    A commit entry carries a subject the model quoted verbatim from git and a
+    coach-written log (`logSource == "dashboard"`) is the coach's own prose;
+    neither is the model speaking, and ACC-DATA-007 was amended in as many
+    words to say so. Every other log message, and every warning, is composed
+    here.
+    """
+    derived = model["log"] if model["logSource"] == "derived" else []
+    return ([e["m"] for e in derived if e["kind"] != "commit"]
+            + list(model["warnings"]))
+
+
+@pytest.mark.parametrize("name", ALL_FIXTURES)
+def test_no_sentence_the_model_composes_interpolates_a_None(name, relay):
+    for said in _composed(relay_model.build(relay(name), now=NOW)):
+        assert not INTERPOLATED_NONE.search(said), (name, said)
+
+
+@pytest.mark.parametrize("bad", [None, 7, True, 1.5, ["x"], {"k": 1}, "", "   "],
+                         ids=repr)
+def test_no_composed_sentence_interpolates_a_None_on_a_malformed_relay(
+        tmp_path, bad):
+    """The same rule where the Nones come from: every field the log and the
+    warnings name a leg, a stage or a check by, made unusable at once."""
+    relay_dir = tmp_path / f"fuzz-{abs(hash(repr(bad)))}"
+    (relay_dir / "batons").mkdir(parents=True)
+    relay_dir.joinpath("legs.json").write_text(json.dumps(
+        {"relay": bad,
+         "stages": [{"id": bad, "name": bad, "legs": [bad]},
+                    {"id": bad, "name": bad, "legs": [bad, bad]}],
+         "legs": [{"id": bad, "stage": bad, "status": "running"},
+                  {"id": "alpha", "stage": bad, "status": "done"}]}))
+    relay_dir.joinpath("state.json").write_text(json.dumps(
+        {"currentLeg": bad, "currentStage": bad,
+         "checks": {"ACC-X-001": {"status": bad, "claimedBy": "alpha",
+                                  "round": 3, "fixLeg": bad, "stage": bad}}}))
+    _land(relay_dir, "alpha", NOW - 4000)
+
+    model = relay_model.build(relay_dir, now=NOW)
+    assert model["log"], "the fixture has to derive a log to be a test of one"
+    for said in _composed(model):
+        assert not INTERPOLATED_NONE.search(said), (bad, said)
 
 
 def test_check_transitions_are_logged_against_the_leg_that_claimed_them(relay):
@@ -434,13 +543,15 @@ def test_a_relay_inside_a_repository_it_does_not_own_finds_no_repository(tmp_pat
     standalone.mkdir()
     # Git really does answer for it; the shape is what refuses the answer.
     assert _git(standalone, "rev-parse", "--show-toplevel").stdout.strip() == top
-    assert relay_model._repo_dir(standalone) is None
+    assert relay_model._repo_reading(standalone) == \
+        (None, relay_model.REPO_NONE)
 
     # A `.relay` beside the repository root, and a `.relay` two directories
     # below it. Both are live relays and git is right about both.
     for relay_dir in (host / ".relay", host / "services" / "svc" / ".relay"):
         relay_dir.mkdir()
-        assert relay_model._repo_dir(relay_dir) == host.resolve(), relay_dir
+        assert relay_model._repo_reading(relay_dir) == \
+            (host.resolve(), None), relay_dir
 
 
 @pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
@@ -464,7 +575,11 @@ def test_git_failing_to_answer_is_not_an_answer(tmp_path, monkeypatch):
     assert relay_model._has_git(project) is True        # the question is asked
     asked = _git_or_none(project, "rev-parse", "--show-toplevel")
     assert asked is None, asked                         # ...and git says nothing
-    assert relay_model._repo_dir(relay_dir) is None
+    # ...and the model says GIT did not answer, which is what happened. It is
+    # not "this relay is not inside a repository of its own": the relay is
+    # `<project>/.relay` and a `.git` is sitting right beside it.
+    assert relay_model._repo_reading(relay_dir) == \
+        (None, relay_model.REPO_SILENT)
 
 
 @pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
@@ -479,7 +594,8 @@ def test_a_relay_reached_through_a_symlink_still_finds_its_repository(tmp_path):
     alias.symlink_to(tmp_path / "real", target_is_directory=True)
     assert (alias / ".relay").is_dir()
 
-    assert relay_model._repo_dir(alias / ".relay") == (tmp_path / "real").resolve()
+    assert relay_model._repo_reading(alias / ".relay").dir == \
+        (tmp_path / "real").resolve()
     model = relay_model.build(alias / ".relay", now=NOW)
     entry = commit_named(model, "alpha: the first leg's own work")
     assert entry is not None, [e["m"] for e in entries_of(model, "commit")]
@@ -505,7 +621,7 @@ def test_a_relay_directory_that_is_itself_a_repository_root_reads_it(tmp_path):
          when=NOW - 9000)
     _land(relay_dir, "alpha", NOW - 5000, _short_sha(relay_dir))
 
-    assert relay_model._repo_dir(relay_dir) == relay_dir.resolve()
+    assert relay_model._repo_reading(relay_dir).dir == relay_dir.resolve()
     model = relay_model.build(relay_dir, now=NOW)
     entry = commit_named(model, "alpha: the relay's own work")
     assert entry is not None, [e["m"] for e in entries_of(model, "commit")]
@@ -545,13 +661,385 @@ def test_a_git_that_is_not_a_repository_does_not_inherit_the_host(tmp_path):
     assert _git(relay_dir, "rev-parse", "--show-toplevel").stdout.strip() == \
         str(host.resolve())
     # ...and the answer is refused, because a relay that is its own project
-    # owns the repository ROOTED AT IT and no other.
-    assert relay_model._repo_dir(relay_dir) is None
+    # owns the repository ROOTED AT IT and no other - said in those terms, and
+    # naming the work tree git DID report, because "no repository of its own"
+    # would leave a supervisor hunting for the `.git` they are looking at.
+    reading = relay_model._repo_reading(relay_dir)
+    assert reading.dir is None
+    assert reading.why == relay_model.REPO_ELSEWHERE.format(top=host.resolve())
 
     model = relay_model.build(relay_dir, now=NOW)
     assert entries_of(model, "commit") == [], \
         [e["m"] for e in entries_of(model, "commit")]
     assert not [e for e in model["log"] if "host: not the relay's work" in e["m"]]
+
+
+# --------------------------------------------------------------------------
+# ACC-DATA-001 — "NEVER BLOCKS" BOUNDS THE WHOLE CALL, NOT ONLY FILE SHAPES
+#
+# Added 2026-08-27. `GIT_TIMEOUT = 3.0` was a ceiling on ONE git process and
+# every read in a build carried its own copy of it — `rev-parse` for the work
+# tree, `cat-file` for the claims, `log` for the walk, `log --no-walk` for the
+# claims the walk missed. Four ceilings in series is not a bound a caller can
+# hold: a judge measured `build()` at 10.7 s, five times the 2 s repaint budget
+# the check itself cites, while every malformed FILE shape was refused in
+# 0.3 ms. "A budget the caller cannot rely on is not a budget."
+#
+# NO TEST DROVE `_git` UNDER LATENCY, WHICH IS WHY THIS HID. The only bound
+# test asserted the argument passed to `subprocess.run` and never let a clock
+# run, so four sequential three-second timeouts read exactly like one. These
+# tests spend real wall-clock time on purpose; it is the only thing that can
+# tell a shared deadline from four private ones.
+# --------------------------------------------------------------------------
+
+@pytest.fixture
+def four_read_relay(tmp_path):
+    """A relay that makes `build()` do ALL FOUR of its git reads.
+
+    The fourth only happens when a baton claims a commit the walk did not
+    reach, so one commit is landed on a branch HEAD cannot see. Without it a
+    dropped deadline on the `--no-walk` read would never be exercised.
+    """
+    project = tmp_path / "proj"
+    relay_dir = project / ".relay"
+    (relay_dir / "batons").mkdir(parents=True)
+    _git(project, "init", "-q", "-b", "main")
+    _git(project, "commit", "-q", "--allow-empty", "-m", "alpha: on the branch",
+         when=NOW - 5000)
+    on_head = _short_sha(project)
+    _git(project, "checkout", "-q", "-b", "sideline")
+    _git(project, "commit", "-q", "--allow-empty", "-m", "beta: off the branch",
+         when=NOW - 4000)
+    off_head = _short_sha(project)
+    _git(project, "checkout", "-q", "main")
+    assert off_head not in _git(project, "log", "--format=%h",
+                                "HEAD").stdout.split()
+
+    (relay_dir / "legs.json").write_text(json.dumps(
+        {"relay": "budget",
+         "legs": [{"id": "alpha", "status": "done"},
+                  {"id": "beta", "status": "done"}]}))
+    _land(relay_dir, "alpha", NOW - 4900, on_head)
+    _land(relay_dir, "beta", NOW - 3900, off_head)
+    return relay_dir
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_build_spends_one_deadline_across_every_git_read(
+        four_read_relay, monkeypatch):
+    """THE PASS-THROUGH GUARD. Every read is capped at what is LEFT of the
+    build's budget, so the timeouts fall as the build spends it. A read handed
+    no deadline takes a whole fresh budget instead, which shows up here as a
+    timeout that climbs back to `GIT_BUDGET`."""
+    real = relay_model.subprocess.run
+    seen = []
+
+    def watched(argv, **kwargs):
+        seen.append(kwargs.get("timeout"))
+        return _slow_git(0.05, real)(argv, **kwargs)
+
+    monkeypatch.setattr(relay_model.subprocess, "run", watched)
+    model = relay_model.build(four_read_relay, now=NOW)
+    # Snapshotted, and the patch dropped, before anything else spawns git: the
+    # helpers below run under it otherwise, and a test that measured its own
+    # `git` calls would be measuring itself.
+    timeouts = list(seen)
+    monkeypatch.undo()
+
+    # All four reads really happened, and all four really answered: this is
+    # the healthy path, bounded rather than degraded.
+    assert len(timeouts) == 4, timeouts
+    assert {row["leg"]: row["commit"] for row in model["runners"]} == \
+        {"alpha": _short_sha(four_read_relay.parent),
+         "beta": [e["commit"] for e in entries_of(model, "commit")
+                  if "beta" in e["m"]][0]}
+    assert len(entries_of(model, "commit")) == 2
+
+    # STRICTLY under the budget, and that is the point of the first read
+    # rather than a rounding detail: the clock starts when the BUILD starts,
+    # so the file work above it has already been charged. A first read handed
+    # no deadline is handed a whole fresh budget instead, and reads back as
+    # exactly `GIT_BUDGET`.
+    assert timeouts[0] < relay_model.GIT_BUDGET, timeouts
+    # ONE budget, spent: strictly falling, and never renewed.
+    assert timeouts == sorted(timeouts, reverse=True), timeouts
+    assert all(t < relay_model.GIT_BUDGET for t in timeouts[1:]), timeouts
+    # ...and it really is being spent - each read is at least the previous
+    # read's latency cheaper than the one before it.
+    assert all(a - b >= 0.04 for a, b in zip(timeouts, timeouts[1:])), timeouts
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_build_returns_inside_its_budget_however_slow_git_is(
+        four_read_relay, monkeypatch):
+    """THE WHOLE-CALL BOUND, measured on a clock. Four reads at 0.5 s each is
+    2.0 s of git; one shared 0.8 s budget is 0.8 s of git, and the difference
+    is what "never blocks" means for a call inside a 2 s repaint loop."""
+    monkeypatch.setattr(relay_model, "GIT_BUDGET", 0.8)
+    monkeypatch.setattr(relay_model.subprocess, "run",
+                        _slow_git(0.5, relay_model.subprocess.run))
+
+    started = time.monotonic()
+    model = relay_model.build(four_read_relay, now=NOW)
+    spent = time.monotonic() - started
+
+    # Four private 0.5 s reads would be 2.0 s. The slack is for a machine that
+    # has just woken up, and is still well under the unbounded figure.
+    assert spent < 1.3, spent
+    # ...and it degraded rather than raised: the batons are still a log.
+    assert isinstance(model, dict)
+    assert len(model["log"]) >= 2
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_git_that_never_answers_costs_the_budget_and_not_a_read_apiece(
+        four_read_relay, monkeypatch):
+    """The degenerate end: git answers nothing at all. One budget is spent on
+    the first read and the rest are not spawned, because a read that starts
+    with nothing left cannot be within a bound that is already gone."""
+    monkeypatch.setattr(relay_model, "GIT_BUDGET", 0.4)
+    spawned = []
+
+    def hanging(argv, **kwargs):
+        spawned.append(argv)
+        return _sleeping_git(30.0)(argv, **kwargs)
+
+    monkeypatch.setattr(relay_model.subprocess, "run", hanging)
+
+    started = time.monotonic()
+    model = relay_model.build(four_read_relay, now=NOW)
+    spent = time.monotonic() - started
+
+    assert spent < 1.0, spent
+    assert len(spawned) == 1, spawned
+    # And it says what happened, in the words that are true of it.
+    assert relay_model.REPO_SILENT in " | ".join(model["warnings"])
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_the_budget_is_spent_by_the_reads_and_not_by_the_wall_clock(
+        four_read_relay, monkeypatch):
+    """A wall clock can step backwards under NTP; a duration bound that did so
+    would hand a build an unbounded budget at the moment the machine is least
+    well. `time.time` is moved backwards by an hour under the build and the
+    bound is unmoved, because the deadline is monotonic."""
+    monkeypatch.setattr(relay_model, "GIT_BUDGET", 0.4)
+    monkeypatch.setattr(relay_model.time, "time", lambda: NOW - 3600)
+    monkeypatch.setattr(relay_model.subprocess, "run", _sleeping_git(30.0))
+
+    started = time.monotonic()
+    assert isinstance(relay_model.build(four_read_relay), dict)
+    assert time.monotonic() - started < 1.0
+
+
+# --------------------------------------------------------------------------
+# ACC-DATA-009 — THE DIAGNOSIS IS TRUE, OR IT IS NOT PRINTED
+#
+# `_repo_dir` collapsed "no repository" and "git could not answer" into one
+# `None`, so a relay sitting at `<repo>/.relay` with a slow, missing or
+# misconfigured git reported "this relay is not inside a repository of its
+# own" — a false statement about a repository that is right there, and one a
+# supervisor can only act on by hunting for something they already have. A
+# warning that states a falsehood is worse than no warning at all: the gap is
+# then a trap rather than a gap, which is the shape this check keeps finding.
+#
+# Four readings, four sentences, and each one is provoked here by the thing it
+# names rather than asserted about a mock.
+# --------------------------------------------------------------------------
+
+def _claiming_relay(relay_dir, sha="deadbee"):
+    """A relay whose one baton claims a commit, so `_settle_commits` has a
+    claim to fail to confirm and therefore a diagnosis to print."""
+    (relay_dir / "batons").mkdir(parents=True, exist_ok=True)
+    (relay_dir / "legs.json").write_text(json.dumps(
+        {"relay": "diagnosis",
+         "legs": [{"id": "alpha", "status": "done"}]}))
+    _land(relay_dir, "alpha", NOW - 4000, sha)
+    return relay_dir
+
+
+def _diagnosis(model):
+    said = [w for w in model["warnings"] if "cannot be confirmed" in w]
+    assert len(said) == 1, model["warnings"]
+    return said[0]
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_an_absent_git_is_reported_as_an_absent_git(tmp_path, monkeypatch):
+    """THE FALSE LINE, PROVOKED. The relay is `<repo>/.relay`, the repository
+    is real and has the commit, and only `git` itself is out of reach."""
+    project = tmp_path / "proj"
+    relay_dir = project / ".relay"
+    relay_dir.mkdir(parents=True)
+    _git(project, "init", "-q", "-b", "main")
+    _git(project, "commit", "-q", "--allow-empty", "-m", "alpha: the work",
+         when=NOW - 4000)
+    _claiming_relay(relay_dir, _short_sha(project))
+
+    empty = tmp_path / "no-tools"
+    empty.mkdir()
+    monkeypatch.setenv("PATH", str(empty))
+
+    reading = relay_model._repo_reading(relay_dir)
+    assert reading == (None, relay_model.REPO_SILENT)
+    said = _diagnosis(relay_model.build(relay_dir, now=NOW))
+    assert relay_model.REPO_SILENT in said
+    # ...and NOT the sentence that is false about this relay.
+    assert relay_model.REPO_NONE not in said
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_git_too_slow_to_wait_for_is_reported_as_a_git_that_did_not_answer(
+        tmp_path, monkeypatch):
+    """A git that never returns inside the budget is the same fact as a git
+    that is not installed, and it must read as that rather than as "there is
+    no repository here"."""
+    project = tmp_path / "proj"
+    relay_dir = project / ".relay"
+    relay_dir.mkdir(parents=True)
+    _git(project, "init", "-q", "-b", "main")
+    _claiming_relay(relay_dir)
+    monkeypatch.setattr(relay_model, "GIT_BUDGET", 0.2)
+    monkeypatch.setattr(relay_model.subprocess, "run", _sleeping_git(1.0))
+
+    assert relay_model._repo_reading(relay_dir) == (None, relay_model.REPO_SILENT)
+    assert relay_model.REPO_SILENT in _diagnosis(
+        relay_model.build(relay_dir, now=NOW))
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_work_tree_pointed_somewhere_else_is_reported_as_pointing_there(
+        tmp_path):
+    """`core.worktree` is a supported git setting and it moves the work tree
+    git reports. The relay is still inside a repository; the repository is
+    simply not answering about the place the relay sits."""
+    project = tmp_path / "proj"
+    relay_dir = project / ".relay"
+    elsewhere = tmp_path / "elsewhere"
+    relay_dir.mkdir(parents=True)
+    elsewhere.mkdir()
+    _git(project, "init", "-q", "-b", "main")
+    _claiming_relay(relay_dir)
+    _git(project, "config", "core.worktree", str(elsewhere))
+
+    reading = relay_model._repo_reading(relay_dir)
+    assert reading.dir is None
+    assert reading.why == relay_model.REPO_ELSEWHERE.format(
+        top=elsewhere.resolve())
+    said = _diagnosis(relay_model.build(relay_dir, now=NOW))
+    assert str(elsewhere.resolve()) in said
+    assert relay_model.REPO_NONE not in said
+
+
+def test_a_path_the_os_refuses_to_resolve_is_not_a_relay_without_a_repository(
+        tmp_path, monkeypatch):
+    """The last way the ask can fail, at its own seam. `resolve()` refusing is
+    "nobody found out", exactly as a directory that would not be read is, and
+    it is not a statement about whether a repository is there."""
+    relay_dir = tmp_path / "standalone"
+    _claiming_relay(relay_dir)
+    real = relay_model.pathlib.Path.resolve
+
+    def refusing(self, *args, **kwargs):
+        if self == relay_dir:
+            raise OSError(40, "Too many levels of symbolic links")
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(relay_model.pathlib.Path, "resolve", refusing)
+    assert relay_model._repo_reading(relay_dir) == \
+        (None, relay_model.REPO_UNREADABLE)
+
+
+def test_a_relay_with_nowhere_to_look_is_the_only_one_told_it_has_no_repo(
+        tmp_path):
+    """The true reading, and the ONE the sentence belongs to. Every fixture
+    under `tests/fixtures/` is this shape."""
+    relay_dir = tmp_path / "standalone"
+    relay_dir.mkdir()
+    _claiming_relay(relay_dir)
+
+    assert relay_model._repo_reading(relay_dir) == (None, relay_model.REPO_NONE)
+    assert relay_model.REPO_NONE in _diagnosis(
+        relay_model.build(relay_dir, now=NOW))
+
+
+@pytest.mark.skipif(os.geteuid() == 0,
+                    reason="root ignores permission bits, so a chmod test "
+                           "would pass for the wrong reason")
+def test_a_relay_nobody_could_look_inside_is_not_told_it_has_no_repository(
+        tmp_path, chmodded):
+    """A refusal is not a no. Nothing found out whether this relay has a
+    repository, and saying it has none is a statement nobody checked."""
+    relay_dir = tmp_path / "standalone"
+    _claiming_relay(relay_dir)
+    chmodded(relay_dir, 0o600)
+
+    assert relay_model._repo_reading(relay_dir) == \
+        (None, relay_model.REPO_UNREADABLE)
+    # A directory nothing may read has no batons to claim anything either, so
+    # there is no claim to diagnose - but there is also no line saying this
+    # relay has no repository, which is the statement nobody checked.
+    model = relay_model.build(relay_dir, now=NOW)
+    assert relay_model.REPO_NONE not in " | ".join(model["warnings"])
+    assert isinstance(model, dict)
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_repository_that_answers_and_then_stops_is_a_third_thing_again(
+        tmp_path, monkeypatch):
+    """`rev-parse` answered and `cat-file` did not: there IS a repository, so
+    none of the four readings above applies and the model says so in its own
+    terms rather than borrowing one of them."""
+    project = tmp_path / "proj"
+    relay_dir = project / ".relay"
+    relay_dir.mkdir(parents=True)
+    _git(project, "init", "-q", "-b", "main")
+    _git(project, "commit", "-q", "--allow-empty", "-m", "alpha: the work",
+         when=NOW - 4000)
+    _claiming_relay(relay_dir, _short_sha(project))
+    real = relay_model._git
+
+    def deaf_to_cat_file(where, *args, **kwargs):
+        return None if args[:1] == ("cat-file",) else real(where, *args, **kwargs)
+
+    monkeypatch.setattr(relay_model, "_git", deaf_to_cat_file)
+    said = _diagnosis(relay_model.build(relay_dir, now=NOW))
+    assert "its repository could not be asked" in said
+    for reason in (relay_model.REPO_NONE, relay_model.REPO_SILENT,
+                   relay_model.REPO_UNREADABLE):
+        assert reason not in said
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_no_relay_that_has_a_repository_is_told_anything_about_not_having_one(
+        relay, tmp_path):
+    """The sweep that makes the four readings a rule rather than five cases:
+    over every fixture, the live relay, and a real repository relay, a
+    diagnosis is printed only where the reading it names actually holds."""
+    project = tmp_path / "proj"
+    live = project / ".relay"
+    live.mkdir(parents=True)
+    _git(project, "init", "-q", "-b", "main")
+    _git(project, "commit", "-q", "--allow-empty", "-m", "alpha: the work",
+         when=NOW - 4000)
+    _claiming_relay(live, _short_sha(project))
+
+    targets = [live] + [relay(name) for name in ALL_FIXTURES]
+    for target in targets:
+        model = relay_model.build(target, now=NOW)
+        reading = relay_model._repo_reading(target)
+        said = " | ".join(model["warnings"])
+        if reading.dir is not None:
+            # It HAS one, so no reading may claim otherwise.
+            for reason in (relay_model.REPO_NONE, relay_model.REPO_SILENT,
+                           relay_model.REPO_UNREADABLE):
+                assert reason not in said, (target.name, reason)
+        else:
+            # ...and where one is printed, it is the one the ask returned.
+            printed = [r for r in (relay_model.REPO_NONE,
+                                   relay_model.REPO_SILENT,
+                                   relay_model.REPO_UNREADABLE) if r in said]
+            assert printed in ([], [reading.why]), (target.name, printed)
 
 
 def test_the_fixture_in_place_is_asked_no_git_question_at_all():
@@ -1026,6 +1514,40 @@ def commit_named(model, needle):
     found = [e for e in entries_of(model, "commit") if needle in e["m"]]
     assert len(found) <= 1, [e["m"] for e in found]
     return found[0] if found else None
+
+
+def _sleeping_git(seconds):
+    """A `subprocess.run` that behaves like a git too slow to wait for.
+
+    It honours the `timeout` it is given - which is the whole point: the bound
+    under test is the one the CALLER passes, and a fake that ignored it would
+    make every latency assertion pass for the wrong reason.
+    """
+    def run(argv, **kwargs):
+        limit = kwargs.get("timeout")
+        time.sleep(seconds if limit is None else min(seconds, limit))
+        if limit is not None and seconds >= limit:
+            raise subprocess.TimeoutExpired(argv, limit)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+    return run
+
+
+def _slow_git(latency, real):
+    """A `subprocess.run` that costs `latency` seconds and then answers.
+
+    It HONOURS the timeout it is handed, which is what makes it a test of the
+    bound rather than of a mock: a read whose remaining budget is smaller than
+    the latency burns what is left and raises, exactly as a real `git` too slow
+    for its deadline does.
+    """
+    def run(argv, **kwargs):
+        limit = kwargs.get("timeout")
+        if limit is not None and latency >= limit:
+            time.sleep(limit)
+            raise subprocess.TimeoutExpired(argv, limit)
+        time.sleep(latency)
+        return real(argv, **kwargs)
+    return run
 
 
 def _git_or_none(cwd, *args):
@@ -1523,7 +2045,7 @@ def test_a_short_answer_from_git_is_not_an_answer(tmp_path, monkeypatch):
     monkeypatch.setattr(relay_model, "_git", truncated)
     # The seam itself: two shas asked about, one line back, no answer.
     assert relay_model._resolve_shas(
-        relay_dir.parent, {"aaaaaaa", "bbbbbbb"}) is None
+        relay_dir.parent, {"aaaaaaa", "bbbbbbb"}, None) is None
 
     model = relay_model.build(relay_dir, now=NOW)
     said = " | ".join(model["warnings"])
@@ -1916,7 +2438,7 @@ def test_a_commit_the_trunk_can_also_reach_is_still_in_the_walk(tmp_path):
         "late: on the branch the relay cut"]
 
     walked = [c[2] for c in relay_model._relay_commits(
-        relay_model._repo_dir(relay_dir), {})]
+        relay_model._repo_reading(relay_dir).dir, {}, None)]
     assert "while: on main while the relay ran" in walked, walked
 
     model = relay_model.build(relay_dir, now=NOW)
@@ -2722,21 +3244,21 @@ def test_the_window_is_applied_though_the_derivation_produced_no_entry(tmp_path)
     are forty commits in the walk and no derived entry to bound them with, and
     the answer is still none of them."""
     relay_dir = _one_leg_in(tmp_path / "proj")
-    repo = relay_model._repo_dir(relay_dir)
+    repo = relay_model._repo_reading(relay_dir).dir
     batons = relay_model._read_batons(relay_dir, [])
     runners = [{"leg": "alpha", "status": "running"}]
     floor = relay_model._record_floor(relay_dir, runners, batons, [])
 
     # The walk really does have forty commits to bound - otherwise the
     # assertion below would pass for the wrong reason.
-    commits = relay_model._relay_commits(repo, {})
+    commits = relay_model._relay_commits(repo, {}, None)
     assert len(commits) == 40
 
     assert floor is not None                        # a record...
     # No budget argument any more: what makes the answer empty is the WINDOW,
     # and there is no count left that could have supplied it (ACC-DATA-009,
     # rewritten 2026-08-27).
-    assert relay_model._commit_entries(repo, batons, floor, NOW) == []
+    assert relay_model._commit_entries(repo, batons, floor, NOW, None) == []
 
 
 @pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
@@ -2770,7 +3292,7 @@ def test_the_window_opens_when_legs_json_recorded_the_running_leg(tmp_path):
     # HEAD is `main` itself. The walk reaches the whole of it and the records
     # are the whole window for what nobody claims - which is the only bound
     # there is now that no ref narrows the walk.
-    assert [c[2] for c in relay_model._git_log(relay_dir)] == [
+    assert [c[2] for c in relay_model._git_log(relay_dir, None)] == [
         "alpha: the first leg's own work", "before: long before the relay"]
     assert len(relay_events(model)) == 2            # alpha landed, beta started
     assert commit_named(model, "alpha: the first leg's own work") is not None, \
@@ -2902,7 +3424,7 @@ def test_the_walk_stops_at_its_own_bound_and_keeps_the_newest(past_the_walk_boun
     """`_git_log` at its own seam: the cap is what it says it is, and the end
     of the branch it keeps is the newest end."""
     relay_dir, oldest, newest = past_the_walk_bound
-    walked = relay_model._git_log(relay_dir)
+    walked = relay_model._git_log(relay_dir, None)
     assert len(walked) == relay_model.LOG_MAX_COMMITS
     shas = [sha for _when, sha, _subject in walked]
     assert shas[0] == newest
@@ -3583,7 +4105,7 @@ def test_a_relay_directory_by_another_name_is_its_own_project_and_says_so(
     renamed = built.parent / "relaydir"
     built.rename(renamed)
 
-    assert relay_model._repo_dir(renamed) is None
+    assert relay_model._repo_reading(renamed).dir is None
     model = relay_model.build(renamed, now=NOW)
     # The repository it sits in is not its own, so none of its commits are the
     # run's work - not even the ones the batons claim.
@@ -3615,7 +4137,7 @@ def test_a_relay_that_is_its_own_repository_root_names_the_claims_it_lost(
     assert set(claimed) == {"alpha", "gamma"}, claimed
 
     _git(relay_dir, "init", "-q", "-b", "main")
-    assert relay_model._repo_dir(relay_dir) == relay_dir.resolve()
+    assert relay_model._repo_reading(relay_dir).dir == relay_dir.resolve()
 
     model = relay_model.build(relay_dir, now=NOW)
     assert [r["commit"] for r in model["runners"] if r["commit"]] == []
@@ -3683,12 +4205,12 @@ def test_the_walk_is_still_bounded_at_every_depth(tmp_path, depth):
     it stays out of the log wherever the relay sits - otherwise "ask git" would
     have traded a silent empty log for a silent full one."""
     relay_dir = _branch_point_relay(tmp_path / "proj", depth=depth)
-    repo = relay_model._repo_dir(relay_dir)
+    repo = relay_model._repo_reading(relay_dir).dir
     assert repo == (tmp_path / "proj").resolve()
     # The walk really reaches the repository at depth: `before:`, `alpha:` and
     # the unclaimed `nobody:`. gamma's is not reachable from HEAD and is not
     # the walk's to find.
-    assert [c[2] for c in relay_model._git_log(repo)] == [
+    assert [c[2] for c in relay_model._git_log(repo, None)] == [
         *reversed(BRANCH_POINT_UNCLAIMED),
         "alpha: the first leg's own work",
         BRANCH_POINT_EXCLUDED,
@@ -3710,7 +4232,7 @@ def test_the_rows_and_the_log_agree_where_no_repository_can_be_resolved(tmp_path
     orphan = tmp_path / "orphan" / "svc" / ".relay"
     orphan.parent.mkdir(parents=True)
     shutil.copytree(relay_dir, orphan)
-    assert relay_model._repo_dir(orphan) is None
+    assert relay_model._repo_reading(orphan).dir is None
 
     model = relay_model.build(orphan, now=NOW)
     assert entries_of(model, "commit") == [], \
@@ -3770,7 +4292,7 @@ def test_origin_head_naming_the_run_s_own_branch_is_no_longer_a_seam(tmp_path):
     _topology_clone(project, "main", "feat/the-run")
     assert _git(project, "symbolic-ref", "refs/remotes/origin/HEAD"
                 ).stdout.strip() == "refs/remotes/origin/feat/the-run"
-    assert [c[2] for c in relay_model._git_log(project)] == [
+    assert [c[2] for c in relay_model._git_log(project, None)] == [
         *reversed(BRANCH_POINT_UNCLAIMED), "alpha: the first leg's own work",
         BRANCH_POINT_EXCLUDED]
 
@@ -4105,7 +4627,7 @@ def _reads_a_repository(relay_dir):
     repository nothing on disk can confirm a claim and there are no commit
     entries to compare rows against.
     """
-    return relay_model._repo_dir(Path(relay_dir)) is not None
+    return relay_model._repo_reading(Path(relay_dir)).dir is not None
 
 
 def assert_the_model_agrees_with_itself(model, relay_dir):
@@ -4382,8 +4904,8 @@ def test_claimed_commits_answers_for_a_sha_and_says_nothing_for_a_stranger(
     else - no walk, no ref, no branch."""
     relay_dir = _branch_point_relay(tmp_path / "proj")
     sha = _short_sha(relay_dir.parent)
-    assert [c[1] for c in relay_model._claimed_commits(relay_dir, [sha])] == [sha]
-    assert relay_model._claimed_commits(relay_dir, ["deadbee"]) == []
+    assert [c[1] for c in relay_model._claimed_commits(relay_dir, [sha], None)] == [sha]
+    assert relay_model._claimed_commits(relay_dir, ["deadbee"], None) == []
 
 
 def test_claimed_commits_spawns_no_process_when_the_walk_missed_nothing(
@@ -4394,7 +4916,7 @@ def test_claimed_commits_spawns_no_process_when_the_walk_missed_nothing(
     asked = []
     monkeypatch.setattr(relay_model, "_git",
                         lambda *a, **k: asked.append(a) or None)
-    assert relay_model._claimed_commits(tmp_path, []) == []
+    assert relay_model._claimed_commits(tmp_path, [], None) == []
     assert asked == []
 
 
@@ -4583,12 +5105,12 @@ def test_a_written_path_cannot_redirect_the_read_at_all(home_relay, other_projec
     _git(other_project, "commit", "-q", "--allow-empty",
          "-m", "elsewhere: another project's work", when=NOW - 3500)
 
-    read = str(relay_model._repo_dir(home_relay))
+    read = str(relay_model._repo_reading(home_relay).dir)
     for written in (str(other_project), str(home), "~", str(home_relay), None):
         (home_relay / "dashboard.json").write_text(json.dumps(
             {} if written is None else {"path": written}))
         model = relay_model.build(home_relay, now=NOW)
-        assert str(relay_model._repo_dir(home_relay)) == read, written
+        assert str(relay_model._repo_reading(home_relay).dir) == read, written
         assert commit_named(model, "alpha: the leg's work") is not None, written
         assert commit_named(model, "elsewhere: another project's work") is None
 
@@ -4678,7 +5200,22 @@ def test_every_git_read_is_bounded_in_time(tmp_path, monkeypatch):
 
     monkeypatch.setattr(relay_model.subprocess, "run", fake_run)
     assert relay_model._git(tmp_path, "rev-parse", "HEAD") is None
-    assert [c.get("timeout") for c in calls] == [relay_model.GIT_TIMEOUT]
+    # No deadline shared with it: a lone read takes a whole budget of its own,
+    # which is the same number, so the per-process ceiling and the per-build
+    # budget cannot drift apart.
+    assert [c.get("timeout") for c in calls] == [relay_model.GIT_BUDGET]
+
+    # ...and a read handed a deadline that has already passed is not spawned
+    # at all. That is what stops the budget being renewed four times over.
+    calls.clear()
+    assert relay_model._git(tmp_path, "rev-parse", "HEAD",
+                            deadline=time.monotonic() - 1) is None
+    assert calls == []
+    # A deadline still ahead caps the process at what is LEFT of it, never at
+    # the full budget.
+    assert relay_model._git(tmp_path, "rev-parse", "HEAD",
+                            deadline=time.monotonic() + 0.25) is None
+    assert 0 < calls[0]["timeout"] <= 0.25, calls
 
 
 # --------------------------------------------------------------------------
@@ -5239,8 +5776,8 @@ def test_commits_at_one_instant_come_back_in_one_settled_order(tmp_path):
         _git(project, "commit", "-q", "--allow-empty",
              "-m", f"nobody {n}: all in the same second", when=NOW - 5000)
 
-    repo = relay_model._repo_dir(relay_dir)
-    walked = [c[1] for c in relay_model._git_log(repo) if c[0] == NOW - 5000]
+    repo = relay_model._repo_reading(relay_dir).dir
+    walked = [c[1] for c in relay_model._git_log(repo, None) if c[0] == NOW - 5000]
     # THE PREMISE, and it has to be asserted: these commits are reproducible -
     # fixed author, fixed dates, fixed messages - so their shas are fixed too,
     # and at four commits git's own walk order happened to BE ascending by sha.
@@ -5252,10 +5789,10 @@ def test_commits_at_one_instant_come_back_in_one_settled_order(tmp_path):
 
     batons = relay_model._read_batons(relay_dir, [])
     floor = relay_model._record_floor(relay_dir, [], batons, [])
-    entries = relay_model._commit_entries(repo, batons, floor, NOW)
+    entries = relay_model._commit_entries(repo, batons, floor, NOW, None)
     at = [e["commit"] for e in entries if e["t"] == NOW - 5000]
     assert at == sorted(walked), (at, walked)
-    assert entries == relay_model._commit_entries(repo, batons, floor, NOW)
+    assert entries == relay_model._commit_entries(repo, batons, floor, NOW, None)
 
 
 def test_a_record_that_cannot_be_timed_is_skipped_rather_than_fatal(

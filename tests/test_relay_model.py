@@ -853,7 +853,7 @@ def test_no_runner_column_carries_a_display_placeholder_in_place(name):
     em-dash — that is a recorded decision, and it is why this sweep is over the
     runner columns rather than over every string in the model."""
     target = FIXTURES / name
-    assert relay_model._repo_dir(target) is None, target
+    assert relay_model._repo_reading(target).dir is None, target
     _assert_no_placeholder_columns(
         relay_model.build(target)["runners"], f"{name} (in place)")
 
@@ -3089,6 +3089,234 @@ def test_a_stage_that_declares_its_legs_still_orders_them(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# ACC-DATA-002 — plan order is what the contract now DEFINES it to be
+#
+# Rewritten 2026-08-27 against the definition the contract gained that day:
+# "Legs are ordered by their stage's position in `legs.json`'s `stages` array,
+# then by their position within that stage's `legs` array, then by their
+# position in the `legs` array itself... A duplicate stage id, or a stage list
+# naming legs that no longer exist, must not silently reorder anything. Where
+# the model cannot order legs as declared, it warns."
+#
+# Both halves were live defects, and both moved `activeLeg`:
+#
+# * the within-stage rank of a leg its stage does not list was `len(legs) + 1`
+#   — a bound taken from the WRONG LIST. The positions it has to sit above are
+#   indices into a STAGE's `legs` array, and a coach who renames or merges legs
+#   leaves ids in that array with no leg entry left. Four of those in one stage
+#   and a DECLARED leg sorts behind a forgotten one. This relay's own
+#   `legs.json` has had legs renamed and merged at least five times.
+# * `stage_rank` and the two `stageName` maps were last-wins dict
+#   comprehensions, so a repeated stage id sorted its first entry's legs behind
+#   every later stage AND nulled their `stageName` from a later entry carrying
+#   no name — in total silence, while `model["stages"]` went on listing both.
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("forgotten", [0, 1, 3, 4, 5, 9])
+def test_a_leg_its_stage_lists_sorts_ahead_of_one_its_stage_forgot(
+        tmp_path, forgotten):
+    """The class, not the instance: however many renamed-away ids a stage's
+    `legs` array still carries, a leg that array NAMES comes before a leg of
+    the same stage it does not. `len(legs) + 1` held only while the stage list
+    was shorter than the leg list, and a coach who renames legs makes it
+    longer."""
+    gone = [f"renamed-away-{n}" for n in range(forgotten)]
+    target = write_relay(
+        tmp_path, f"plan-order-forgotten-{forgotten}",
+        legs={"relay": "plan-order",
+              "stages": [{"id": "S1", "name": "Stage one", "legs": gone + ["a"]}],
+              "legs": [{"id": "a", "stage": "S1", "status": "running"},
+                       {"id": "b", "stage": "S1", "status": "running"}]})
+
+    model = relay_model.build(target, now=None)
+
+    assert [leg["id"] for leg in model["legs"]] == ["a", "b"], forgotten
+    # ACC-DATA-002 rule 2, which is what the mis-rank actually broke: the
+    # active leg is the first RUNNING leg in plan order.
+    assert model["activeLeg"]["id"] == "a", forgotten
+    assert model["activeRunner"]["leg"] == "a", forgotten
+    # ...and every id the stage list names but the leg list has lost is said
+    # out loud, one warning apiece. "Must not silently reorder anything."
+    said = " | ".join(model["warnings"])
+    for lost in gone:
+        assert f"stage S1 lists leg '{lost}', which has no leg entry" in said
+
+
+def test_a_stage_list_of_nothing_but_ghosts_still_orders_by_the_leg_array():
+    """The degenerate end of the same rule, at the seam rather than through
+    `build()`: when NO leg of a stage is named by that stage's list, the legs
+    keep the order `legs.json`'s own `legs` array put them in."""
+    stages = [{"id": "S1", "name": "One", "legs": ["gone-1", "gone-2", "gone-3"]}]
+    legs = [{"id": "a", "stage": "S1"}, {"id": "b", "stage": "S1"}]
+    warnings = []
+    assert [leg["id"] for leg in relay_model._plan_order(legs, stages, warnings)] \
+        == ["a", "b"]
+    assert len(warnings) == 3, warnings
+
+
+def test_a_duplicate_stage_id_reorders_nothing_and_does_not_do_it_silently(
+        tmp_path):
+    """The first declaration of a stage id is the one that counts — its
+    position AND its name — and the model says the file declared it twice.
+
+    Last-wins put S1's legs behind S2's and blanked their `stageName` from a
+    second entry that carried no name, while `model["stages"]` still said
+    otherwise: a model contradicting itself inside one build."""
+    target = write_relay(
+        tmp_path, "plan-order-duplicate-stage",
+        legs={"relay": "plan-order",
+              "stages": [{"id": "S1", "name": "Stage one", "legs": ["a"]},
+                         {"id": "S2", "name": "Stage two", "legs": ["b"]},
+                         {"id": "S1", "name": None, "legs": []}],
+              "legs": [{"id": "a", "stage": "S1", "status": "running"},
+                       {"id": "b", "stage": "S2", "status": "running"}]},
+        state={"currentStage": "S1"})
+
+    model = relay_model.build(target, now=None)
+
+    assert [leg["id"] for leg in model["legs"]] == ["a", "b"]
+    assert model["activeLeg"]["id"] == "a"
+    assert model["activeRunner"]["leg"] == "a"
+    # The name a supervisor reads on the leg row, on the stage row, and on the
+    # current-stage header are one answer, from one map.
+    assert {leg["id"]: leg["stageName"] for leg in model["legs"]} == \
+        {"a": "Stage one", "b": "Stage two"}
+    assert model["relay"]["currentStage"] == {"id": "S1", "name": "Stage one"}
+    # `stages` is the file as written — both entries — so the model would
+    # contradict itself if the resolution above were silent.
+    assert [(s["id"], s["name"]) for s in model["stages"]] == \
+        [("S1", "Stage one"), ("S2", "Stage two"), ("S1", None)]
+    said = " | ".join(model["warnings"])
+    assert "stage id 'S1' is declared by 2 stages" in said
+
+
+def test_a_duplicate_stage_id_keeps_its_position_wherever_the_copy_sits(
+        tmp_path):
+    """And the copy cannot pull the stage FORWARD either. S2 is declared
+    second; a repeat of it in front of S1 must not make its legs sort first."""
+    target = write_relay(
+        tmp_path, "plan-order-duplicate-forward",
+        legs={"relay": "plan-order",
+              "stages": [{"id": "S2", "name": None, "legs": []},
+                         {"id": "S1", "name": "Stage one", "legs": ["a"]},
+                         {"id": "S2", "name": "Stage two", "legs": ["b"]}],
+              "legs": [{"id": "b", "stage": "S2", "status": "done"},
+                       {"id": "a", "stage": "S1", "status": "done"}]})
+
+    model = relay_model.build(target, now=None)
+    # First-wins, applied consistently: S2's first declaration is at index 0,
+    # so S2 leads — and its name is the one that declaration carries, which is
+    # none. What is forbidden is a SILENT choice, not this choice.
+    assert [leg["id"] for leg in model["legs"]] == ["b", "a"]
+    assert {leg["id"]: leg["stageName"] for leg in model["legs"]} == \
+        {"a": "Stage one", "b": None}
+    assert "stage id 'S2' is declared by 2 stages" in " | ".join(model["warnings"])
+
+
+def test_three_declarations_of_one_stage_id_warn_once_and_count_them(tmp_path):
+    target = write_relay(
+        tmp_path, "plan-order-triplicate",
+        legs={"relay": "plan-order",
+              "stages": [{"id": "S1", "name": "One"}, {"id": "S1"},
+                         {"id": "S1"}],
+              "legs": [{"id": "a", "stage": "S1", "status": "done"}]})
+
+    model = relay_model.build(target, now=None)
+    duplicates = [w for w in model["warnings"] if "is declared by" in w]
+    assert len(duplicates) == 1, duplicates
+    assert "stage id 'S1' is declared by 3 stages" in duplicates[0]
+
+
+def test_a_leg_a_stage_lists_twice_keeps_its_first_position(tmp_path):
+    """The same rule one level down, and the mutation battery is what found it:
+    a `legs` array naming one leg twice declares two positions for it, the
+    model can use one, and taking the LAST silently reorders the stage."""
+    target = write_relay(
+        tmp_path, "plan-order-repeated-leg",
+        legs={"relay": "plan-order",
+              "stages": [{"id": "S1", "name": "One",
+                          "legs": ["a", "b", "a"]}],
+              "legs": [{"id": "b", "stage": "S1", "status": "running"},
+                       {"id": "a", "stage": "S1", "status": "running"}]})
+
+    model = relay_model.build(target, now=None)
+
+    assert [leg["id"] for leg in model["legs"]] == ["a", "b"]
+    assert model["activeLeg"]["id"] == "a"
+    assert "stage S1 lists leg 'a' more than once" in \
+        " | ".join(model["warnings"])
+
+
+def test_two_legs_of_one_stage_the_stage_never_named_keep_file_order(tmp_path):
+    """ACC-DATA-002's third rank, asserted on its own: "then by their position
+    in the `legs` array itself". It is `sort`'s stability rather than a term in
+    the key, so it has to be asserted from the outside — in BOTH file orders,
+    or a test cannot tell a stable sort from an alphabetical one."""
+    for first, second in (("zeta", "alpha"), ("alpha", "zeta")):
+        target = write_relay(
+            tmp_path, f"plan-order-file-order-{first}",
+            legs={"relay": "plan-order",
+                  "stages": [{"id": "S1", "name": "One", "legs": []}],
+                  "legs": [{"id": first, "stage": "S1", "status": "running"},
+                           {"id": second, "stage": "S1", "status": "running"}]})
+        model = relay_model.build(target, now=None)
+        assert [leg["id"] for leg in model["legs"]] == [first, second]
+        assert model["activeLeg"]["id"] == first
+
+
+def test_a_leg_of_no_stage_at_all_is_not_adopted_by_an_unnameable_one(tmp_path):
+    """A stage whose `id` could not be read is not a stage any leg can be in.
+    Keying it as `None` makes it the stage of every leg whose `stage` field is
+    missing — which moves those legs to that stage's position AND puts its name
+    on their rows, an invented value in the one field ACC-DATA-007 forbids it
+    in."""
+    target = write_relay(
+        tmp_path, "plan-order-null-stage",
+        legs={"relay": "plan-order",
+              "stages": [{"id": None, "name": "Ghost", "legs": ["nowhere"]},
+                         {"id": "S1", "name": "One", "legs": ["a"]}],
+              "legs": [{"id": "nowhere", "status": "running"},
+                       {"id": "a", "stage": "S1", "status": "running"}]})
+
+    model = relay_model.build(target, now=None)
+
+    # The declared stage leads; the stageless leg follows it.
+    assert [leg["id"] for leg in model["legs"]] == ["a", "nowhere"]
+    assert model["activeLeg"]["id"] == "a"
+    assert {leg["id"]: leg["stageName"] for leg in model["legs"]} == \
+        {"a": "One", "nowhere": None}
+    assert {leg["id"]: leg["stage"] for leg in model["legs"]} == \
+        {"a": "S1", "nowhere": None}
+
+
+def test_two_stages_with_no_usable_id_are_not_one_duplicated_stage(tmp_path):
+    """They are two stages the model could not read, each already warned about
+    by position. Counting them together says "stage id 'None' is declared by 2
+    stages" — a placeholder printed as a value, in a diagnosis."""
+    target = write_relay(
+        tmp_path, "plan-order-two-null-stages",
+        legs={"relay": "plan-order",
+              "stages": [{"id": 7, "name": "A"}, {"id": ["x"], "name": "B"},
+                         {"id": "S1", "name": "One", "legs": ["a"]}],
+              "legs": [{"id": "a", "stage": "S1", "status": "running"}]})
+
+    model = relay_model.build(target, now=None)
+    assert not [w for w in model["warnings"] if "is declared by" in w], \
+        model["warnings"]
+    # ...and each one is still named, by the position it has.
+    said = " | ".join(model["warnings"])
+    assert "stage #0 `id`" in said and "stage #1 `id`" in said
+
+
+def test_a_stage_declared_once_is_never_warned_about(relay):
+    """The other side: the warning is a diagnosis, not noise. No fixture on
+    disk — the nine of them and the live relay — declares a stage twice."""
+    for name in ALL_FIXTURES:
+        model = relay_model.build(relay(name), now=None)
+        assert not [w for w in model["warnings"] if "is declared by" in w], name
+
+
+# --------------------------------------------------------------------------
 # ACC-DATA-001 — a relay directory the process may not search
 #
 # A relay directory with no search bit is STILL A DIRECTORY, so `build()` gets
@@ -3168,7 +3396,11 @@ def test_a_relay_whose_repository_is_readable_still_finds_it(tmp_path, chmodded)
     (project / ".git").mkdir()
     chmodded(relay_dir, 0o600)
 
-    assert relay_model._has_git(relay_dir) is False       # a refusal, not "no"
+    # A REFUSAL IS None, NOT False - a third answer, because a directory that
+    # would not be read has not said there is no repository there, and telling
+    # a supervisor it did is a false statement about their relay.
+    assert relay_model._has_git(relay_dir) is None        # a refusal, not "no"
+    assert relay_model._has_git(relay_dir.parent) is True
     assert any(relay_model._has_git(root)
                for root in relay_model._repo_roots(relay_dir)) is True
     # ...and the shape is what carries it there: a relay that is its own
@@ -3400,7 +3632,7 @@ def test_active_leg_and_active_runner_agree_on_every_fixture_in_place(name):
     git is `test_active_leg_and_active_runner_agree_in_a_repository` below.
     """
     target = FIXTURES / name
-    assert relay_model._repo_dir(target) is None, target
+    assert relay_model._repo_reading(target).dir is None, target
     assert_active_agrees(relay_model.build(target), f"{name} (in place)")
 
 
@@ -3722,9 +3954,13 @@ PINNED_BOUNDS = {
     # How many entries the Progress Log keeps - and it yields to attribution
     # (ACC-DATA-009): every confirmed claim appears however many there are.
     "LOG_MAX_ENTRIES": 300,
-    # Seconds any one git process may take. build() runs inside a 2 s repaint
-    # loop, so this is the difference between a slow pane and a frozen one.
-    "GIT_TIMEOUT": 3.0,
+    # Seconds ALL of one build()'s git work may take, shared by every read
+    # rather than renewed per read. build() runs inside a 2 s repaint loop, so
+    # this is the difference between a slow pane and a frozen one - and it is
+    # below 2.0 because the file work and the draw come out of the same budget.
+    # It was `GIT_TIMEOUT = 3.0`, a ceiling on ONE process that four sequential
+    # reads each spent in full: a judge measured build() at 10.7 s.
+    "GIT_BUDGET": 1.5,
     # The most a relay file may weigh before the model refuses to read it: 1
     # MiB, twenty times the largest relay file this project has written.
     "MAX_RELAY_FILE_BYTES": 1024 * 1024,
@@ -3811,9 +4047,42 @@ def test_the_baton_vocabularies_are_what_this_file_says_they_are():
 def test_the_bounds_are_what_this_file_says_they_are():
     for name, expected in PINNED_BOUNDS.items():
         assert getattr(relay_model, name) == expected, name
-    # The two relationships the values exist in, stated rather than implied.
+    # The three relationships the values exist in, stated rather than implied.
     assert relay_model.LOG_MAX_COMMITS < relay_model.LOG_MAX_ENTRIES
     assert relay_model.MAX_RELAY_FILE_BYTES % relay_model._READ_CHUNK == 0
+    # ACC-DATA-001: the whole call has to fit a 2 s repaint, and git is not the
+    # only thing in it. A budget equal to the repaint budget is already over it.
+    assert 0 < relay_model.GIT_BUDGET < 2.0
+
+
+#: ACC-DATA-009. Why the model could not read a repository for a relay, in the
+#: words a supervisor reads. Written out here rather than fetched, because the
+#: defect these replaced was a SENTENCE that was false - one clause covering
+#: four different facts - and a test that reads the clause from the module
+#: cannot tell a true one from a false one.
+PINNED_REPO_REASONS = {
+    # Nothing that could hold a repository holds one. The only reading the old
+    # single clause was ever right about.
+    "REPO_NONE": "this relay is not inside a repository of its own",
+    # Every candidate refused to be read, so nobody found out.
+    "REPO_UNREADABLE": "this relay's own directory could not be read",
+    # Git was asked and did not answer: absent, broken, or slower than
+    # GIT_BUDGET.
+    "REPO_SILENT": "git could not answer for this relay",
+    # Git answered about somewhere else - `core.worktree` aimed elsewhere, or
+    # a `.git` git rejected so it reported the surrounding project instead.
+    "REPO_ELSEWHERE": "git reports {top} as this relay's work tree, "
+                      "which is not it",
+}
+
+
+def test_the_repository_diagnoses_are_what_this_file_says_they_are():
+    for name, expected in PINNED_REPO_REASONS.items():
+        assert getattr(relay_model, name) == expected, name
+    # Four DIFFERENT sentences: collapsing any two of them back together is
+    # how the model came to state a falsehood about a relay that has a
+    # repository sitting right there.
+    assert len(set(PINNED_REPO_REASONS.values())) == 4
 
 
 def test_the_path_shapes_and_the_patterns_are_what_this_file_says_they_are():
@@ -3877,7 +4146,8 @@ def test_the_module_declares_no_constant_this_file_has_not_pinned():
     assert declared, "the module declares module-level names"
 
     pinned = (set(PINNED_STATE_TUPLES) | set(PINNED_ORDERS)
-              | set(PINNED_BOUNDS) | set(UNPINNED_MODULE_NAMES))
+              | set(PINNED_BOUNDS) | set(PINNED_REPO_REASONS)
+              | set(UNPINNED_MODULE_NAMES))
     assert set(declared) - pinned == set(), sorted(set(declared) - pinned)
     # ...and nothing here pins a name the module no longer has.
     assert pinned - set(declared) == set(), sorted(pinned - set(declared))
