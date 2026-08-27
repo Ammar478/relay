@@ -50,8 +50,35 @@ Web UI plus a JSON API. Node 22, zero dependencies.
 It asks a batch of scoping questions, researches, writes the contract, plans the
 legs — then **stops at an approval gate**. Nothing executes until you say go.
 
-After that you supervise rather than co-write. Open `.relay/control.html` in a
-browser and refresh it as the run progresses:
+After that you supervise rather than co-write.
+
+## Watching a run
+
+**Relay Control** is a terminal dashboard over the live `.relay/` directory. Run
+it from anywhere — it opens the relay it finds from the working directory:
+
+```bash
+~/.claude/skills/relay/relay-control
+```
+
+Name a relay to watch another project's run, either the relay directory or the
+project above it:
+
+```bash
+~/.claude/skills/relay/relay-control ~/work/some-project
+```
+
+Inside a Claude Code session, `/relay-control` prints a snapshot of the relay
+into the conversation — phase, leg and check counts, the active leg, the
+attention items — plus that shell line. It reports; it cannot hand your terminal
+to a full-screen program, so the live view is always something you open
+yourself. Link the skill once to get the command:
+
+```bash
+ln -s ~/.claude/skills/relay/skills/relay-control ~/.claude/skills/relay-control
+```
+
+There is also a static HTML dashboard, for a snapshot you can keep or share:
 
 ```bash
 python3 ~/.claude/skills/relay/scripts/render_dashboard.py --relay-dir .relay
@@ -135,6 +162,10 @@ references/
 templates/                  relay.md contract.md legs.json state.json baton.md
 assets/control.html         dashboard template
 scripts/render_dashboard.py fills the template from .relay/ state
+relay-control               opens the live terminal dashboard
+scripts/relay_model.py      the one reader of .relay/; everything else asks it
+scripts/relay_control/      the terminal dashboard itself
+skills/relay-control/       the /relay-control skill, linked into ~/.claude/skills
 ```
 
 ## Origin
