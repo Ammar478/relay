@@ -275,7 +275,7 @@ invariant one: state what done means before you start.
 ## References
 
 - `references/research.md` — the deep-search loop and gap analysis
-- `references/execution.md` — runner briefings, batons, and recovery plays
+- `references/execution.md` — runner briefings, batons, parallel runners, recovery plays
 - `references/validation.md` — writing checks that hold up, and the two judges
 - `references/dashboard.md` — Relay Control: when to render, what to write
 - `templates/` — the five state files; `assets/control.html` — dashboard template
