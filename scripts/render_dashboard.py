@@ -92,7 +92,10 @@ def read_baton(path):
     when it landed, how long it is, the commit it names, and a status if given."""
     text = path.read_text(errors="replace")
     m = STATUS_RE.search(text)
-    status = BATON_STATUS.get((m.group(1).lower() if m else ""), "Success")
+    # No status found means NOT MEASURED, never "Success". Defaulting to success
+    # made 29 of this repo's 40 batons render as passing without the parser ever
+    # finding a status - a failed leg included.
+    status = BATON_STATUS.get(m.group(1).lower(), "Unknown") if m else None
     sha = SHA_RE.search(text)
     return {
         "text": text[:9000] + ("\n\n… truncated, full baton on disk" if len(text) > 9000 else ""),
