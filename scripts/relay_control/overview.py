@@ -178,6 +178,11 @@ def _spec_rows(pane, leg):
                            theme_tokens.ABSENT)]))
 
     bullet = pane.theme.glyph("bullet") + " "
+    # Cells, not characters (`chrome.cell_width`): the bullet comes from the
+    # glyph table, which is *data* — a table whose mark was two cells would
+    # give the text a line one cell too long and indent its continuations one
+    # cell short, silently, on every leg with a boundary.
+    gutter = chrome.cell_width(bullet)
     for heading, items in (("Boundaries", leg.get("boundaries")),
                            ("Verification", leg.get("verification"))):
         if not items:
@@ -185,10 +190,10 @@ def _spec_rows(pane, leg):
         rows.append(_BLANK)
         rows.append(_row([(heading, theme_tokens.PANE_TITLE)], heading=True))
         for item in items:
-            lines = chrome.wrap(item, max(1, width - len(bullet)))
+            lines = chrome.wrap(item, max(1, width - gutter))
             for index, line in enumerate(lines):
                 rows.append(_row([
-                    (bullet if index == 0 else " " * len(bullet),
+                    (bullet if index == 0 else " " * gutter,
                      theme_tokens.MUTED),
                     (line, theme_tokens.BODY),
                 ]))
@@ -287,20 +292,28 @@ def _draw_legs(pane, model):
 def _draw_leg_row(pane, row, leg):
     """One leg: its status glyph, its id, and the highlight if it is running.
 
+    The highlight is `navigation.highlight()`, which is where the padding rule
+    lives for every list in the package. It was written out a second time here
+    — `text.ljust(pane.body_width - len(glyph) - 2)` — and a second copy of a
+    width computation is a second chance to measure it wrong: `ljust()` pads in
+    *characters*, so a leg id in CJK padded a row that was already full past
+    the pane's edge, and `Canvas.write()` cut it back with an ellipsis. The
+    running leg's row then ended in a mark saying its own blank padding had
+    been truncated.
+
     The glyph keeps its own status attribute even on the highlighted row
-    (ACC-TUI-006): the highlight says *where the relay is*, the glyph says what
-    that leg's state is, and collapsing the two loses the second.
+    (ACC-TUI-006), and that falls out of the token's type rather than out of a
+    rule stated here: `theme.status()` hands back a resolved attribute, which
+    `highlight()` keeps, while a token *name* becomes `theme.SELECTED`. The
+    highlight says *where the relay is*, the glyph says what that leg's state
+    is, and collapsing the two loses the second.
     """
     glyph, attr = pane.theme.status(leg.get("status") or "pending")
-    text = leg.get("id") or "(unnamed leg)"
+    parts = [(glyph + "  ", attr),
+             (leg.get("id") or "(unnamed leg)", theme_tokens.BODY)]
     if leg.get("isActive"):
-        # Padded to the pane, so the highlight reads as a row rather than as a
-        # word: `theme.SELECTED` is reverse video and stops where its text does.
-        width = max(len(text), pane.body_width - len(glyph) - 2)
-        pane.segments(row, [(glyph + "  ", attr),
-                            (text.ljust(width), theme_tokens.SELECTED)])
-    else:
-        pane.segments(row, [(glyph + "  ", attr), (text, theme_tokens.BODY)])
+        parts = navigation.highlight(parts, pane.body_width)
+    pane.segments(row, parts)
 
 
 # --------------------------------------------------------------------------
@@ -386,8 +399,16 @@ def _step_row(pane, step, result):
     glyph, attr = (pane.theme.status(result) if result
                    else (pane.theme.glyph("bullet"), theme_tokens.ABSENT))
     lead = glyph + " "
-    text = chrome.clip(step, max(1, pane.body_width - len(lead) - len(label) - 1))
-    gap = pane.body_width - len(lead) - len(text) - len(label)
+    # Cells, not characters. The gap is what is left of the row once the lead,
+    # the step and the result have been spent, so a step measured with `len()`
+    # is charged half what it costs and the gap is written twice as wide as
+    # there is room for: the row overran the pane, `Canvas.write()` cut it, and
+    # what it cut was the result this row exists to report — a verification
+    # step in CJK read `✓ …の検証手順 …` with no outcome on it at all.
+    ellipsis = pane.theme.glyph("ellipsis")
+    spent = chrome.cell_width(lead) + chrome.cell_width(label)
+    text = chrome.clip(step, max(1, pane.body_width - spent - 1), ellipsis)
+    gap = pane.body_width - spent - chrome.cell_width(text)
     return _row([(lead, attr), (text, theme_tokens.BODY),
                  (" " * max(1, gap) + label, token)])
 

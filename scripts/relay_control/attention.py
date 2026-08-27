@@ -141,7 +141,14 @@ def _layout(model, width, budget=None, ellipsis="…", marker="·"):
         return []
 
     items = _items(model)
-    aligned = max(len(item["label"]) for item in items) + GAP
+    # Cells, not characters (`chrome.cell_width`). A label is coach prose and
+    # the fixtures carry CJK: measured with `len()`, a label drawn in twelve
+    # cells was budgeted six, the text beside it was given the whole of the
+    # rest of the row, and the band — which draws on a bare canvas and holds
+    # the reserved-last-column rule *itself* — ran into the margin. That is the
+    # one overrun in this package that `assert_within_width()` can see, and it
+    # takes the certification away from every frame test in the repository.
+    aligned = max(chrome.cell_width(item["label"]) for item in items) + GAP
     # The label shares its row only while that still leaves prose worth reading.
     gutter = aligned if usable - aligned >= MIN_TEXT else 0
 
@@ -193,14 +200,21 @@ def _item_rows(item, usable, gutter, ellipsis, marker, allowed=None):
 
     if gutter:
         lines = _fit(item["text"], usable - gutter, allowed, ellipsis)
-        rows = [[(label, token), (" " * (gutter - len(label)), theme_tokens.BODY),
+        # No clamp on the padding: `gutter` is the widest label *plus*
+        # `GAP`, so what is left after this label is at least `GAP` cells.
+        rows = [[(label, token),
+                 (" " * (gutter - chrome.cell_width(label)),
+                  theme_tokens.BODY),
                  (lines[0], text_token)]]
         rows += [[(" " * gutter, theme_tokens.BODY), (line, text_token)]
                  for line in lines[1:]]
         indent = gutter
     else:
         lines = _fit(item["text"], usable - INDENT, allowed, ellipsis)
-        rows = [[(chrome.clip(label, usable), token)]]
+        # The theme's ellipsis, not `clip()`'s literal default: under a locale
+        # that cannot encode `…` curses drops the cell to a blank, and a label
+        # cut with a blank where its mark should be was cut in silence.
+        rows = [[(chrome.clip(label, usable, ellipsis), token)]]
         rows += [[(" " * INDENT, theme_tokens.BODY), (line, text_token)]
                  for line in lines]
         indent = INDENT
@@ -210,8 +224,8 @@ def _item_rows(item, usable, gutter, ellipsis, marker, allowed=None):
         # What the human could *do* is not what happened: it is drawn in its
         # own token so a reader can find it without reading the prose again.
         action = chrome.clip("%s %s" % (marker, action), usable - indent, ellipsis)
-        used = sum(len(text) for text, _ in rows[-1])
-        if used + GAP + len(action) <= usable:
+        used = sum(chrome.cell_width(text) for text, _ in rows[-1])
+        if used + GAP + chrome.cell_width(action) <= usable:
             rows[-1].append((" " * GAP, theme_tokens.BODY))
             rows[-1].append((action, theme_tokens.EMPHASIS))
         else:

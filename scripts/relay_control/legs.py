@@ -82,8 +82,11 @@ SEPARATOR = " | "
 #: the cells under it stand with nothing saying what they are. Both are worse
 #: than the column not being there, so the width of the label *is* the
 #: threshold — and `_head_row()` re-states it, so the two cannot drift.
-MIN_STAGE_ID = len(COLUMNS[1])
-MIN_FULFILLS = len(COLUMNS[2])
+#: Measured in cells, like every other width in the package — the labels are
+#: ASCII today, and `chrome.cell_width()` is what keeps that a fact about the
+#: labels rather than an assumption the arithmetic rests on.
+MIN_STAGE_ID = chrome.cell_width(COLUMNS[1])
+MIN_FULFILLS = chrome.cell_width(COLUMNS[2])
 
 #: How much of a coach's word the Status column will resize itself for.
 #:
@@ -93,7 +96,8 @@ MIN_FULFILLS = len(COLUMNS[2])
 #: nothing. A status is a word, not a sentence — twice the longest word this
 #: view owns is as much room as a coach gets before it is cut, which is enough
 #: for every spelling in the model's alias tables and for `blocked`.
-MAX_STATUS_WORD = 2 * max(len(word) for word in STATE_WORDS.values())
+MAX_STATUS_WORD = 2 * max(chrome.cell_width(word)
+                          for word in STATE_WORDS.values())
 
 #: The two coach words that map onto a display state and mean more than it.
 #:
@@ -215,11 +219,11 @@ def _filter_window(texts, active, width, ellipsis):
     lo = hi = active
 
     def measure(first, last):
-        cells = len(SEPARATOR.join(texts[first:last + 1]))
+        cells = chrome.cell_width(SEPARATOR.join(texts[first:last + 1]))
         if first > 0:
-            cells += len(ellipsis) + len(SEPARATOR)
+            cells += chrome.cell_width(ellipsis) + len(SEPARATOR)
         if last < len(texts) - 1:
-            cells += len(SEPARATOR) + len(ellipsis)
+            cells += len(SEPARATOR) + chrome.cell_width(ellipsis)
         return cells
 
     if measure(lo, hi) > width:
@@ -289,14 +293,21 @@ def _layout(pane, legs, width):
     from the detail view), then `Stage/ID` shrinks and clips, and last of all
     the status *word* goes and the glyph stands for it alone.
     """
-    lead = max([len(_lead(pane, leg)[0]) for leg in legs] or [3])
-    widest = min(max([len(status_word(leg)) for leg in legs] or [0]),
+    cells = chrome.cell_width
+    # Cells, not characters, everywhere in here: every one of these three
+    # widths is measured over untrusted prose. A leg id in CJK is drawn two
+    # columns per character, so `len()` sized `Stage/ID` at half what its
+    # widest id needs — and the column then clipped an id it had the room to
+    # draw whole while the grid to its right was pushed out of line with its
+    # own heads.
+    lead = max([cells(_lead(pane, leg)[0]) for leg in legs] or [3])
+    widest = min(max([cells(status_word(leg)) for leg in legs] or [0]),
                  MAX_STATUS_WORD)
-    status = max(len(COLUMNS[0]), lead + widest)
-    stage = max([len(reference(leg))
-                 + (len(_marker(leg)) + 1 if _marker(leg) else 0)
+    status = max(cells(COLUMNS[0]), lead + widest)
+    stage = max([cells(reference(leg))
+                 + (cells(_marker(leg)) + 1 if _marker(leg) else 0)
                  for leg in legs] or [0])
-    stage = max(len(COLUMNS[1]), stage)
+    stage = max(cells(COLUMNS[1]), stage)
 
     rest = width - status - GAP - stage - GAP
     if rest >= MIN_FULFILLS:
@@ -323,8 +334,13 @@ def _head_row(layout):
     for label, width in zip(COLUMNS, layout):
         if not width:
             break
-        text = label if len(label) <= width else ""
-        parts.append((text.ljust(width + GAP), theme_tokens.MUTED))
+        text = label if chrome.cell_width(label) <= width else ""
+        # Padded in cells. `str.ljust()` counts characters, which is the same
+        # number here and would stop being it the moment a heading were not
+        # ASCII — and the value rows below are spaced from the same `layout`,
+        # so the two have to be measured the same way or the grid comes apart.
+        parts.append((text + " " * (width + GAP - chrome.cell_width(text)),
+                      theme_tokens.MUTED))
     if parts:
         # The row stops where its last label does. Padding out to the last
         # column's full width would put the ellipsis of a clipped *blank* at
@@ -350,7 +366,7 @@ def _leg_row(pane, leg, layout, chosen=False):
     lead, attr = _lead(pane, leg)
     parts = [(lead, attr)]
 
-    room = status_width - len(lead)
+    room = status_width - chrome.cell_width(lead)
     if room > 0:
         note = raw_status_note(leg)
         # On the selected row the *word* gives its colour up and the glyph does
@@ -359,8 +375,8 @@ def _leg_row(pane, leg, layout, chosen=False):
         # the way across the row. A raw-status note keeps its colour whatever is
         # selected — `blocked` must never read as `Pending` (ACC-LEGS-004), and
         # that is the one thing in this cell the glyph does not already say.
-        parts.append((chrome.clip(status_word(leg), room, ellipsis)
-                      .ljust(room + GAP),
+        word = chrome.clip(status_word(leg), room, ellipsis)
+        parts.append((word + " " * (room + GAP - chrome.cell_width(word)),
                       _note_attr(pane, note) if note
                       else theme_tokens.BODY if chosen else attr))
     else:
@@ -370,12 +386,16 @@ def _leg_row(pane, leg, layout, chosen=False):
         marker = _marker(leg)
         suffix = " " + marker if marker else ""
         cell = chrome.clip(reference(leg),
-                           max(1, stage_width - len(suffix)), ellipsis)
+                           max(1, stage_width - chrome.cell_width(suffix)),
+                           ellipsis)
         parts.append((cell, theme_tokens.EMPHASIS if leg.get("isActive")
                       else theme_tokens.BODY))
         if marker:
             parts.append((suffix, theme_tokens.KIND))
-        pad = stage_width - len(cell) - len(suffix)
+        # Cells: `clip()` answers a string of at most `stage_width` *cells*,
+        # so padding it out by characters spends the gap twice over on a CJK
+        # id and pushes `Fulfills` out from under its own heading.
+        pad = stage_width - chrome.cell_width(cell) - chrome.cell_width(suffix)
         if fulfills_width:
             pad += GAP
         if pad > 0:

@@ -41,6 +41,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from frame import display_width  # noqa: E402
+
 from test_chrome import (  # noqa: E402
     FIXTURES, STANDARD, WIDE, row_of, session,
 )
@@ -874,3 +876,154 @@ def test_the_view_consumes_its_own_key_and_no_other():
         assert term.wait(timeout=5) == 0, "`q` did not quit from the Legs view"
     finally:
         term.close()
+
+
+# --------------------------------------------------------------------------
+# Width is measured in cells, not in characters
+#
+# Every one of this table's three widths is measured over untrusted prose — a
+# leg id, a stage, a coach's status word — and a terminal draws a CJK character
+# in two columns. `len()` therefore sized `Stage/ID` at half what its widest id
+# needs, and `str.ljust()` then padded a clipped cell out to that many
+# *characters* rather than cells.
+#
+# Neither is visible to a width assertion: `Pane` clips every write to its own
+# rectangle, so a row built twice as wide as the pane reaches the screen
+# truncated rather than overrunning it. What is visible is what the row says —
+# an id cut where the column had room for it — and where the grid lands, which
+# is what the "content starts under its own head" assertion below measures.
+# --------------------------------------------------------------------------
+
+#: Nine ideographs: eighteen cells, nine characters.
+CJK_LEG = "日本語で書かれた脚"
+CJK_LEG_TWO = "二番目の日本語の脚"
+
+#: The reference the `Stage/ID` column builds out of it.
+CJK_REFERENCE = "S1/" + CJK_LEG
+
+
+def cells_relay(directory, legs, relay="cells"):
+    """A relay whose leg ids are whatever is passed, each fulfilling a check.
+
+    `fulfills` is populated so that the rightmost column has content of its
+    own: a column of absence markers would still line up with its heading
+    whatever the arithmetic did, and would prove nothing about the grid.
+    """
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "legs.json").write_text(json.dumps({
+        "relay": relay,
+        "stages": [{"id": "S1", "name": "Only stage",
+                    "legs": [leg_id for leg_id, _ in legs]}],
+        "legs": [{"id": leg_id, "stage": "S1", "status": status,
+                  "goal": "a leg", "fulfills": ["ACC-CELL-%03d" % index]}
+                 for index, (leg_id, status) in enumerate(legs)],
+    }))
+    return directory
+
+
+CELLS_LEGS = ((CJK_LEG, "running"), (CJK_LEG_TWO, "pending"),
+              ("plain-leg", "pending"))
+
+
+def column_cells(frame, row):
+    """One screen row as a list of cells, so an index *is* a column.
+
+    `frame.lines` joins the grid and the cell after a double-width character is
+    the empty string in it, so a string index into a line carrying CJK is not
+    the column the terminal drew at.
+    """
+    return list(frame.cells[row])
+
+
+def head_columns(frame, head):
+    """`{label: column}` for the table's heads.
+
+    The head row is ASCII by construction — the three labels are literals in
+    this file — so a string index into it *is* a column, which is exactly what
+    stops being true one row further down.
+    """
+    line = frame.lines[head]
+    return {label: line.index(label) for label in ("Status", "Stage/ID",
+                                                   "Fulfills")}
+
+
+def test_a_double_width_leg_id_is_drawn_whole_where_the_column_has_room(
+        tmp_path):
+    """`Stage/ID` is as wide as its widest id, measured in cells.
+
+    Sized with `len()` the column was nine cells wide for an id that needs
+    eighteen, so a wide terminal with nothing else on it clipped an id it had a
+    hundred and forty columns to spare for — and marked the cut, which reads as
+    a relay whose leg ids are too long rather than as a renderer that measured
+    them wrong.
+    """
+    frame = legs_frame(cells_relay(tmp_path / "wide", CELLS_LEGS), size=WIDE)
+    assert frame.contains(CJK_REFERENCE), frame._message(
+        "the Stage/ID column cut %r, which fits the terminal twice over"
+        % CJK_REFERENCE)
+    row = frame.find(CJK_REFERENCE)
+    assert ELLIPSIS not in frame.lines[row], frame._message(
+        "the row carries a mark saying something was cut: %r"
+        % frame.lines[row])
+    frame.assert_within_width()
+
+
+@pytest.mark.parametrize("size", [WIDE, STANDARD])
+def test_every_column_of_a_double_width_row_starts_under_its_own_head(
+        size, tmp_path):
+    """The grid is one grid, on every row, whatever the row is spelled in.
+
+    The heads are spaced from the layout and the cells are padded to it, so the
+    two agree only while both are measured the same way. Padded in characters,
+    a cell clipped to eighteen *cells* was then padded out to eighteen
+    characters — thirty-six cells — and every column to its right was drawn out
+    from under its own heading.
+    """
+    frame = legs_frame(cells_relay(tmp_path / "grid", CELLS_LEGS), size=size)
+    head = frame.find("Stage/ID")
+    assert head is not None, frame._message("the table drew no head row")
+    columns = head_columns(frame, head)
+    body = [row for row in range(head + 1, frame.rows - 1)
+            if frame.lines[row].strip()]
+    assert body, frame._message("the table drew no rows under its heads")
+
+    for row in body:
+        cells = column_cells(frame, row)
+        for label, col in sorted(columns.items(), key=lambda item: item[1]):
+            assert cells[col].strip(), frame._message(
+                "row %d has nothing in column %d, where the %s head starts — "
+                "the cells to its left were padded in characters and pushed "
+                "it right" % (row, col, label))
+            if col:
+                assert not cells[col - 1].strip(), frame._message(
+                    "row %d puts content in column %d, immediately left of "
+                    "the %s head — the cell before it overran its column"
+                    % (row, col - 1, label))
+    frame.assert_within_width()
+
+
+def test_the_words_this_table_is_spaced_from_are_one_cell_per_character():
+    """Where `len()` and `chrome.cell_width()` provably agree, and why.
+
+    Four of this table's widths are measured over text that cannot be
+    double-width — the three column heads, the four state words, the five
+    filter labels and the status glyph in the gutter — so swapping the measure
+    there is a mutation no frame can fail on. They are equivalent, and this is
+    what keeps them equivalent rather than an argument that they are: a head or
+    a glyph that stopped being one cell per character makes the two measures
+    disagree, and the column it is the threshold for would be drawn at half the
+    width it needs.
+
+    Nothing here is read out of `relay_control.legs` or `relay_control.theme`;
+    every word and mark is one this file already spells for its own assertions.
+    """
+    words = (("Status", "Stage/ID", "Fulfills")
+             + tuple(STATE_WORDS.values())
+             + tuple(label for label, _ in FILTERS)
+             + tuple(GLYPHS.values()) + (ELLIPSIS,))
+    for text in words:
+        assert display_width(text) == len(text), (
+            "%r is %d cells and %d characters, so the widths this table is "
+            "spaced from are measured two different ways"
+            % (text, display_width(text), len(text)))

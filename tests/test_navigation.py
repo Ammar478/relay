@@ -1581,3 +1581,149 @@ def test_a_relay_with_nothing_to_select_takes_the_keys_without_moving(tmp_path):
         assert term.wait(timeout=10.0) == 0
     finally:
         term.close()
+
+
+# --------------------------------------------------------------------------
+# One measure for the whole package — a structural check, because no frame
+# can make this one
+#
+# `chrome.cell_width()` is the package's one answer to "how many cells is this
+# text". A second one is not a wrong answer that some screen would show: it is
+# a *right* answer written twice, and the two stay in step until the day one of
+# them is changed. `tests/test_chrome.py` already sweeps the package for a
+# second row-fitting helper for the same reason; this is the same sweep one
+# level down, over the measure the fitting helper is built on.
+#
+# The other half is `str.ljust()` / `rjust()` / `center()`. There is no
+# cell-aware spelling of any of the three — they count Python characters — so a
+# call is a width computation that is right only while its text is ASCII, and
+# every one of the five views pads a cell out to a column it measured from
+# prose. This is invisible from a screen for the reason the sections in
+# `.relay/skills/pane-conventions.md` give: `Pane` clips every write to its own
+# rectangle, so a row padded to twice its column reaches the terminal
+# truncated rather than overrunning it.
+# --------------------------------------------------------------------------
+
+#: The one module that may measure a cell. Everything else in the package asks
+#: it, and passes the answer around.
+MEASURE_OWNER = "chrome.py"
+
+#: What a second measure would have to reach for to be written at all: the
+#: east-asian-width table, by either of the two names it comes under.
+MEASURE_IMPORTS = ("unicodedata", "wcwidth")
+
+#: The string methods that pad in characters.
+CHARACTER_PADDERS = ("ljust", "rjust", "center")
+
+#: The modules that still call one. Both were another leg's file when
+#: `cells-everywhere-else` ran and both pad a cell out to a width they measured
+#: from coach prose — `contract.py` a check id, `models.py` a role name. The
+#: set is a subset bound and only ever shrinks: fixing one of them does not
+#: fail this test, and adding a sixth module to it is the failure it exists for.
+PADS_BY_CHARACTER = frozenset(("contract.py", "models.py"))
+
+#: The modules this leg made cell-aware. Named rather than derived, so that a
+#: `.ljust()` coming *back* into one of them is a failure and not a quietly
+#: widened allow-list.
+CELL_AWARE = ("overview.py", "attention.py", "legs.py", "runners.py",
+              "navigation.py", "chrome.py")
+
+
+def measure_imports(paths):
+    """`{module name: [what it imported]}` for the east-asian-width tables."""
+    found = {}
+    for path in paths:
+        for node in ast.walk(ast.parse(path.read_text(), filename=str(path))):
+            names = []
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                names = [node.module or ""]
+            for name in names:
+                if name.split(".")[0] in MEASURE_IMPORTS:
+                    found.setdefault(path.name, []).append(name)
+    return found
+
+
+def character_padders(paths):
+    """`{module name: [(method, line)]}` for every `ljust`/`rjust`/`center`."""
+    found = {}
+    for path in paths:
+        for node in ast.walk(ast.parse(path.read_text(), filename=str(path))):
+            if isinstance(node, ast.Attribute) and node.attr in CHARACTER_PADDERS:
+                found.setdefault(path.name, []).append((node.attr, node.lineno))
+    return found
+
+
+def test_only_one_module_in_the_package_measures_text_in_cells():
+    """`cell_width()` is the measure, and there is one of it.
+
+    A second one would agree with the first for as long as nobody changed
+    either, and no screen would ever say which of the two a given rectangle had
+    been measured with. What separates them is that there are two, and that is
+    a fact about the source.
+    """
+    modules = package_modules()
+    assert len(modules) >= 7, "swept only %r" % ([p.name for p in modules],)
+    assert {"chrome.py", "overview.py", "attention.py", "legs.py",
+            "runners.py", "navigation.py"} <= {p.name for p in modules}
+    found = measure_imports(modules)
+    assert set(found) == {MEASURE_OWNER}, (
+        "the east-asian-width table is read in %r. `chrome.cell_width()` is "
+        "the package's one measure: a second is a right answer written twice, "
+        "and the two stay in step only until one of them is changed."
+        % sorted(found))
+
+
+def test_no_module_this_leg_made_cell_aware_pads_a_row_in_characters():
+    """`ljust()` counts characters; a column is counted in cells.
+
+    Every one of these modules pads a cell out to a width it measured from
+    prose, and the fixtures carry CJK — so a call here is a row built at twice
+    the width of the column it belongs to, clipped back by `Pane` before it
+    reaches the screen, and invisible to every width assertion in the harness.
+    """
+    modules = package_modules()
+    found = character_padders(modules)
+    offenders = {name: calls for name, calls in found.items()
+                 if name in CELL_AWARE}
+    assert not offenders, (
+        "%r pad in characters. Pad in cells instead: "
+        "`text + \" \" * max(0, width - chrome.cell_width(text))`." % offenders)
+    assert set(found) <= PADS_BY_CHARACTER, (
+        "a module outside %r pads in characters: %r"
+        % (sorted(PADS_BY_CHARACTER), sorted(set(found) - PADS_BY_CHARACTER)))
+    # The allow-list may not name a module that has gone: a stale entry is an
+    # allow-list that only ever widens.
+    names = {path.name for path in modules}
+    assert PADS_BY_CHARACTER <= names, (
+        "%r is allow-listed and is not in the package any more"
+        % sorted(PADS_BY_CHARACTER - names))
+
+
+def test_the_measure_sweeps_find_a_planted_second_measure(tmp_path):
+    """Non-vacuity, for both sweeps, on exactly what they must keep out.
+
+    Planted in `tmp_path` rather than inside `scripts/relay_control/`, for the
+    reason the handler sweep above gives: this is a shared tree with more than
+    one runner in it, and a module that exists inside the package for ten
+    milliseconds is a module another runner's sweep can collect. That the
+    collection reaches the real package is asserted in the two tests above.
+    """
+    planted = tmp_path / "_second_measure_probe.py"
+    planted.write_text(
+        "import unicodedata\n"
+        "\n"
+        "\n"
+        "def width(text):\n"
+        "    return sum(2 if unicodedata.east_asian_width(ch) in 'WF' else 1\n"
+        "               for ch in text)\n"
+        "\n"
+        "\n"
+        "def cell(text, room):\n"
+        "    return text.ljust(room)\n"
+    )
+    assert measure_imports([planted]) == {planted.name: ["unicodedata"]}, (
+        "the measure sweep did not see a module reading the width table")
+    assert character_padders([planted]) == {planted.name: [("ljust", 10)]}, (
+        "the padding sweep did not see a module padding in characters")

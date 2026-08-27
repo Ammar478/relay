@@ -268,9 +268,17 @@ def _cells(runner, theme, active):
 
 
 def _widths(cells):
-    """`{key: cells}` — each column as wide as its label or its widest value."""
-    return {column.key: max([len(column.label)]
-                            + [len(row[column.key][0]) for row in cells])
+    """`{key: cells}` — each column as wide as its label or its widest value.
+
+    Cells, not characters. A leg id, a stage name and a coach's status word all
+    reach here as prose, and a terminal draws a CJK character in two columns:
+    measured with `len()`, the `Leg` column was sized at half what its widest
+    id needs, so the id was clipped where the table had room for it and every
+    column to its right was drawn out of line with its own heading.
+    """
+    return {column.key: max([chrome.cell_width(column.label)]
+                            + [chrome.cell_width(row[column.key][0])
+                               for row in cells])
             for column in COLUMNS}
 
 
@@ -349,7 +357,11 @@ def _segments(pairs, widths, ellipsis="…"):
             parts.append((" " * GAP, theme_tokens.MUTED))
         text = chrome.clip(text, widths[key], ellipsis)
         if index < len(pairs) - 1:
-            text = text.ljust(widths[key])
+            # Padded to the column in *cells*. `clip()` answers a string of at
+            # most `widths[key]` cells, and `str.ljust()` would then pad it out
+            # to that many *characters* — twice the column, for a cell whose
+            # text is double-width.
+            text += " " * (widths[key] - chrome.cell_width(text))
         parts.append((text, token))
     return parts
 

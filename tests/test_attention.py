@@ -866,3 +866,173 @@ def test_an_item_squeezes_to_one_text_row_and_no_further(allowed):
     assert text.strip(), "the label was given a row and no text followed it"
     assert text.rstrip().endswith("…"), (
         "text the squeeze cut must say it was cut: %r" % text)
+
+
+# --------------------------------------------------------------------------
+# Width is measured in cells, not in characters
+#
+# The band is the one region in the package that draws on a bare `Canvas`
+# rather than through a `Pane`, so it holds the reserved-last-column rule
+# itself: `Canvas.write()` clips at `canvas.width`, and `usable = width - 1` is
+# the band's own arithmetic. That makes this the one place where measuring a
+# label in characters is visible to `assert_within_width()` — and it takes the
+# strict certification away from every frame test in the repository while it
+# lasts.
+# --------------------------------------------------------------------------
+
+#: Six ideographs — twelve cells, six characters. A label is coach prose:
+#: `dashboard.json` is hand-written and the fixtures already carry CJK.
+CJK_LABEL = "要対応の判断"
+
+#: The text beside it, in a character a test can find a column for.
+TEXT_CHAR = "a"
+
+
+def cells_relay(directory, label, text, action=None, level="bad"):
+    """A relay whose whole attention band is one item, spelled by the caller."""
+    return relay_at(
+        directory,
+        legs={"relay": "cells",
+              "stages": [{"id": "S1", "name": "Only stage", "legs": ["leg"]}],
+              "legs": [{"id": "leg", "stage": "S1", "goal": "a goal",
+                        "status": "running"}]},
+        dashboard={"title": "Cells relay", "path": str(directory),
+                   "attention": [{"level": level, "label": label,
+                                  "text": text, "action": action}]})
+
+
+def first_column(frame, row, char):
+    """The column `char` is first drawn at on `row`.
+
+    Columns, not string offsets: the cell after a double-width character is the
+    empty string in `frame.lines`, so an index into a line carrying CJK is not
+    the column the terminal drew at (`.relay/skills/pane-conventions.md`).
+    """
+    for col, cell in enumerate(frame.cells[row]):
+        if cell == char:
+            return col
+    return None
+
+
+def reserved_column(frame):
+    """What every row put in the column the chrome reserves.
+
+    `assert_within_width()` makes the same claim; this one reads the cells, so
+    a failure says *what* was drawn in the margin rather than only that
+    something was.
+    """
+    return [row[frame.cols - 1] for row in frame.cells]
+
+
+def test_a_double_width_label_does_not_push_the_band_into_the_margin(tmp_path):
+    """The label's own width, measured in cells.
+
+    `aligned` is the widest label plus a gap, and the text beside it is given
+    everything the row has left. Measured with `len()`, a label drawn in twelve
+    cells was budgeted six — so the band handed the text six cells more than
+    the row had, and the item ran into the column the chrome reserves. Nothing
+    else in this package can do that: a view draws through a `Pane`, which
+    clips to its own rectangle.
+    """
+    relay = cells_relay(tmp_path / "wide", CJK_LABEL, TEXT_CHAR * 200)
+    frame = proved_frame_of(relay, size=WIDE)
+    assert frame.contains(CJK_LABEL), frame._message(
+        "the double-width label was not drawn — this proves nothing")
+    assert reserved_column(frame) == [" "] * frame.rows, frame._message(
+        "the band drew into the column the chrome reserves, so no frame from "
+        "this program can be certified by the strict assert_within_width()")
+    frame.assert_within_width()
+
+
+def test_a_wrapped_line_starts_under_the_text_it_continues(tmp_path):
+    """The gutter is the same number of cells on every row of an item.
+
+    The label's row pads the label out to the gutter and the rows under it are
+    indented by the whole gutter, so the two agree only while the label is
+    measured the same way in both. With `len()` the padding was six cells short
+    of where the text actually began and the continuation lines stood under
+    the middle of the label.
+    """
+    relay = cells_relay(tmp_path / "wrap", CJK_LABEL, TEXT_CHAR * 200)
+    frame = proved_frame_of(relay, size=WIDE)
+    head = first_column(frame, BAND_TOP, TEXT_CHAR)
+    tail = first_column(frame, BAND_TOP + 1, TEXT_CHAR)
+    assert head is not None and tail is not None, frame._message(
+        "the item did not wrap onto a second row — this proves nothing")
+    assert head == tail, frame._message(
+        "the text starts at column %d and its continuation at column %d"
+        % (head, tail))
+    frame.assert_within_width()
+
+
+#: Text and an action chosen so that the row is decided differently by the two
+#: measures, and *both* of the band's measurements are on the hook.
+#:
+#: At 160 columns the band has 159 usable cells and `NEEDS YOUR CALL` takes a
+#: gutter of 17. Sixty-two ideographs are 124 cells, so the row stands at 141
+#: and the action — nine ideographs behind a marker and a space, twenty cells —
+#: needs 163. It does not fit, and it takes a row of its own.
+#:
+#: Counted in characters it fits twice over: the row measures 79 and the action
+#: 11, which is 92 of 159. Either half counted wrong appends a twenty-cell
+#: action to a row with eighteen cells left, and the band — which draws on a
+#: bare canvas — runs into the column the chrome reserves.
+FULL_ROW_TEXT = "検" * 62
+ACTION = "次の脚の前に決める"
+
+
+def test_an_action_is_appended_only_when_it_fits_in_cells(tmp_path):
+    """What a human could *do* never costs the reserved column.
+
+    `_item_rows` measures the row it has already built to decide whether the
+    action fits beside it. With `len()` a row of double-width prose was
+    reported at half its width, the action was appended to a row that was
+    already full, and the band ran into the margin again — this time on the
+    one item the band exists for.
+    """
+    relay = cells_relay(tmp_path / "action", "NEEDS YOUR CALL",
+                        FULL_ROW_TEXT, action=ACTION)
+    frame = proved_frame_of(relay, size=WIDE)
+    assert frame.contains(ACTION), frame._message(
+        "the action was not drawn at all — this proves nothing")
+    assert ACTION not in frame.lines[BAND_TOP], frame._message(
+        "the action was appended to a row with no cells left in it: %r"
+        % frame.lines[BAND_TOP])
+    assert reserved_column(frame) == [" "] * frame.rows, frame._message(
+        "the band drew into the column the chrome reserves")
+    frame.assert_within_width()
+
+
+#: A label with no room for it at thirty columns, so the band has to cut it.
+#: Long enough that the aligned layout is out of the question too, which is
+#: what puts the label on a row of its own where it is cut rather than padded.
+LONG_LABEL = "A" * 60
+
+
+def test_a_label_the_band_cut_says_so_under_a_locale_without_the_mark(
+        tmp_path):
+    """`LC_ALL=C` is the only screen that separates the band's cut from the
+    canvas's.
+
+    Under UTF-8 both end in `…` and no assertion can tell them apart. Under a
+    locale that cannot encode it, curses drops `chrome.clip()`'s literal
+    default to a *blank* — a silent truncation wearing a mark's clothes — while
+    the theme's spelling degrades to `...`. The band cuts the label itself, so
+    it has to hand in the theme's mark.
+    """
+    env = {key: value for key, value in os.environ.items()
+           if key not in ("LC_ALL", "LC_CTYPE", "LANG")}
+    env["LC_ALL"] = "C"
+    relay = cells_relay(tmp_path / "label", LONG_LABEL,
+                        "some text for the item")
+    term = session(relay, size=(8, 30), env=env)
+    try:
+        frame = repaint(term)
+    finally:
+        term.close()
+    line = frame.lines[BAND_TOP].rstrip()
+    assert line.startswith("A"), frame._message(
+        "row %d is not the label's row: %r" % (BAND_TOP, line))
+    assert line.endswith("..."), frame._message(
+        "the label was cut with a mark this locale cannot draw: %r" % line)
+    frame.assert_within_width()
