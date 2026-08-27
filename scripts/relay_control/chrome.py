@@ -5,8 +5,8 @@ and a rectangle, and it draws. The split matters because six view legs run in
 parallel on top of this file: a view that needed to reach past its `Pane` to
 place something would be a view that can collide with another view's pane.
 
-Four invariants this module holds for every view
-------------------------------------------------
+Five invariants this module holds for every view
+-----------------------------------------------
 1. **Everything is clipped, nothing raises.** `Pane.line()` truncates to the
    pane's width, ignores a row outside the pane, and swallows the `curses.error`
    a write at the screen's last cell raises. "Degrade, not crash" is enforced
@@ -16,10 +16,17 @@ Four invariants this module holds for every view
    exactly at the margin is byte-identical to a row truncated to fit — a frame
    with an empty last column is one a test can certify with
    `assert_within_width()` rather than wave through with `allow_full_width`.
-3. **All arithmetic is from the live terminal size.** `Canvas` is handed a
+   The header, the status bar and the keybar each work in `width - 1` of their
+   own accord, because they draw on a bare `Canvas` and only `Canvas.pane()`
+   clamps.
+3. **Width is counted in cells, never in characters.** `cell_width()` is the
+   only measure in this module. `len()` is right for ASCII and wrong by a
+   factor of two for the CJK the fixtures already carry, and the pane that
+   overflows is the pane that erases the rule beside it.
+4. **All arithmetic is from the live terminal size.** `Canvas` is handed a
    rectangle measured from `getmaxyx()` at every repaint. There is no constant
    here that is a width.
-4. **Nothing drawn is a control character.** Every string a view hands over is
+5. **Nothing drawn is a control character.** Every string a view hands over is
    relay prose — a leg goal, a commit subject, a coach's log line, a warning —
    and all of it is hand-written into `.relay/`. `Canvas.write()` is the one
    place text becomes cells, so it is the one place a control character stops
@@ -41,6 +48,7 @@ is happening right now is the last thing to go.
 
 import curses
 import functools
+import unicodedata
 
 from . import theme as theme_tokens
 
@@ -114,16 +122,17 @@ def sanitise(text, placeholder):
     * Escaping is what ncurses does for you if you let a control character
       through — `addstr` renders ESC as `^[` — and it costs a cell. Every
       width computation in this package (`clip`, `wrap`, `Pane.right`,
-      `Pane.header`, `overview._fit`, `attention._item_rows`) counts Python
-      characters and spends them as cells. Two cells for one character makes
+      `Pane.header`, `overview._fit`, `attention._item_rows`) measures a cell
+      count and spends it as cells. Two cells for one character makes
       each of those quietly wrong, and the observable end of that is the
       reserved last column: a goal with sixty ESCs in it ran a row to the
       margin and wrapped into the pane below, which is invariant 2 gone and
       `Frame.assert_within_width()` unable to certify *any* frame in the
       repository.
 
-    So the substitution is one character for one character. Nothing upstream
-    of here has to know it happened, `len()` stays the cell count everywhere,
+    So the substitution is one character for one character, and one cell for
+    one cell — the mark is narrow in every glyph table (`cell_width()` is what
+    says so). Nothing upstream of here has to know it happened,
     and the placeholder is visible: a reader sees that something was in the
     text without being told what a `0x9B` is.
 
@@ -135,20 +144,108 @@ def sanitise(text, placeholder):
     return text.translate(_control_table(placeholder))
 
 
+def cell_width(text):
+    """How many terminal cells `text` occupies.
+
+    `len()` is a count of Python characters and it is **not** a count of cells.
+    A terminal draws a CJK ideograph in two columns and a combining mark in
+    none, so a rectangle measured with `len()` is out by up to a factor of two
+    on text the fixtures already carry. Measured at 160x48: a leg goal of CJK
+    ideographs was given the Active Leg pane's 79 cells, `wrap()` handed the
+    pane rows of 79 *characters*, and the row was drawn at **158** — which
+    erased the vertical rule beside it, painted over the Legs pane in the next
+    column, and wrapped onto the row below. Invariant 2 of this module — the reserved last column, which is
+    the whole reason `Frame.assert_within_width()` can certify a frame at all —
+    goes with it.
+
+    The rule is Unicode's own rather than a table somebody typed:
+    `east_asian_width` names the wide (`W`) and fullwidth (`F`) forms, and the
+    marks and format characters a terminal joins onto the cell before them
+    (`Mn`, `Me`, `Cf`) take none of their own. `tests/frame.py` measures a
+    captured screen by the same rule, so what this module spends and what the
+    emulator reports are one statement and not two.
+
+    A control character counts as one cell, which is deliberate and is the
+    other half of ACC-ROBUST-006: `Canvas.write()` has already replaced it with
+    a one-cell mark by the time anything is measured, and the substitution is
+    1:1 in cells precisely so that this function does not have to know.
+    """
+    return sum(_char_cells(ch) for ch in str(text))
+
+
+def _char_cells(ch):
+    if unicodedata.combining(ch) or unicodedata.category(ch) in ("Mn", "Me", "Cf"):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def _take_cells(text, cells):
+    """`(prefix, width)` — the longest prefix of `text` that fits in `cells`.
+
+    A double-width character that would straddle the far edge is not taken:
+    half a character is not a character, and a terminal asked to draw one
+    either drops it or spills into the next cell. So the prefix comes back one
+    cell short rather than one cell over — short is a blank column, over is
+    somebody else's pane.
+    """
+    if cells <= 0:
+        return "", 0
+    spent = 0
+    for index, ch in enumerate(text):
+        width = _char_cells(ch)
+        if spent + width > cells:
+            return text[:index], spent
+        spent += width
+    return text, spent
+
+
+def _drop_cells(text, cells):
+    """`(rest, offset)` — `text` with its first `cells` cells taken off.
+
+    For a write that starts left of its canvas: what is off the edge is gone
+    and what is left begins at column 0. A wide character straddling the edge
+    is dropped whole and `offset` is the one cell it would have half-filled, so
+    what follows still lands on the column it belongs to instead of sliding a
+    cell to the left.
+    """
+    spent = 0
+    for index, ch in enumerate(text):
+        if spent >= cells:
+            return text[index:], spent - cells
+        spent += _char_cells(ch)
+    return "", max(0, spent - cells)
+
+
 def clip(text, width, ellipsis="…"):
-    """`text` cut to `width` cells, with an ellipsis when something was lost."""
+    """`text` cut to `width` cells, and **always** marked where it was cut.
+
+    Two things here that `text[:width]` gets wrong, both of them named
+    absences:
+
+    * **Cells, not characters** — see `cell_width()`.
+    * **The mark is never the thing dropped.** This used to answer
+      `text[:width]`, with no mark at all, whenever it was left fewer cells
+      than the ellipsis is wide. So a row cut with exactly one cell to spare
+      was cut *silently*, which is the one thing this package never does, in
+      the hardest place in it to see. Under `LC_ALL=C` the ellipsis is `...`
+      and the silence covered three cells rather than one. Now the mark is
+      taken first and the text spends what is left, so a cut says so at every
+      width down to one cell — where the answer is the mark and nothing else,
+      which is the honest screen for a column that has room for one cell and
+      something longer to put in it.
+    """
     text = "" if text is None else str(text)
     if width <= 0:
         return ""
-    if len(text) <= width:
+    if cell_width(text) <= width:
         return text
-    if width <= len(ellipsis):
-        return text[:width]
-    return text[:width - len(ellipsis)] + ellipsis
+    mark, mark_width = _take_cells(ellipsis, width)
+    kept, _ = _take_cells(text, width - mark_width)
+    return kept + mark
 
 
 def elide_left(text, width, ellipsis="…"):
-    """`text` cut to `width` cells from the *front*.
+    """`text` cut to `width` cells from the *front*, the cut always marked.
 
     For paths, where the tail is the part that identifies the thing:
     `…/tests/fixtures/agent-service` says more than `/Users/ammar/Documen…`.
@@ -156,11 +253,12 @@ def elide_left(text, width, ellipsis="…"):
     text = "" if text is None else str(text)
     if width <= 0:
         return ""
-    if len(text) <= width:
+    total = cell_width(text)
+    if total <= width:
         return text
-    if width <= len(ellipsis):
-        return text[-width:]
-    return ellipsis + text[-(width - len(ellipsis)):]
+    mark, mark_width = _take_cells(ellipsis, width)
+    rest, _ = _drop_cells(text, total - (width - mark_width))
+    return mark + rest
 
 
 def wrap(text, width):
@@ -172,17 +270,60 @@ def wrap(text, width):
     for word in str(text).split():
         if not current:
             current = word
-        elif len(current) + 1 + len(word) <= width:
+        elif cell_width(current) + 1 + cell_width(word) <= width:
             current += " " + word
         else:
             lines.append(current)
             current = word
-        while len(current) > width:
-            lines.append(current[:width])
-            current = current[width:]
+        while cell_width(current) > width:
+            head, _ = _take_cells(current, width)
+            # A single character wider than the whole line: it gets the line
+            # anyway rather than the loop spinning for ever, and `Canvas.write()`
+            # cuts it to the mark. Dropping it would be a silent deletion.
+            head = head or current[:1]
+            lines.append(head)
+            current = current[len(head):]
     if current:
         lines.append(current)
     return lines
+
+
+def fit_parts(parts, width, ellipsis):
+    """`[(text, token), ...]` cut to `width` cells, marked **once**, at the end.
+
+    A row assembled from several styled segments cannot be cut by clipping the
+    segments: each one knows only its own width, so the row is either marked
+    once per segment or — the case that actually shipped — not at all, because
+    every segment fitted and the row did not.
+
+    Two things it is careful about, and both of them were paid for:
+
+    * **The theme's ellipsis, not `clip()`'s default.** `Canvas.write()` now
+      passes the theme's, but a caller assembling a row still has to hand the
+      right mark in: under a locale that cannot encode `…` curses drops the cell
+      to a blank, and a blank is a silent truncation wearing a mark's clothes.
+    * **The cell for the mark is reserved before it is spent**, so the last
+      segment cannot fill the row and leave the mark nowhere to go.
+
+    This lived in `runners.py`, `contract.py` and `models.py` — three
+    byte-identical copies, written independently by three legs that were each
+    forbidden to edit this file, and each of whose batons asked for the move.
+    """
+    if sum(cell_width(text) for text, _ in parts) <= width:
+        return list(parts)
+    mark, mark_width = _take_cells(ellipsis, max(0, width))
+    room = max(0, width - mark_width)
+    fitted, spent = [], 0
+    for text, token in parts:
+        if spent >= room:
+            break
+        text, taken = _take_cells(text, room - spent)
+        if text:
+            fitted.append((text, token))
+            spent += taken
+    if mark:
+        fitted.append((mark, theme_tokens.MUTED))
+    return fitted
 
 
 def paginate(items, height):
@@ -293,9 +434,15 @@ class Canvas:
             return 0
         text = sanitise(str(text), self.theme.glyph("control"))
         if col < 0:
-            text = text[-col:]
-            col = 0
-        text = clip(text, self.width - col)
+            # What is off the left edge is gone; `offset` is the cell a wide
+            # character straddling the edge would have half-filled, and is left
+            # blank so what follows lands on its own column.
+            text, offset = _drop_cells(text, -col)
+            col = offset
+        # The theme's ellipsis, not `clip()`'s literal default: under a locale
+        # that cannot encode `…` curses drops the cell to a blank, and a
+        # truncation with a blank where its mark should be is a silent one.
+        text = clip(text, self.width - col, self.theme.glyph("ellipsis"))
         if not text:
             return 0
         try:
@@ -303,7 +450,7 @@ class Canvas:
                             self.resolve(token))
         except curses.error:
             return 0
-        return len(text)
+        return cell_width(text)
 
     def segments(self, row, parts, col=0):
         """Draw `[(text, token), ...]` end to end. Returns the column reached."""
@@ -396,11 +543,15 @@ class Pane:
         dash to fill the space (ACC-OVER-004).
         """
         width = self.canvas.width
-        self.canvas.write(0, 0, clip(self.title, width), theme_tokens.PANE_TITLE)
+        # No `clip()` on the title: `Canvas.write()` clips to this same width,
+        # with the theme's own mark. A second clip here could only spell the
+        # mark differently.
+        self.canvas.write(0, 0, self.title, theme_tokens.PANE_TITLE)
         if meta:
-            meta = clip(str(meta), max(0, width - len(self.title) - 2))
+            meta = clip(str(meta), max(0, width - cell_width(self.title) - 2),
+                        self.theme.glyph("ellipsis"))
             if meta:
-                self.canvas.write(0, width - len(meta), meta,
+                self.canvas.write(0, width - cell_width(meta), meta,
                                   theme_tokens.PANE_META)
         return self
 
@@ -410,8 +561,10 @@ class Pane:
         """One body row, `row` counted from 0 at the first row under the title."""
         if not (0 <= row < self.body_height):
             return False
-        return self.canvas.write(row + 1, col, clip(text, self.body_width - col),
-                                 token) > 0
+        # `Canvas.write()` clips to exactly `body_width - col` already, and with
+        # the theme's ellipsis rather than a literal one; clipping again here
+        # was the same cut spelled worse.
+        return self.canvas.write(row + 1, col, text, token) > 0
 
     def segments(self, row, parts, col=0):
         """A body row assembled from `[(text, token), ...]`."""
@@ -423,9 +576,9 @@ class Pane:
         """Right-aligned text on a body row — an elapsed time, a count."""
         if not (0 <= row < self.body_height) or not text:
             return False
-        text = clip(str(text), self.body_width)
-        return self.canvas.write(row + 1, self.body_width - len(text), text,
-                                 token) > 0
+        text = clip(str(text), self.body_width, self.theme.glyph("ellipsis"))
+        return self.canvas.write(row + 1, self.body_width - cell_width(text),
+                                 text, token) > 0
 
     def empty(self, message):
         """How a pane says there is nothing to show.
@@ -434,7 +587,7 @@ class Pane:
         Never an empty box, never a dash, never `1-0 of 0` — a reader has to be
         able to tell "no runners have landed" from "this pane is broken".
         """
-        self.line(0, clip(message, self.body_width), theme_tokens.ABSENT)
+        self.line(0, message, theme_tokens.ABSENT)
         return self
 
     def more(self, hidden, row=None):
@@ -472,8 +625,13 @@ def metrics_of(model):
 
 
 def _metric_width(metrics):
-    return sum(len(label) + 1 + len(value) for label, value in metrics) + \
-        3 * max(0, len(metrics) - 1)
+    """The cells `draw_header()` will spend on `metrics`, separators included.
+
+    A metric's *value* is whatever `dashboard.json` says it is — coach prose,
+    by ACC-DATA-001 — so it is measured in cells and not in characters.
+    """
+    return sum(cell_width(label) + 1 + cell_width(value)
+               for label, value in metrics) + 3 * max(0, len(metrics) - 1)
 
 
 def relay_title(model):
@@ -516,10 +674,10 @@ def draw_header(canvas, model):
     metrics = metrics_of(model)
     # Metrics are dropped from the left — TIME first — because a token figure
     # is the one a reader is most often watching change.
-    while metrics and len(title) + 4 + _metric_width(metrics) > usable:
+    while metrics and cell_width(title) + 4 + _metric_width(metrics) > usable:
         metrics = metrics[1:]
     right = _metric_width(metrics)
-    gap = usable - len(title) - (right + 2 if right else 0)
+    gap = usable - cell_width(title) - (right + 2 if right else 0)
     path = elide_left(path, max(0, gap - 2), ell)
 
     col = canvas.segments(0, [(title, theme_tokens.TITLE)])
@@ -562,11 +720,19 @@ def draw_status_bar(canvas, model):
     count = "%d/%d" % (done, total)
     usable = canvas.width - 1
 
-    col = canvas.segments(0, [(canvas.theme.glyph("dot"), attr),
-                              (" ", theme_tokens.BODY),
-                              (phase.upper(), attr),
-                              (" ", theme_tokens.BODY)])
-    count_col = usable - len(count)
+    # Fitted to `usable`, like the bar and the count beside it. It was not:
+    # these segments were spaced against `canvas.width` while everything else
+    # on the row worked in `width - 1`, so below about ten columns the phase
+    # word ran into the reserved last column — on *every* view, the Overview
+    # included, with no keystroke sent. The strict `assert_within_width()`
+    # could then certify no frame at all at 3x8 or 2x6, and the row it named
+    # belonged to the chrome rather than to the view being tested.
+    col = canvas.segments(0, fit_parts(
+        [(canvas.theme.glyph("dot"), attr),
+         (" ", theme_tokens.BODY),
+         (phase.upper(), attr),
+         (" ", theme_tokens.BODY)], usable, canvas.theme.glyph("ellipsis")))
+    count_col = usable - cell_width(count)
     bar_width = count_col - 1 - col
     if bar_width > 0:
         filled = int(round(bar_width * done / total)) if total else 0
@@ -588,7 +754,7 @@ def draw_status_bar(canvas, model):
 def _fit_bindings(bindings, usable):
     """As many bindings as fit, always keeping the last one — `q Quit`."""
     kept = list(bindings)
-    while kept and len("  ".join("%s %s" % b for b in kept)) > usable:
+    while kept and cell_width("  ".join("%s %s" % b for b in kept)) > usable:
         if len(kept) == 1:
             return []
         del kept[-2]
@@ -610,7 +776,8 @@ def draw_keybar(canvas, bindings):
                                   (" " + label, theme_tokens.KEY_LABEL)], col)
 
     legend = [(canvas.theme.glyph(state), word) for state, word in LEGEND]
-    width = sum(len(g) + 1 + len(w) for g, w in legend) + 2 * (len(legend) - 1)
+    width = sum(cell_width(g) + 1 + cell_width(w)
+                for g, w in legend) + 2 * (len(legend) - 1)
     start = usable - width
     if start < col + 2:
         return

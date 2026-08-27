@@ -19,6 +19,25 @@ Two degradations live here and nowhere else:
   *not*: they are drawn from the ACS alternate character set, which reaches the
   terminal as real box drawing on any terminal ncurses knows.
 
+Blocked is not failed
+---------------------
+`blocked` and `failed` used to resolve to one token, so `theme.status()` handed
+back the same glyph *and* the same attribute for both, in colour and in
+monochrome — the two states were byte-identical on screen and only a word beside
+the check id told them apart. They are not the same thing to a supervisor:
+**blocked needs a decision from them; failed needs a fix leg from the coach.**
+ACC-TUI-006 now forbids sharing both.
+
+It is the *pair* that separates them and not the glyph, for two reasons. The
+contract enumerates five glyphs and the keybar legend names those five; a sixth
+mark on a check row would be a mark nothing on the screen explains. And blocked
+genuinely is a check that did not pass — `✗` is not the wrong shape for it, only
+the wrong colour. So `status.blocked` is magenta where `status.failed` is red,
+and bold-underline where `status.failed` is bold-reverse, which keeps them apart
+on a terminal with no colour at all. The state is still written as a word beside
+the glyph by the views that draw it; this makes the glyph agree with the word
+instead of contradicting it.
+
 Why pair 0 is never used for a status glyph
 -------------------------------------------
 Once `start_color()` has been called, ncurses renders colour pair 0 as an
@@ -63,7 +82,7 @@ STATUS = {
     "failed": "status.failed",
     "cancelled": "status.cancelled",
     "passed": "status.completed",
-    "blocked": "status.failed",
+    "blocked": "status.blocked",
 }
 
 #: Relay phases → the token the status bar's dot and word are drawn with.
@@ -118,6 +137,10 @@ _SPEC = {
     "status.pending":   ("white",  ("dim",),   ("dim",)),
     "status.failed":    ("red",    ("bold",),  ("bold", "reverse")),
     "status.cancelled": ("blue",   ("dim",),   ("dim", "underline")),
+
+    # A sixth state, and the reason it is not a sixth *glyph*: see
+    # "Blocked is not failed" in the module docstring.
+    "status.blocked":   ("magenta", ("bold",), ("bold", "underline")),
 
     "phase.running":  ("green",  ("bold",), ("bold",)),
     "phase.judging":  ("yellow", ("bold",), ("bold",)),
@@ -264,7 +287,10 @@ class Theme:
         """`(glyph, attr)` for a leg or check state — the pair, never one half.
 
         Returning both together is what stops a view drawing the right glyph in
-        the wrong colour, which is half of ACC-TUI-006.
+        the wrong colour, which is half of ACC-TUI-006. The other half is that
+        two states which need different things from a supervisor may not come
+        back identical: `blocked` shares `✗` with `failed` and carries its own
+        pair, in colour and in monochrome. See "Blocked is not failed" above.
         """
         key = state if state in GLYPHS else "pending"
         return self._glyphs[key], self.attr(STATUS.get(state, STATUS["pending"]))

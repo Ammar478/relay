@@ -232,7 +232,7 @@ def _rows(groups, theme, width):
     ellipsis = theme.glyph("ellipsis")
     rows = []
     for area, members in groups:
-        rows.append(_Row(True, _fit_parts([
+        rows.append(_Row(True, chrome.fit_parts([
             (area, theme_tokens.PANE_TITLE),
             (" %d/%d evidenced" % (_evidenced(members), len(members)),
              theme_tokens.PANE_META),
@@ -258,7 +258,7 @@ def _check_rows(check, theme, width, idw):
     # The glyph and the word carry the same attribute, from the same call: a
     # view cannot draw the right glyph in the wrong colour (ACC-TUI-006), and
     # the word is what separates blocked from failed, which share a glyph.
-    rows = [_Row(False, _fit_parts([
+    rows = [_Row(False, chrome.fit_parts([
         (glyph, attr),
         (" " * GAP, theme_tokens.MUTED),
         (_id_of(check).ljust(idw), theme_tokens.BODY),
@@ -347,31 +347,3 @@ def _fit(rows, height):
     while shown and shown[-1].heading:
         shown = shown[:-1]
     return shown, len(rows) - len(shown)
-
-
-def _fit_parts(parts, width, ellipsis):
-    """`parts` cut to `width` cells, marked once, in the theme's own ellipsis.
-
-    A row left to `Canvas.write()` to clip is cut with `chrome.clip()`'s literal
-    `…` default, which curses drops to a blank under a locale that cannot encode
-    it — a silent truncation. The cell for the mark is reserved *before* it is
-    spent, because `chrome.clip()` hands back `text[:width]` with no mark at all
-    when it is left fewer cells than the ellipsis is wide.
-
-    This is the second copy of this helper in the package (`runners.py` has the
-    first). It belongs in `chrome.py`, which this leg may not touch; see the
-    baton.
-    """
-    if sum(len(text) for text, _ in parts) <= width:
-        return list(parts)
-    room = max(0, width - len(ellipsis))
-    fitted, spent = [], 0
-    for text, token in parts:
-        if spent >= room:
-            break
-        text = text[:room - spent]
-        if text:
-            fitted.append((text, token))
-            spent += len(text)
-    fitted.append((ellipsis, theme_tokens.MUTED))
-    return fitted

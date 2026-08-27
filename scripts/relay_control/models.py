@@ -243,7 +243,7 @@ def _toggle_cell(text, problem, theme):
 def _problem_row(theme, key, problem, width, ellipsis):
     """The row that says a whole `dashboard.json` key is the wrong shape."""
     glyph, attr = theme.status("failed")
-    return _row(_clip_parts(
+    return _row(chrome.fit_parts(
         [("%s %s is unreadable: a %s, not an object" % (glyph, key, problem),
           attr)], width, ellipsis))
 
@@ -289,32 +289,6 @@ def _fit(rows, height):
         if not shown or not shown[-1]["heading"]:
             return shown, len(dense) - len(shown)
         dense = [row for row in dense if row is not shown[-1]]
-
-
-def _clip_parts(parts, width, ellipsis):
-    """`parts` cut to `width` cells, with the cut marked once, in the theme's
-    own ellipsis.
-
-    A row left to `Canvas.write()` to clip is cut with the literal `…` that
-    `chrome.clip()` defaults to, which curses drops to a blank under a locale
-    that cannot encode it — a silent truncation wearing a mark's clothes. And a
-    cell is kept back for the mark before it is spent, because `chrome.clip()`
-    returns `text[:width]` with no mark at all when it is left fewer cells than
-    the ellipsis is wide.
-    """
-    if sum(len(text) for text, _ in parts) <= width:
-        return list(parts)
-    room = max(0, width - len(ellipsis))
-    fitted, spent = [], 0
-    for text, token in parts:
-        if spent >= room:
-            break
-        text = text[:room - spent]
-        if text:
-            fitted.append((text, token))
-            spent += len(text)
-    fitted.append((ellipsis, theme_tokens.MUTED))
-    return fitted
 
 
 def _cells(roles, theme):
@@ -391,19 +365,20 @@ def _body_rows(model, pane, state):
 
     cells = _cells(roles, theme)
     kept, widths = _kept(cells, width)
-    rows.append(_row(_clip_parts(
+    rows.append(_row(chrome.fit_parts(
         _grid_parts({name: (name, theme_tokens.MUTED) for name in kept},
                     kept, widths),
         width, ellipsis), heading=True))
     for (_label, reason, _name, _effort), values in zip(roles, cells):
-        rows.append(_row(_clip_parts(_grid_parts(values, kept, widths),
-                                     width, ellipsis)))
-        rows.append(_row(_clip_parts([(INDENT + reason, theme_tokens.MUTED)],
-                                     width, ellipsis)))
+        rows.append(_row(chrome.fit_parts(_grid_parts(values, kept, widths),
+                                          width, ellipsis)))
+        rows.append(_row(chrome.fit_parts(
+            [(INDENT + reason, theme_tokens.MUTED)], width, ellipsis)))
 
     rows.append(_BLANK)
-    rows.append(_row(_clip_parts([(TOGGLES_HEADING, theme_tokens.PANE_TITLE)],
-                                 width, ellipsis), heading=True))
+    rows.append(_row(chrome.fit_parts(
+        [(TOGGLES_HEADING, theme_tokens.PANE_TITLE)], width, ellipsis),
+        heading=True))
     rows.extend(_toggle_rows(model, pane, state, width, ellipsis))
     return rows
 
@@ -433,7 +408,7 @@ def _toggle_rows(model, pane, state, width, ellipsis):
             parts = [(text, theme_tokens.SELECTED) for text, _ in parts]
             if drawn < width:
                 parts.append((" " * (width - drawn), theme_tokens.SELECTED))
-        rows.append(_row(_clip_parts(parts, width, ellipsis)))
+        rows.append(_row(chrome.fit_parts(parts, width, ellipsis)))
     return rows
 
 

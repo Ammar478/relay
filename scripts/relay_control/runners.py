@@ -187,8 +187,8 @@ def _draw_filters(pane, counts, chosen, runners):
         parts.append(("%s (%d)" % (label, _count(counts, key, runners, status)),
                       theme_tokens.SELECTED if index == chosen
                       else theme_tokens.MUTED))
-    pane.segments(0, _fit_parts(parts, pane.body_width,
-                                pane.theme.glyph("ellipsis")))
+    pane.segments(0, chrome.fit_parts(parts, pane.body_width,
+                                      pane.theme.glyph("ellipsis")))
 
 
 def _draw_table(pane, rows, active):
@@ -307,15 +307,16 @@ def _table_width(kept, widths):
 
 def _label_segments(kept, widths, theme, width):
     ellipsis = theme.glyph("ellipsis")
-    return _fit_parts(_segments(
+    return chrome.fit_parts(_segments(
         [(key, (COLUMNS_BY_KEY[key].label, theme_tokens.MUTED))
          for key in kept], widths, ellipsis), width, ellipsis)
 
 
 def _row_segments(row, kept, widths, theme, width):
     ellipsis = theme.glyph("ellipsis")
-    return _fit_parts(_segments([(key, row[key]) for key in kept], widths,
-                                ellipsis), width, ellipsis)
+    return chrome.fit_parts(
+        _segments([(key, row[key]) for key in kept], widths, ellipsis),
+        width, ellipsis)
 
 
 def _segments(pairs, widths, ellipsis="…"):
@@ -333,36 +334,6 @@ def _segments(pairs, widths, ellipsis="…"):
             text = text.ljust(widths[key])
         parts.append((text, token))
     return parts
-
-
-def _fit_parts(parts, width, ellipsis):
-    """`parts` cut to `width` cells, with the cut marked once, in the theme's own
-    ellipsis.
-
-    A row left to `Canvas.write()` to clip is cut with the literal `…` that
-    `chrome.clip()` defaults to, and curses drops that to a blank under a
-    locale that cannot encode it — a silent truncation, which is the one thing
-    this package never does. Narrow terminals reach this on the filter row
-    before they reach it anywhere else: four labels and four counts are wider
-    than 40 cells whatever the table does.
-    """
-    if sum(len(text) for text, _ in parts) <= width:
-        return list(parts)
-    # One mark, at the end, and a cell kept for it: `chrome.clip()` drops the
-    # mark rather than the character when it is left a single cell to work in,
-    # and a row that ends one filter short with nothing to show for it is the
-    # silent truncation again.
-    room = max(0, width - len(ellipsis))
-    fitted, spent = [], 0
-    for text, token in parts:
-        if spent >= room:
-            break
-        text = text[:room - spent]
-        if text:
-            fitted.append((text, token))
-            spent += len(text)
-    fitted.append((ellipsis, theme_tokens.MUTED))
-    return fitted
 
 
 COLUMNS_BY_KEY = {column.key: column for column in COLUMNS}
