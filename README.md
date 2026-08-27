@@ -1,9 +1,9 @@
 # Relay
 
 A Claude Code skill for running a long-horizon build as a supervised relay: write
-the acceptance contract before any code, break the work into legs, run one leg at
-a time with a fresh agent each time, and gate every stage behind adversarial
-judges until every check passes.
+the acceptance contract before any code, break the work into legs, run every leg
+with a fresh agent and fan out where their files are disjoint, and gate every
+stage behind adversarial judges until every check passes.
 
 The problem it solves is not that models write bad code. It is that a human
 cannot supervise a twelve-hour build by reading every diff. Relay is a structure
@@ -20,9 +20,10 @@ Everything else in the skill is machinery for these.
 implementation exists to bias it. Tests written afterward confirm decisions; they
 do not catch bugs.
 
-**One runner on the track. Readers fan out.** Anything that mutates state runs
-strictly serially. Anything read-only — search, research, review — runs in
-parallel. Concurrency is a property of the operation, not the schedule.
+**One runner on the track — the track being the files.** The serial rule exists to
+stop two runners making conflicting architectural choices, so it binds only legs
+that share files. Legs whose file sets are disjoint run in parallel from the first
+leg on, and read-only work — search, research, review — always fans out.
 
 **The baton carries state, not the conversation.** Every leg gets a fresh agent
 that reads state from disk and writes results back. No trajectory is carried
@@ -49,8 +50,35 @@ Web UI plus a JSON API. Node 22, zero dependencies.
 It asks a batch of scoping questions, researches, writes the contract, plans the
 legs — then **stops at an approval gate**. Nothing executes until you say go.
 
-After that you supervise rather than co-write. Open `.relay/control.html` in a
-browser and refresh it as the run progresses:
+After that you supervise rather than co-write.
+
+## Watching a run
+
+**Relay Control** is a terminal dashboard over the live `.relay/` directory. Run
+it from anywhere — it opens the relay it finds from the working directory:
+
+```bash
+~/.claude/skills/relay/relay-control
+```
+
+Name a relay to watch another project's run, either the relay directory or the
+project above it:
+
+```bash
+~/.claude/skills/relay/relay-control ~/work/some-project
+```
+
+Inside a Claude Code session, `/relay-control` prints a snapshot of the relay
+into the conversation — phase, leg and check counts, the active leg, the
+attention items — plus that shell line. It reports; it cannot hand your terminal
+to a full-screen program, so the live view is always something you open
+yourself. Link the skill once to get the command:
+
+```bash
+ln -s ~/.claude/skills/relay/skills/relay-control ~/.claude/skills/relay-control
+```
+
+There is also a static HTML dashboard, for a snapshot you can keep or share:
 
 ```bash
 python3 ~/.claude/skills/relay/scripts/render_dashboard.py --relay-dir .relay
@@ -68,7 +96,7 @@ changed"*. There are no buttons.
 | **relay** | The whole run, from objective to shipped |
 | **leg** | One bounded unit of work, finishable by one fresh agent in one context |
 | **stage** | A group of legs worth judging together; *cleared* once all its checks pass |
-| **check** | One testable behavioural claim, ID `ACC-<AREA>-<NNN>` |
+| **check** | One testable claim, ID `ACC-<AREA>-<NNN>` — behavioural unless marked `Convention` |
 | **coach** | Plans, hands out legs, disposes of batons, holds the gates |
 | **runner** | A fresh agent that runs exactly one leg |
 | **judge** | A fresh agent that verifies, having never seen the code written |
@@ -82,7 +110,7 @@ changed"*. There are no buttons.
 | 1 · Contract | Testable behavioural checks with stable IDs and named evidence |
 | 2 · Plan | Legs grouped into stages; every check claimed by exactly one leg |
 | 3 · Approve | **The run stops here.** Nothing executes without an explicit go |
-| 4 · Run | Fresh runner per leg: tests first, implement, verify, commit, write a baton |
+| 4 · Run | Fresh runner per leg, legs with disjoint file sets in parallel: tests first, implement, verify, commit, write a baton |
 | 5 · Judge | Code judge and behaviour judge, in parallel, with no implementation history |
 | 6 · Fix | Failures become fix legs at the head of the queue. Repeat until clear |
 | 7 · Finish | Checks passed, rounds per stage, accepted debt, what to look at first |
@@ -128,12 +156,16 @@ than no dashboard, because it makes real progress look like broken tooling.
 SKILL.md                    the loop the coach follows
 references/
   research.md               deep-search loop and gap analysis
-  execution.md              runner briefings, batons, recovery plays
+  execution.md              briefings, batons, parallel runners, recovery plays
   validation.md             writing checks that hold up, and the two judges
   dashboard.md              Relay Control: when to render, what to write
 templates/                  relay.md contract.md legs.json state.json baton.md
 assets/control.html         dashboard template
 scripts/render_dashboard.py fills the template from .relay/ state
+relay-control               opens the live terminal dashboard
+scripts/relay_model.py      the one reader of .relay/; everything else asks it
+scripts/relay_control/      the terminal dashboard itself
+skills/relay-control/       the /relay-control skill, linked into ~/.claude/skills
 ```
 
 ## Origin

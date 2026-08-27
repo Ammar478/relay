@@ -216,6 +216,113 @@ def test_bold_and_reverse_are_recorded_separately():
     assert frame.attrs_at(0, 0).reverse is False
 
 
+# --------------------------------------------------------------------------
+# The SGR flag tables, stated here rather than read from the module
+#
+# `_SGR_ON` and `_SGR_OFF` are tables carrying the answer, and the tests that
+# claimed to check them read their expectation out of the same tables — so
+# every entry outside the three or four a curses app happens to send could be
+# changed with a green suite. What follows is ECMA-48 SGR written out by hand:
+# if the module stops agreeing with it, these fail.
+#
+# 6 is "rapid blink", which no terminal has distinguished from 5 in decades;
+# both are recorded as one flag, because a frame is what a human would see.
+# 26 is "proportional spacing", which turns nothing off — it is here so that
+# a table entry meaning "clear nothing" is checked to clear nothing.
+# --------------------------------------------------------------------------
+
+SGR_SETS_FLAG = {
+    1: "bold",
+    2: "dim",
+    3: "italic",
+    4: "underline",
+    5: "blink",
+    6: "blink",
+    7: "reverse",
+    8: "invisible",
+    9: "strike",
+}
+SGR_CLEARS_FLAGS = {
+    22: ("bold", "dim"),
+    23: ("italic",),
+    24: ("underline",),
+    25: ("blink",),
+    26: (),
+    27: ("reverse",),
+    28: ("invisible",),
+    29: ("strike",),
+}
+ALL_FLAGS = frozenset(SGR_SETS_FLAG.values())
+EVERY_FLAG_ON = "\x1b[" + ";".join(str(code) for code in sorted(SGR_SETS_FLAG)) + "m"
+
+
+@pytest.mark.parametrize("code,flag", sorted(SGR_SETS_FLAG.items()))
+def test_each_sgr_flag_parameter_sets_the_flag_it_names_and_no_other(code, flag):
+    attrs = feed("\x1b[%dmX" % code).frame().attrs_at(0, 0)
+    assert attrs.flags == frozenset({flag}), (
+        "SGR %d is %r in ECMA-48; the harness recorded %s"
+        % (code, flag, attrs.describe())
+    )
+    assert attrs.fg is None and attrs.bg is None and attrs.other == frozenset()
+
+
+@pytest.mark.parametrize("code,cleared", sorted(SGR_CLEARS_FLAGS.items()))
+def test_each_sgr_off_parameter_clears_the_flags_it_names_and_no_other(
+    code, cleared
+):
+    """Every flag on first, so a table entry that clears too much shows up.
+
+    Checking `ESC[22m` against a cell that was only bold cannot tell "clears
+    bold and dim" from "clears everything".
+    """
+    attrs = feed(EVERY_FLAG_ON + "\x1b[%dmX" % code).frame().attrs_at(0, 0)
+    assert attrs.flags == ALL_FLAGS - frozenset(cleared), (
+        "SGR %d turns off %s in ECMA-48; the harness left %s"
+        % (code, cleared or "nothing", attrs.describe())
+    )
+
+
+def test_every_flag_sgr_can_set_is_a_name_the_assertions_accept():
+    """`assert_attrs(has=...)` refuses a name it does not know — so the names
+    it knows have to be exactly the ones a program can actually turn on.
+
+    A flag the emulator records under a name the assertion helpers reject is
+    unassertable; a name they accept that no SGR parameter produces is an
+    assertion that can never be true.
+    """
+    frame = feed(EVERY_FLAG_ON + "X").frame()
+    for flag in sorted(ALL_FLAGS):
+        frame.assert_attrs("X", has=flag)
+    with pytest.raises(ValueError) as excinfo:
+        frame.assert_attrs("X", has="rapidblink")
+    listed = str(excinfo.value).rsplit(":", 1)[1]
+    assert sorted(name.strip() for name in listed.split(",")) == sorted(ALL_FLAGS)
+
+
+def test_a_parameter_that_is_not_a_number_is_not_parameter_zero():
+    """An OMITTED parameter is 0, and 0 is a reset. One that is *there* and is
+    not a number is neither.
+
+    Reading the second as the first turned an unknown parameter into a full
+    reset: the model dropped attributes the terminal was still showing, so
+    `assert_attrs(..., has="bold")` failed and `lacks="bold"` passed, both
+    about a screen that never existed. Unknown parameters are recorded in
+    `other` and obeyed by nothing — the rule this file already states, applied
+    to the one shape that was exempt from it.
+    """
+    kept = feed("\x1b[1;7;99m\x1b[1;>2mSTILL").frame().attrs_for("STILL")
+    assert kept.bold is True and kept.reverse is True
+    assert kept.other == frozenset({99, ">2"})
+    # ...and both reach a failure message, which is where a reader meets them:
+    # an unreadable parameter sits in the same set as an unmodelled numeric one
+    assert kept.describe() == "bold+reverse other=99,>2"
+    # while the omitted parameter really does still reset, either spelling
+    assert feed("\x1b[1;7m\x1b[mPLAIN").frame().attrs_for("PLAIN") \
+        == DEFAULT_ATTRS
+    assert feed("\x1b[1;7m\x1b[0mPLAIN").frame().attrs_for("PLAIN") \
+        == DEFAULT_ATTRS
+
+
 def test_sgr_reset_returns_cells_to_default():
     for reset in ("\x1b[0m", "\x1b[m"):
         screen = feed("\x1b[1;31;44mHOT" + reset + "COLD")
@@ -244,6 +351,20 @@ def test_colon_and_semicolon_extended_colour_agree():
     semi = feed("\x1b[38;5;214mX").frame().attrs_at(0, 0)
     colon = feed("\x1b[38:5:214mX").frame().attrs_at(0, 0)
     assert semi.fg == colon.fg == (38, 5, 214)
+
+
+def test_colour_index_zero_is_a_colour_and_not_an_absent_parameter():
+    """`0` is the number zero, everywhere a parameter is read.
+
+    Palette entry 0 is a colour a pane background is plausibly drawn with, and
+    an all-zero parameter treated as "no parameter" drops it out of the tuple —
+    `(38, 5)` instead of `(38, 5, 0)` — so the cell records a colour nobody
+    could have asked for.
+    """
+    assert feed("\x1b[38:5:0mX").frame().attrs_at(0, 0).fg == (38, 5, 0)
+    assert feed("\x1b[48:5:0mX").frame().attrs_at(0, 0).bg == (48, 5, 0)
+    assert feed("\x1b[38;5;0mX").frame().attrs_at(0, 0).fg == (38, 5, 0)
+    assert feed("\x1b[38:2:0:0:0mX").frame().attrs_at(0, 0).fg == (38, 2, 0, 0, 0)
     itu = feed("\x1b[38:2::10:20:30mX").frame().attrs_at(0, 0)
     assert itu.fg == (38, 2, 10, 20, 30)
 

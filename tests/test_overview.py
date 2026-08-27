@@ -32,6 +32,7 @@ Four rules this file follows, all of them paid for by an earlier leg:
 """
 
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -40,8 +41,11 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from frame import display_width  # noqa: E402
+
 from test_chrome import (  # noqa: E402
-    FIXTURES, STANDARD, WIDE, frame_of, leg_figures, session,
+    FIXTURES, STANDARD, UTF8_ENV, WIDE, frame_of, leg_figures, repaint,
+    session,
 )
 
 import relay_model  # noqa: E402
@@ -782,3 +786,385 @@ def test_the_highlighted_row_stops_at_the_pane_edge(relay, size):
         "the highlight runs past the pane's right edge")
     assert max(reversed_cells) < frame.cols - 1, frame._message(
         "the highlight reaches the reserved last column")
+
+
+# --------------------------------------------------------------------------
+# Width is measured in cells, not in characters
+#
+# `chrome.cell_width()` is the package's one measure. Two sites in this module
+# were still counting Python characters — the highlight the Legs pane pads
+# across its width, and the gap `_step_row` leaves between a verification step
+# and its result — and neither could be seen by any width assertion: a `Pane`
+# clips every write to its own rectangle, so a row built twice as wide as the
+# pane reaches the screen *truncated* rather than overrunning it.
+#
+# What sees it is a control relay. The two relays below differ in one thing:
+# whether their prose is drawn in one cell per character or two. They carry the
+# same number of *cells*, so a pane that measures cells draws them into the
+# same columns, and a pane that measures characters draws the wide one at half
+# the width it paints.
+# --------------------------------------------------------------------------
+
+#: Nine ideographs — eighteen cells, nine characters — and an ASCII leg id of
+#: the same eighteen cells.
+CJK_ID = "日本語で書かれた脚"
+PLAIN_ID = "x" * 18
+
+#: A verification step naming a check `state.json` records as passed, so the
+#: row carries a result to be pushed off the end of. Twenty-three cells either
+#: way; eighteen characters against twenty-three.
+CELL_CHECK = "ACC-CELL-001"
+CJK_STEP = CELL_CHECK + " の検証手順"
+PLAIN_STEP = CELL_CHECK + " " + "y" * 10
+
+#: A step far wider than any pane, so the row has to be cut and the result kept.
+LONG_CJK_STEP = CELL_CHECK + " " + "検証" * 60
+
+#: The result `state.json` gives that check, as the Active Runner pane spells
+#: it. Written out here rather than read from the module.
+CELL_RESULT = "passed"
+
+#: The theme's mark for a cut, under the UTF-8 locale `session()` forces.
+ELLIPSIS = "…"
+
+
+def cells_relay(directory, leg_id, step, goal="a goal with nothing odd in it"):
+    """A one-leg relay whose leg id and verification step are what is passed.
+
+    Everything else is held constant, so two of these differ only in the one
+    field a test is measuring — which is what makes "the same cells, the same
+    columns" a statement about the renderer rather than about the fixture.
+    """
+    directory = Path(directory)
+    (directory / "batons").mkdir(parents=True, exist_ok=True)
+    (directory / "legs.json").write_text(json.dumps({
+        "relay": "cells",
+        "stages": [{"id": "S1", "name": "Only stage", "legs": [leg_id]}],
+        "legs": [{"id": leg_id, "stage": "S1", "goal": goal,
+                  "fulfills": [CELL_CHECK], "verification": [step],
+                  "status": "running"}],
+    }))
+    (directory / "state.json").write_text(json.dumps({
+        "relay": "cells", "phase": "running", "currentStage": "S1",
+        "currentLeg": leg_id,
+        "checks": {CELL_CHECK: {"status": "passed", "stage": "S1"}},
+    }))
+    (directory / "dashboard.json").write_text(json.dumps(
+        {"title": "Cells relay", "path": str(directory)}))
+    return directory
+
+
+def highlight_span(frame):
+    """`(row, first, last)` — the one reverse-video run on this screen.
+
+    `theme.SELECTED` is the only token that reaches a colour terminal as
+    reverse video, so the run is the highlight and nothing else. Read as
+    *columns* off `attrs_at()`: a string index into a line carrying
+    double-width text is not the column the terminal drew at.
+    """
+    found = [(row, col) for row in range(frame.rows)
+             for col in range(frame.cols) if frame.attrs_at(row, col).reverse]
+    assert found, frame._message("nothing on this screen is highlighted")
+    rows = sorted({row for row, _ in found})
+    assert len(rows) == 1, frame._message(
+        "rows %r are highlighted; the Overview highlights the running leg and "
+        "nothing else" % rows)
+    columns = [col for _, col in found]
+    return rows[0], min(columns), max(columns)
+
+
+def painted_columns(frame, row):
+    """Every column of `row` with something in it — columns, not characters."""
+    return [col for col, cell in enumerate(frame.cells[row]) if cell.strip()]
+
+
+def last_row_containing(frame, needle):
+    """The *last* row carrying `needle`.
+
+    A leg's verification step is drawn twice: once in the Active Leg pane's
+    `Verification` list and once in the Active Runner pane, which is the one
+    that carries the step's result. The Active Runner pane is the bottom one at
+    every size, so the last match is its copy.
+    """
+    rows = [row for row in range(frame.rows) if needle in frame.lines[row]]
+    assert rows, frame._message("no row carries %r" % needle)
+    return rows[-1]
+
+
+def test_a_double_width_leg_id_pads_its_highlight_to_the_pane_and_no_further(
+        tmp_path):
+    """ACC-OVER-003's highlight, on a leg id a terminal draws two cells wide.
+
+    The Legs pane padded the running row with `str.ljust()`, which counts
+    characters: nine ideographs are eighteen cells, so the row was padded out
+    to the pane's width in *characters* and reached it in twice as many cells.
+    `Canvas.write()` cut the row back, and the running leg's row — the one
+    thing on the Overview that says where the relay is — ended in an ellipsis
+    marking the truncation of its own blank padding.
+    """
+    wide = frame_of(cells_relay(tmp_path / "wide", CJK_ID, CJK_STEP), size=WIDE)
+    plain = frame_of(cells_relay(tmp_path / "plain", PLAIN_ID, PLAIN_STEP),
+                     size=WIDE)
+    assert wide.contains(CJK_ID), wide._message(
+        "the double-width leg id was not drawn at all — this proves nothing")
+
+    row, first, last = highlight_span(wide)
+    assert (row, first, last) == highlight_span(plain), wide._message(
+        "the highlight covers %r on a relay whose leg id is eighteen cells "
+        "wide and %r on one whose id is the same eighteen cells of ASCII"
+        % ((row, first, last), highlight_span(plain)))
+    assert ELLIPSIS not in wide.lines[row], wide._message(
+        "the highlighted row was cut: the padding was measured in characters "
+        "and spent in cells, so the row ran past the pane and came back with "
+        "a mark on it")
+    assert last == wide.cols - 2, wide._message(
+        "the highlight ends at column %d; the pane runs to the column before "
+        "the one the chrome reserves, which is %d"
+        % (last, wide.cols - 2))
+    wide.assert_within_width()
+
+
+@pytest.mark.parametrize("size", [WIDE, (48, 60)])
+def test_a_double_width_verification_step_keeps_its_result_on_the_row(
+        size, tmp_path):
+    """ACC-OVER-005: the step, and its last known result beside it.
+
+    `_step_row` spends the row on the lead, the step and the result and puts
+    what is left between the last two. Measured with `len()` the step is
+    charged half what it costs, so the gap is written twice as wide as the row
+    has room for — and what `Canvas.write()` then cuts off the end is the
+    result, which is the one thing the row exists to report.
+    """
+    wide = frame_of(cells_relay(tmp_path / "wide", CJK_ID, CJK_STEP), size=size)
+    plain = frame_of(cells_relay(tmp_path / "plain", PLAIN_ID, PLAIN_STEP),
+                     size=size)
+    wide_row = last_row_containing(wide, CELL_CHECK)
+    plain_row = last_row_containing(plain, CELL_CHECK)
+    assert wide.lines[wide_row].rstrip().endswith(CELL_RESULT), wide._message(
+        "the Active Runner's step row reads %r — the result was pushed off "
+        "the end of a row measured in characters"
+        % wide.lines[wide_row].rstrip())
+    assert (painted_columns(wide, wide_row)[-1]
+            == painted_columns(plain, plain_row)[-1]), wide._message(
+        "the step row ends at column %d against %d for the same row in cells "
+        "of ASCII" % (painted_columns(wide, wide_row)[-1],
+                      painted_columns(plain, plain_row)[-1]))
+    assert wide_row == plain_row, wide._message(
+        "double-width prose moved the Active Runner pane's rows")
+    wide.assert_within_width()
+
+
+def test_a_step_too_wide_for_the_pane_is_cut_and_still_reports_its_result(
+        tmp_path):
+    """The cut is the step's, never the result's.
+
+    A step of a hundred and twenty cells cannot fit any pane here, so the row
+    has to be cut — and `_step_row` reserves the result before it spends the
+    row on the step, so what carries the mark is the step.
+    """
+    frame = frame_of(cells_relay(tmp_path / "long", CJK_ID, LONG_CJK_STEP),
+                     size=WIDE)
+    row = last_row_containing(frame, CELL_CHECK)
+    line = frame.lines[row].rstrip()
+    assert line.endswith(CELL_RESULT), frame._message(
+        "the cut took the result: %r" % line)
+    assert ELLIPSIS in line, frame._message(
+        "a step of a hundred and twenty cells was drawn with no mark saying "
+        "it had been cut: %r" % line)
+    frame.assert_within_width()
+
+
+#: Every size the Overview is swept at with double-width prose. `session()`
+#: waits on `q Quit`, which the keybar still draws at five rows and twenty
+#: columns; below that the wait has nothing to land on and `tests/test_chrome.py`
+#: makes the same claim through a bare `TerminalSession`.
+CELLS_SIZES = [WIDE, STANDARD, (12, 40), (8, 30), (5, 20)]
+
+
+@pytest.mark.parametrize("size", CELLS_SIZES)
+def test_double_width_prose_degrades_without_reaching_the_reserved_column(
+        size, tmp_path):
+    """Degrade, not crash — with every rectangle measured in cells.
+
+    The relay's goal, leg id and verification step are all drawn two columns
+    per character, so every width computation in this module is spending twice
+    what `len()` would have said. The claim is the strict one: nothing wrapped,
+    and the column the chrome reserves is empty, which is what lets every other
+    frame test in the repository be certified rather than waved through.
+    """
+    relay = cells_relay(tmp_path / "small", CJK_ID, LONG_CJK_STEP,
+                        goal="日本語で書かれた目標" * 6)
+    term = session(relay, size=size)
+    try:
+        frame = repaint(term)
+    finally:
+        term.close()
+    frame.assert_finished()
+    assert frame.paint_end == "synchronised", frame._message(
+        "captured on %r — a repaint this program did not vouch for"
+        % frame.paint_end)
+    assert "Traceback" not in frame.text, frame._message("the TUI raised")
+    assert [row[frame.cols - 1] for row in frame.cells] == [" "] * frame.rows, (
+        frame._message("something reached the column the chrome reserves"))
+    frame.assert_within_width()
+
+
+def test_a_step_the_view_cut_itself_says_so_under_a_locale_without_the_mark(
+        tmp_path):
+    """`LC_ALL=C` is the only screen that separates the two cuts.
+
+    Under UTF-8 a cut made by `Canvas.write()` and a cut made by `_step_row`
+    both end in `…` and no assertion can tell them apart. Under a locale that
+    cannot encode it, curses drops the canvas's default mark to a *blank* —
+    a silent truncation wearing a mark's clothes — while the theme's degrades
+    to `...`. The row is the view's own cut, so it has to carry the theme's.
+    """
+    env = {key: value for key, value in os.environ.items()
+           if key not in ("LC_ALL", "LC_CTYPE", "LANG")}
+    env["LC_ALL"] = "C"
+    relay = cells_relay(tmp_path / "ascii-mark", "plain-leg",
+                        CELL_CHECK + " " + "y" * 400)
+    term = session(relay, size=WIDE, env=env)
+    try:
+        frame = repaint(term)
+    finally:
+        term.close()
+    row = last_row_containing(frame, CELL_CHECK)
+    line = frame.lines[row].rstrip()
+    assert line.endswith(CELL_RESULT), frame._message(
+        "the cut took the result rather than the step: %r" % line)
+    assert "..." in line, frame._message(
+        "the step was cut with no mark this locale can draw: %r" % line)
+    assert UTF8_ENV["LC_ALL"] != "C", (
+        "the UTF-8 environment this file's other tests run under is itself C, "
+        "so this test says nothing about the difference between the two")
+    frame.assert_within_width()
+
+
+#: The glyphs this module measures, spelled here rather than read from
+#: `theme.GLYPHS`. The child runs under a UTF-8 locale, so these are what
+#: reaches the screen.
+PANE_GLYPHS = ("✓", "●", "○", "✗", "−", "·")
+
+#: Every word the Active Runner pane can put beside a verification step. The
+#: first four are what the model normalises a check's status to (ACC-DATA-004);
+#: the last is this view's own literal for a step nothing has judged.
+STEP_RESULTS = ("passed", "failed", "blocked", "pending", "no result recorded")
+
+
+def test_the_two_measures_this_pane_cannot_tell_apart_are_one_cell_wide(
+        tmp_path):
+    """Where `len()` and `chrome.cell_width()` provably agree, and why.
+
+    Two of this module's widths are measured over text that cannot be
+    double-width, so swapping the measure there is a mutation no frame can
+    fail on. They are equivalent — and this is the check that keeps them
+    equivalent rather than an argument that they are:
+
+    * **the glyphs come from `theme.GLYPHS`, which is data.** A table that grew
+      a two-cell mark would make the two measures differ, and the row a step or
+      a boundary is drawn on would be one cell longer than the pane. That is a
+      failure here rather than a truncation on a screen.
+    * **the word beside a verification step is a check's status**, and the
+      model normalises every spelling a coach can write to one of four ASCII
+      words. Asserted against a relay whose `state.json` says `済んだ判定`,
+      which is exactly the input that would otherwise reach `_step_row` as
+      prose.
+    """
+    for glyph in PANE_GLYPHS:
+        assert display_width(glyph) == len(glyph) == 1, (
+            "%r is %d cells and %d characters, so the rows this module spaces "
+            "from it are measured two different ways"
+            % (glyph, display_width(glyph), len(glyph)))
+    for word in STEP_RESULTS:
+        assert display_width(word) == len(word), (
+            "%r is not one cell per character" % word)
+
+    directory = tmp_path / "cjk-status"
+    (directory / "batons").mkdir(parents=True, exist_ok=True)
+    (directory / "legs.json").write_text(json.dumps({
+        "relay": "cells",
+        "stages": [{"id": "S1", "name": "Only stage", "legs": ["leg"]}],
+        "legs": [{"id": "leg", "stage": "S1", "goal": "a goal",
+                  "fulfills": [CELL_CHECK], "verification": [CJK_STEP],
+                  "status": "running"}]}))
+    (directory / "state.json").write_text(json.dumps({
+        "relay": "cells", "phase": "running", "currentStage": "S1",
+        "currentLeg": "leg",
+        "checks": {CELL_CHECK: {"status": "済んだ判定", "stage": "S1",
+                                "round": 1}}}))
+    statuses = {check.get("status")
+                for check in relay_model.build(str(directory))["checks"]}
+    assert statuses <= set(STEP_RESULTS), (
+        "the model let %r through to the view, so the word this pane measures "
+        "is coach prose after all and `len()` is not safe on it"
+        % sorted(statuses - set(STEP_RESULTS)))
+
+
+#: A boundary of one-character words, so `wrap()` fills each line to the last
+#: cell it is given rather than stopping short at a word break. Two cells of
+#: bullet in front of a line wrapped to the *pane's* width instead of to what
+#: is left of it is two cells past the pane, and the difference between the two
+#: is invisible on prose whose words happen not to land on the edge.
+BOUNDARY_MARK = "START"
+BOUNDARY = BOUNDARY_MARK + " " + " ".join("abcdefghij"[index % 10]
+                                          for index in range(150))
+
+#: 80 columns stacks the Overview into one column, so a screen row belongs to
+#: exactly one pane and can be measured whole.
+STACKED = (48, 80)
+
+
+def boundary_relay(directory):
+    directory = Path(directory)
+    (directory / "batons").mkdir(parents=True, exist_ok=True)
+    (directory / "legs.json").write_text(json.dumps({
+        "relay": "cells",
+        "stages": [{"id": "S1", "name": "Only stage", "legs": ["leg"]}],
+        "legs": [{"id": "leg", "stage": "S1", "goal": "short goal",
+                  "status": "running", "fulfills": [],
+                  "boundaries": [BOUNDARY]}]}))
+    (directory / "state.json").write_text(json.dumps({
+        "relay": "cells", "phase": "running", "currentStage": "S1",
+        "currentLeg": "leg", "checks": {}}))
+    (directory / "dashboard.json").write_text(json.dumps(
+        {"title": "Cells relay", "path": str(directory)}))
+    return directory
+
+
+def test_a_wrapped_boundary_stays_inside_the_pane_and_under_its_own_bullet(
+        tmp_path):
+    """ACC-OVER-001's list, and the two cells the bullet costs it.
+
+    The bullet's width is subtracted from the line and spent again as the
+    indent under it, so the row is the pane's width exactly — on the bullet's
+    row and on every row that continues it. Wrap the line to the whole pane and
+    each row is two cells too long; indent a continuation by anything else and
+    the sentence steps sideways halfway through. `Pane` clips either one back,
+    so what is left on the screen is a mark on a row that had nothing cut from
+    it, and a list that no longer reads as a list.
+    """
+    frame = frame_of(boundary_relay(tmp_path / "boundary"), size=STACKED)
+    head = frame.find("Boundaries")
+    assert head is not None, frame._message("the pane drew no Boundaries list")
+    rows = []
+    for row in range(head + 1, frame.rows):
+        if not frame.lines[row].strip() or set(frame.lines[row].strip()) == {"─"}:
+            break
+        rows.append(row)
+    assert len(rows) >= 3, frame._message(
+        "the boundary occupies %d rows; it has to wrap at least twice for "
+        "this to say anything" % len(rows))
+
+    for row in rows:
+        assert ELLIPSIS not in frame.lines[row], frame._message(
+            "row %d carries a mark saying it was cut, on a boundary that was "
+            "wrapped to fit: %r" % (row, frame.lines[row]))
+
+    text_at = frame.lines[rows[0]].index(BOUNDARY_MARK)
+    for row in rows[1:]:
+        assert painted_columns(frame, row)[0] == text_at, frame._message(
+            "row %d continues the boundary from column %d; the sentence "
+            "starts at column %d on the row above"
+            % (row, painted_columns(frame, row)[0], text_at))
+    frame.assert_within_width()

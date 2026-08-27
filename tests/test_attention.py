@@ -50,7 +50,7 @@ sys.path.insert(0, str(SCRIPTS))
 from frame import TerminalSession  # noqa: E402
 
 import relay_model  # noqa: E402
-from relay_control import attention, chrome  # noqa: E402
+from relay_control import app, attention, chrome  # noqa: E402
 
 # The keybar is drawn on every view at every size, so it is the one needle that
 # always means "the program has painted a screen".
@@ -114,6 +114,29 @@ def frame_of(relay_dir, size=WIDE, **kwargs):
     term = session(relay_dir, size=size, **kwargs)
     try:
         return term.frame()
+    finally:
+        term.close()
+
+
+#: A key nothing binds: the loop reads it, changes nothing, and repaints.
+IDLE_KEY = "z"
+
+
+def repaint(term, expect=READY):
+    """A frame the program proved whole (DEC 2026), off a no-op keystroke.
+
+    See `tests/test_chrome.py`'s copy for why a frame taken any other way
+    cannot carry the proof: `start()` has already read the first paint's
+    bracket by the time a wait takes its baseline.
+    """
+    return term.send(IDLE_KEY, expect=expect)
+
+
+def proved_frame_of(relay_dir, size=WIDE, **kwargs):
+    """`frame_of`, but a frame the program stated was whole."""
+    term = session(relay_dir, size=size, **kwargs)
+    try:
+        return repaint(term)
     finally:
         term.close()
 
@@ -481,7 +504,10 @@ def test_every_row_the_band_lays_out_stops_short_of_the_last_column(width):
 def test_it_degrades_below_80x24_without_crashing(size):
     term = session(AGENT_SERVICE, size=size)
     try:
-        frame = term.frame()
+        # Every assertion below is negative, and every one of them passes on a
+        # screen the program had not finished. So the frame is one it proved.
+        frame = repaint(term)
+        frame.assert_finished()
         assert "Traceback" not in frame.text, frame._message("the TUI raised")
         frame.assert_within_width()
         assert frame.text.strip(), frame._message("nothing was drawn at all")
@@ -529,6 +555,11 @@ def test_the_band_belongs_to_the_overview_and_to_no_other_view():
     term = session(AGENT_SERVICE, size=WIDE)
     try:
         legs = term.send("F", expect="Esc Overview")
+        # The barrier says the frame is the Legs view's; `assert_finished()`
+        # says the program had *finished* drawing it. Only the second one
+        # rules out the band having simply not been overwritten yet, which is
+        # the reading a torn frame gives this negative assertion for free.
+        legs.assert_finished()
         assert "Esc Overview" in legs.lines[legs.rows - 1]
         legs.assert_not_contains("NEEDS YOUR CALL")
         back = term.send("<Esc>", expect="Active Leg")
@@ -649,3 +680,359 @@ def test_a_relay_that_names_itself_is_named_that(tmp_path):
     frame = frame_of(relay)
     assert frame.lines[0].startswith("wave-3-cutover"), frame._message(
         "legs.json names the relay; the directory is only the fallback")
+
+
+# --------------------------------------------------------------------------
+# the band is budgeted against the terminal's HEIGHT, not only its width
+# --------------------------------------------------------------------------
+#
+# `height(model, width)` was never told how tall the terminal is, so it asked
+# for `MAX_ROWS` at every size and `app.paint()` clamped the answer without
+# telling the band. At 8x30 the clamp left the Overview one row — less than a
+# pane needs — so the band silently deleted every pane AND dropped four of its
+# own items without a marker. The layout now offers the band a budget, and the
+# band spends it worst-first and announces what it could not fit.
+#
+# What is asserted here is the property, never the fraction: at every size both
+# the band and the Overview get rows, or what was dropped is dropped visibly.
+
+PANE_TITLES = ("Active Leg", "Legs", "Progress Log", "Active Runner")
+
+#: Sizes where there are enough rows for a band row and a pane (two rows) at
+#: once. Below this neither can be whole and the band keeps its marker row.
+SHARED_SIZES = [WIDE, STANDARD, (16, 60), (12, 40), (10, 34), (8, 30), (6, 24)]
+
+
+@pytest.mark.parametrize("size", SHARED_SIZES)
+def test_the_band_and_the_overview_both_get_rows(size):
+    """The starvation this leg exists to fix, at every size that can hold both.
+
+    On a frame the program *proved* whole: "no pane was drawn" is the reading
+    a half-painted screen gives for free, so this is one of the assertions
+    `Frame.assert_finished()` exists for.
+    """
+    frame = proved_frame_of(AGENT_SERVICE, size=size)
+    frame.assert_finished()
+    assert frame.lines[BAND_TOP].strip(), frame._message(
+        "the band got no row at %dx%d" % (size[1], size[0]))
+    assert any(frame.contains(title) for title in PANE_TITLES), frame._message(
+        "the band took every row the Overview had at %dx%d — no pane is drawn"
+        % (size[1], size[0]))
+
+
+def test_a_band_that_does_not_fit_truncates_with_a_marker_and_keeps_the_panes():
+    """8x30, the size the band leg reported and could not fix inside its own.
+
+    The band keeps the item a human has to act on, says how many it hid, and
+    still leaves the Overview a pane. Every figure here is read off the frame
+    or out of `build()`; none of them is the constant `app` chose.
+    """
+    frame = proved_frame_of(AGENT_SERVICE, size=(8, 30))
+    frame.assert_finished()
+    assert frame.lines[BAND_TOP].strip() == "NEEDS YOUR CALL", frame._message(
+        "the worst item is not what the band spent its rows on")
+    assert frame.lines[BAND_TOP + 1].startswith("  "), frame._message(
+        "the label was given a row and no text followed it")
+    assert frame.lines[BAND_TOP + 1].strip(), frame._message(
+        "the item's text row is blank")
+
+    row = frame.search(r"^\+\d+ more$")
+    assert row is not None, frame._message(
+        "the band dropped items without saying so")
+    hidden = int(re.match(r"^\+(\d+) more$", frame.lines[row].strip()).group(1))
+    # A row that starts a new item begins with its label at column 0; a
+    # continuation row is indented and the marker starts with a `+`.
+    shown = [line for line in frame.lines[BAND_TOP:row]
+             if line[:1] not in (" ", "+", "")]
+    assert len(shown) + hidden == len(items_of(AGENT_SERVICE)), frame._message(
+        "%d shown + %d hidden is not the %d items the model carries"
+        % (len(shown), hidden, len(items_of(AGENT_SERVICE))))
+    assert any(frame.contains(title) for title in PANE_TITLES), frame._message(
+        "the truncated band still ate the Overview")
+
+
+@pytest.mark.parametrize("width", [30, 40, 80, 160])
+@pytest.mark.parametrize("budget", [0, 1, 2, 3, 4, 5, 6, 7, 8, 24])
+def test_the_band_never_spends_more_rows_than_it_was_offered(width, budget):
+    """The offer is a bound, and an offer of even one row is spent on something.
+
+    A band that overran its budget would draw over the pane below it; one that
+    answered 0 to a real offer would leave a blank strip that reads as a crash.
+    """
+    rows = attention.height(model_of(AGENT_SERVICE), width, budget)
+    assert rows <= min(budget, attention.MAX_ROWS)
+    assert rows > 0 or budget == 0
+
+
+@pytest.mark.parametrize("width", [30, 40, 80, 160])
+@pytest.mark.parametrize("budget", [0, 1, 2, 3, 4, 5, 6, 7, 8, 24])
+def test_what_the_band_asks_for_is_what_it_paints(width, budget):
+    """`draw()` is given a canvas of exactly the rows `height()` asked for.
+
+    So the answer has to be a fixed point: laying the band out inside the
+    number it just asked for must produce that same number, or the band paints
+    a different set of rows from the one the layout made room for.
+    """
+    model = model_of(AGENT_SERVICE)
+    asked = attention.height(model, width, budget)
+    assert attention.height(model, width, asked) == asked
+
+
+@pytest.mark.parametrize("width", [30, 40, 80])
+@pytest.mark.parametrize("budget", [1, 2, 3, 4, 5, 6, 7])
+def test_no_budget_makes_the_band_drop_an_item_silently(width, budget):
+    """Whatever the budget, the arithmetic of the marker adds up to the model."""
+    model = model_of(AGENT_SERVICE)
+    rows = attention._layout(model, width, budget)
+    lines = ["".join(text for text, _ in parts) for parts in rows]
+    assert rows, "no band at all inside a budget of %d" % budget
+    marker = [line for line in lines if re.match(r"^\+\d+ more$", line.strip())]
+    shown = [line for line in lines if line[:1] not in (" ", "+", "")]
+    if len(shown) == len(model["attention"]):
+        assert not marker, "every item was drawn and the band still cried more"
+        return
+    assert marker, "%d of %d items drawn inside %d rows and no marker: %r" % (
+        len(shown), len(model["attention"]), budget, lines)
+    hidden = int(re.match(r"^\+(\d+) more$", marker[0].strip()).group(1))
+    assert len(shown) + hidden == len(model["attention"])
+
+
+def test_a_squeezed_item_keeps_its_ellipsis():
+    """A budget that costs an item text rows cuts them visibly, as `_fit` does."""
+    model = model_of(AGENT_SERVICE)
+    roomy = attention._layout(model, 30, attention.MAX_ROWS)
+    tight = attention._layout(model, 30, 3)
+    assert len(tight) < len(roomy)
+    text = "\n".join("".join(t for t, _ in parts) for parts in tight)
+    assert "…" in text, (
+        "the band spent fewer rows on the worst item without saying that the "
+        "text was cut: %r" % text)
+
+
+@pytest.mark.parametrize("size", [(5, 20), (4, 16)])
+def test_a_terminal_too_short_for_a_pane_still_gets_a_band(size):
+    """ACC-TUI-005 does not stop applying when the panes no longer fit.
+
+    Two rows or one between the status bar and the keybar is less than a pane
+    needs, so there is no split that leaves both something. The band keeps
+    them — it is the part of the screen that says a human has to decide — and
+    what it cannot show it says it cannot show.
+    """
+    frame = proved_frame_of(AGENT_SERVICE, size=size)
+    frame.assert_finished()
+    assert frame.lines[BAND_TOP].strip(), frame._message(
+        "the band vanished at %dx%d, leaving a blank strip under the status "
+        "bar that reads as a crashed repaint" % (size[1], size[0]))
+    assert frame.search(r"^\+\d+ more$") is not None, frame._message(
+        "the band hid every item without saying so")
+
+
+@pytest.mark.parametrize("available", list(range(-2, 26)))
+def test_the_layout_never_offers_the_band_rows_it_does_not_have(available):
+    """The split, as a property rather than as the fraction `app` chose.
+
+    Three claims, and none of them names a constant of the rule: the offer is
+    never more than there is; a band offered nothing at all is a blank strip,
+    so an offer is at least one row wherever there is one row; and wherever
+    there is room for the band and a pane at once, what is kept back is at
+    least what a pane needs to exist.
+    """
+    budget = app._band_budget(available)
+    assert 0 <= budget <= max(0, available)
+    if available >= 1:
+        assert budget >= 1, "a region that exists and is offered no rows"
+    if available >= chrome.MIN_PANE_HEIGHT + 1:
+        assert available - budget >= chrome.MIN_PANE_HEIGHT, (
+            "%d rows offered out of %d leaves less than the %d a pane needs"
+            % (budget, available, chrome.MIN_PANE_HEIGHT))
+
+
+@pytest.mark.parametrize("allowed", [0, -1, -9])
+def test_an_item_squeezes_to_one_text_row_and_no_further(allowed):
+    """The floor under the squeeze, which nothing on a screen can show.
+
+    An allowance of nothing is not "no text": `_fit` cuts a wrapped text
+    *down* to an allowance, and asked for none it hands back every line it
+    started with — so an unfloored squeeze makes the item taller than the one
+    it was squeezing, and the band gives up and prints a marker where it could
+    have shown the item a human has to act on.
+    """
+    item = attention._items(model_of(AGENT_SERVICE))[0]
+    rows = attention._item_rows(item, 29, 0, "…", "·", allowed=allowed)
+    assert len(rows) == 2, (
+        "an allowance of %d gave the item %d rows: the label and %d of text"
+        % (allowed, len(rows), len(rows) - 1))
+    text = "".join(part for part, _ in rows[1])
+    assert text.strip(), "the label was given a row and no text followed it"
+    assert text.rstrip().endswith("…"), (
+        "text the squeeze cut must say it was cut: %r" % text)
+
+
+# --------------------------------------------------------------------------
+# Width is measured in cells, not in characters
+#
+# The band is the one region in the package that draws on a bare `Canvas`
+# rather than through a `Pane`, so it holds the reserved-last-column rule
+# itself: `Canvas.write()` clips at `canvas.width`, and `usable = width - 1` is
+# the band's own arithmetic. That makes this the one place where measuring a
+# label in characters is visible to `assert_within_width()` — and it takes the
+# strict certification away from every frame test in the repository while it
+# lasts.
+# --------------------------------------------------------------------------
+
+#: Six ideographs — twelve cells, six characters. A label is coach prose:
+#: `dashboard.json` is hand-written and the fixtures already carry CJK.
+CJK_LABEL = "要対応の判断"
+
+#: The text beside it, in a character a test can find a column for.
+TEXT_CHAR = "a"
+
+
+def cells_relay(directory, label, text, action=None, level="bad"):
+    """A relay whose whole attention band is one item, spelled by the caller."""
+    return relay_at(
+        directory,
+        legs={"relay": "cells",
+              "stages": [{"id": "S1", "name": "Only stage", "legs": ["leg"]}],
+              "legs": [{"id": "leg", "stage": "S1", "goal": "a goal",
+                        "status": "running"}]},
+        dashboard={"title": "Cells relay", "path": str(directory),
+                   "attention": [{"level": level, "label": label,
+                                  "text": text, "action": action}]})
+
+
+def first_column(frame, row, char):
+    """The column `char` is first drawn at on `row`.
+
+    Columns, not string offsets: the cell after a double-width character is the
+    empty string in `frame.lines`, so an index into a line carrying CJK is not
+    the column the terminal drew at (`.relay/skills/pane-conventions.md`).
+    """
+    for col, cell in enumerate(frame.cells[row]):
+        if cell == char:
+            return col
+    return None
+
+
+def reserved_column(frame):
+    """What every row put in the column the chrome reserves.
+
+    `assert_within_width()` makes the same claim; this one reads the cells, so
+    a failure says *what* was drawn in the margin rather than only that
+    something was.
+    """
+    return [row[frame.cols - 1] for row in frame.cells]
+
+
+def test_a_double_width_label_does_not_push_the_band_into_the_margin(tmp_path):
+    """The label's own width, measured in cells.
+
+    `aligned` is the widest label plus a gap, and the text beside it is given
+    everything the row has left. Measured with `len()`, a label drawn in twelve
+    cells was budgeted six — so the band handed the text six cells more than
+    the row had, and the item ran into the column the chrome reserves. Nothing
+    else in this package can do that: a view draws through a `Pane`, which
+    clips to its own rectangle.
+    """
+    relay = cells_relay(tmp_path / "wide", CJK_LABEL, TEXT_CHAR * 200)
+    frame = proved_frame_of(relay, size=WIDE)
+    assert frame.contains(CJK_LABEL), frame._message(
+        "the double-width label was not drawn — this proves nothing")
+    assert reserved_column(frame) == [" "] * frame.rows, frame._message(
+        "the band drew into the column the chrome reserves, so no frame from "
+        "this program can be certified by the strict assert_within_width()")
+    frame.assert_within_width()
+
+
+def test_a_wrapped_line_starts_under_the_text_it_continues(tmp_path):
+    """The gutter is the same number of cells on every row of an item.
+
+    The label's row pads the label out to the gutter and the rows under it are
+    indented by the whole gutter, so the two agree only while the label is
+    measured the same way in both. With `len()` the padding was six cells short
+    of where the text actually began and the continuation lines stood under
+    the middle of the label.
+    """
+    relay = cells_relay(tmp_path / "wrap", CJK_LABEL, TEXT_CHAR * 200)
+    frame = proved_frame_of(relay, size=WIDE)
+    head = first_column(frame, BAND_TOP, TEXT_CHAR)
+    tail = first_column(frame, BAND_TOP + 1, TEXT_CHAR)
+    assert head is not None and tail is not None, frame._message(
+        "the item did not wrap onto a second row — this proves nothing")
+    assert head == tail, frame._message(
+        "the text starts at column %d and its continuation at column %d"
+        % (head, tail))
+    frame.assert_within_width()
+
+
+#: Text and an action chosen so that the row is decided differently by the two
+#: measures, and *both* of the band's measurements are on the hook.
+#:
+#: At 160 columns the band has 159 usable cells and `NEEDS YOUR CALL` takes a
+#: gutter of 17. Sixty-two ideographs are 124 cells, so the row stands at 141
+#: and the action — nine ideographs behind a marker and a space, twenty cells —
+#: needs 163. It does not fit, and it takes a row of its own.
+#:
+#: Counted in characters it fits twice over: the row measures 79 and the action
+#: 11, which is 92 of 159. Either half counted wrong appends a twenty-cell
+#: action to a row with eighteen cells left, and the band — which draws on a
+#: bare canvas — runs into the column the chrome reserves.
+FULL_ROW_TEXT = "検" * 62
+ACTION = "次の脚の前に決める"
+
+
+def test_an_action_is_appended_only_when_it_fits_in_cells(tmp_path):
+    """What a human could *do* never costs the reserved column.
+
+    `_item_rows` measures the row it has already built to decide whether the
+    action fits beside it. With `len()` a row of double-width prose was
+    reported at half its width, the action was appended to a row that was
+    already full, and the band ran into the margin again — this time on the
+    one item the band exists for.
+    """
+    relay = cells_relay(tmp_path / "action", "NEEDS YOUR CALL",
+                        FULL_ROW_TEXT, action=ACTION)
+    frame = proved_frame_of(relay, size=WIDE)
+    assert frame.contains(ACTION), frame._message(
+        "the action was not drawn at all — this proves nothing")
+    assert ACTION not in frame.lines[BAND_TOP], frame._message(
+        "the action was appended to a row with no cells left in it: %r"
+        % frame.lines[BAND_TOP])
+    assert reserved_column(frame) == [" "] * frame.rows, frame._message(
+        "the band drew into the column the chrome reserves")
+    frame.assert_within_width()
+
+
+#: A label with no room for it at thirty columns, so the band has to cut it.
+#: Long enough that the aligned layout is out of the question too, which is
+#: what puts the label on a row of its own where it is cut rather than padded.
+LONG_LABEL = "A" * 60
+
+
+def test_a_label_the_band_cut_says_so_under_a_locale_without_the_mark(
+        tmp_path):
+    """`LC_ALL=C` is the only screen that separates the band's cut from the
+    canvas's.
+
+    Under UTF-8 both end in `…` and no assertion can tell them apart. Under a
+    locale that cannot encode it, curses drops `chrome.clip()`'s literal
+    default to a *blank* — a silent truncation wearing a mark's clothes — while
+    the theme's spelling degrades to `...`. The band cuts the label itself, so
+    it has to hand in the theme's mark.
+    """
+    env = {key: value for key, value in os.environ.items()
+           if key not in ("LC_ALL", "LC_CTYPE", "LANG")}
+    env["LC_ALL"] = "C"
+    relay = cells_relay(tmp_path / "label", LONG_LABEL,
+                        "some text for the item")
+    term = session(relay, size=(8, 30), env=env)
+    try:
+        frame = repaint(term)
+    finally:
+        term.close()
+    line = frame.lines[BAND_TOP].rstrip()
+    assert line.startswith("A"), frame._message(
+        "row %d is not the label's row: %r" % (BAND_TOP, line))
+    assert line.endswith("..."), frame._message(
+        "the label was cut with a mark this locale cannot draw: %r" % line)
+    frame.assert_within_width()

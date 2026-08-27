@@ -1,0 +1,10 @@
+{
+  "title": "Relay with pinned models",
+  "models": {
+    "coach": { "model": "Opus 4.6", "effort": "high" },
+    "runner": { "model": "Sonnet 4.5", "effort": "medium" },
+    "judge": { "model": "GPT-5.1", "effort": "low" }
+  },
+  "toggles": { "skipCodeJudge": true, "skipBehaviourJudge": false },
+  "notes": "Every role is pinned and both experimental toggles are written."
+}

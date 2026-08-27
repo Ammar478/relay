@@ -8,6 +8,33 @@ passed.
 
 ---
 
+## STANDING — The user's own sentences
+
+One to three, quoted verbatim from the request, re-verified at **every** gate by
+a judge doing what a user does. Never marked passed by inspection.
+
+### ACC-STANDING-001 — "<the sentence that says what the user runs>"
+
+**Standing.** <What running it looks like when it works.>
+
+**Evidence:** the exact command typed and its first output; then the rest.
+
+---
+
+## CONVENTION — The project's own standards
+
+From `CLAUDE.md`, the lint config and two neighbouring files. Marked `Convention`,
+measured from the tree by the **code judge** — the behaviour judge cannot reach
+them, and a check no judge marks stays `blocked` and stalls the relay.
+
+### ACC-CONV-001 — No module over <N> lines
+
+**Convention.** <What the repo's standards demand, as a number a judge measures.>
+
+**Evidence:** the three largest files the stage touched, with line counts.
+
+---
+
 ## AUTH — Authentication
 
 ### ACC-AUTH-001 — <title>

@@ -1,0 +1,26 @@
+# Ruff configuration for relay-control-tui.
+#
+# WHY THIS FILE EXISTS. `ruff check .` exited 1 with 65 findings and 37 of them
+# were false positives, so nobody read the output and the four real ones were
+# invisible inside it. A linter whose output nobody can read is not a linter.
+# The rule below silences the false positives BY FILE AND BY RULE, so a real
+# finding of the same rule anywhere else still comes through.
+#
+# The rule selection is deliberately ruff's default (E4, E7, E9, F) rather than
+# a wider one: a rule set nobody has triaged is how the 65-finding wall was
+# built in the first place. Widen it when someone is going to read the result.
+
+[lint.per-file-ignores]
+# F811 (redefined-while-unused) in this file is pytest's fixture protocol, not
+# a redefinition. The module imports shared fixtures by name from
+# `test_relay_model` — that is the documented way to share them, and the
+# import is what makes them visible to pytest — and then every test that wants
+# one takes it as an ARGUMENT of the same name. Ruff sees the parameter
+# shadowing the import and reports all 39 of them.
+#
+# What F811 would legitimately have caught here is a duplicate `def test_*`,
+# which silently deletes the earlier test of that name. That is a guard worth
+# keeping, so it is asserted directly instead, over BOTH test modules and
+# without ruff's blind spot for a redefinition that reuses an argument name:
+# `test_no_test_module_defines_one_name_twice` in `tests/test_relay_model.py`.
+"tests/test_progress_log.py" = ["F811"]
