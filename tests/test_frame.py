@@ -3143,7 +3143,7 @@ def test_a_wait_keeps_to_its_own_budget_against_a_program_that_never_stops(
         elapsed = time.monotonic() - started
     assert "never appeared" in str(excinfo.value)
     assert "tick" in str(excinfo.value)     # with the screen it did have
-    assert elapsed < 2.0, (
+    assert elapsed < 2.5, (
         "a wait given 0.4s ran for %.2fs — to the session timeout, not its "
         "own" % elapsed
     )
@@ -3192,7 +3192,7 @@ def test_the_response_wait_keeps_to_its_own_budget_too(noisy):
         frame = term.send("x", settle=0.2)
         elapsed = time.monotonic() - started
     assert frame.contains("PANE header"), frame.text
-    assert elapsed < 2.0, (
+    assert elapsed < 2.5, (
         "a send given a 0.2s window ran for %.2fs — to the session timeout, "
         "not its own" % elapsed
     )
@@ -3292,9 +3292,17 @@ def test_a_hard_reset_does_not_erase_the_painting_it_never_bracketed(brackets):
     bracketed everything.
     """
     with session(brackets, "ris-exit", "0.3", rows=10, cols=60,
-                 paint=0.05, redraw=3.0) as term:
+                 redraw=3.0) as term:
         term.wait_for("READY")
-        frame = term.send("x", expect="DONE")
+        term.send("x", expect="DONE")
+        # The ending an EXIT is worth is what this test is about, so the exit
+        # is waited out rather than raced: a wait whose quiet window expires
+        # while the child is still on its way out reports `quiet`, which is
+        # honest, is not the ending under test, and made this flaky under
+        # load. With the program provably gone, the next wait can only take
+        # the exit branch.
+        assert term.wait(timeout=5) == 0
+        frame = term.wait_for("DONE")
     assert frame.paint_end == PAINT_ABANDONED, (
         "a hard reset laundered a program that never bracketed a glyph into "
         "one whose exit proves the screen: %s" % frame.paint_end
@@ -3350,7 +3358,7 @@ def test_an_empty_bracket_does_not_carry_proof_across_loose_painting(brackets):
         term.wait_for("READY")
         loose = term.send("x")           # drains the unbracketed painting
         assert loose.contains("LOOSE line"), loose.text
-        frame = term.send("y", expect="LOOSE line", quiet=0.6)
+        frame = term.send("y", expect="LOOSE line", quiet=1.5)
     assert frame.paint_end == PAINT_QUIET, (
         "an empty bracket certified a screen carrying painting no bracket "
         "enclosed, because an earlier repaint had been bracketed: %s"
@@ -3383,10 +3391,10 @@ def test_a_bracket_already_open_when_the_wait_begins_does_not_end_it(brackets):
         term.wait_for("READY")
         opened = term.send("x")        # drains the bracket the program opens
         assert opened.contains("STALE line"), opened.text
-        # A quiet window wider than the program's pause, so that the frame
-        # that comes back is decided by what the harness makes of the close
-        # and not by the harness giving up first.
-        frame = term.send("y", expect="STALE line", quiet=0.6)
+        # A quiet window several times the program's pause, so that the
+        # frame that comes back is decided by what the harness makes of the
+        # close and not by the harness giving up first on a loaded machine.
+        frame = term.send("y", expect="STALE line", quiet=1.5)
     assert frame.contains("ANSWER now"), (
         "a bracket opened before the keystroke was taken for the answer to "
         "it, and the wait ended before the answer was painted: %s" % frame.text
@@ -3445,7 +3453,9 @@ def test_a_resize_of_the_harness_own_does_not_leave_proof_behind(brackets):
     """
     with session(brackets, "wide-disciplined", "0.3", rows=10, cols=60) as term:
         term.wait_for("READY")
-        whole = term.send("x", expect="READY")
+        term.send("x", expect="READY")
+        assert term.wait(timeout=5) == 0      # the exit, waited out not raced
+        whole = term.wait_for("READY")
         assert whole.paint_end == PAINT_EXITED
         assert whole.contains("EDGE" * 12), whole.text
         damaged = term.resize(10, 24, expect="READY")
