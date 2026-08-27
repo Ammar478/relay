@@ -1,0 +1,324 @@
+#!/usr/bin/env python3
+"""relay-control — open the live relay dashboard, or print a snapshot of it.
+
+    relay-control                     the relay found from the working directory
+    relay-control PATH                that relay (or the one under that project)
+    relay-control --relay-dir PATH    the same, named
+    relay-control --snapshot [PATH]   print a text snapshot instead of opening
+
+Why this file is at the repository root
+---------------------------------------
+The skill installs with `git clone … ~/.claude/skills/relay` and nothing after
+that, so the only thing a supervisor can type is a path to a file inside the
+clone — and this is that file. It resolves **its own** location through any
+symlink, puts the clone's `scripts/` in front of the child's import path, and
+execs the TUI. No alias, no `PATH` edit, no `settings.json` entry, and no
+dependency on the working directory being anywhere near the clone
+(ACC-CMD-001).
+
+Why `--snapshot` is here and not in the package
+-----------------------------------------------
+A Claude Code slash command is a prompt for the model. It cannot hand the
+terminal to a curses program — `.relay/research/slash-command-mechanism.md` is
+the research, and it is why ACC-CMD-001 was amended before any code was
+written. So `/relay-control` renders a *snapshot* into the conversation and
+prints the line that opens the live view. That snapshot has to come out of a
+command the model can run and quote verbatim; this is the command, and
+`skills/relay-control/SKILL.md` is the skill that runs it.
+
+Two rules this file keeps
+-------------------------
+* **Every figure comes from `relay_model.build()`.** This file opens no relay
+  file of its own. That is the rule ACC-TUI-007 puts on the TUI package, kept
+  here for the same reason: a second reader is a second answer, and the
+  snapshot exists precisely to say what the TUI says.
+* **The TUI owns the terminal, not this process.** `os.execve` replaces this
+  process rather than wrapping it, so curses talks to the real terminal and
+  `q` is the whole of the exit path.
+"""
+
+import argparse
+import os
+import shlex
+import sys
+
+#: The clone this file lives in, with every symlink on the way resolved — a
+#: user who puts `relay-control` on their PATH does it with a symlink, and the
+#: `scripts/` that matters is the one beside the *real* file.
+HOME = os.path.dirname(os.path.realpath(__file__))
+SCRIPTS = os.path.join(HOME, "scripts")
+
+if SCRIPTS not in sys.path:
+    sys.path.insert(0, SCRIPTS)
+
+import relay_model  # noqa: E402
+from relay_control import chrome  # noqa: E402
+from relay_control import theme as theme_tokens  # noqa: E402
+from relay_control.app import find_relay  # noqa: E402
+
+#: What the snapshot calls itself. The skill quotes the output verbatim, so
+#: this is the line that tells a reader of the conversation what they are
+#: looking at.
+TITLE_LINE = "Relay Control - snapshot"
+
+#: Cells the snapshot wraps prose into. A conversation is not a terminal and
+#: has no width to measure, so this is a readability choice and the only
+#: constant here that is one.
+WIDTH = 78
+
+#: The label column of the summary block.
+LABEL = 10
+
+
+# --------------------------------------------------------------------------
+# which relay
+# --------------------------------------------------------------------------
+
+
+def resolve(path):
+    """The relay directory `path` names.
+
+    A supervisor points at either the relay or the project above it, because
+    `.relay` is a hidden directory nobody types by choice. Resolution only:
+    this asks whether a directory exists and reads nothing, which is the same
+    licence `find_relay()` works under.
+    """
+    nested = os.path.join(path, ".relay")
+    if os.path.isdir(nested):
+        return nested
+    return path
+
+
+def is_a_relay(model, path):
+    """Whether the caller can have meant this directory.
+
+    `build()` refuses a path that is not a directory at all, and degrades
+    everything else — so an empty `/tmp` builds a model of nothing rather than
+    raising, and the TUI would open on it showing a relay that does not exist.
+    Two things make a directory a relay:
+
+    * **it holds one of the relay's files**, which the model reports in
+      `sources` — asked of the model rather than of the filesystem, so this
+      file still reads nothing; or
+    * **it is called `.relay`**, which a relay in its first minute is and
+      nothing else in it yet. Refusing that would refuse the moment a
+      supervisor most wants to watch.
+    """
+    sources = model.get("sources") or {}
+    if any(source != "missing" for source in sources.values()):
+        return True
+    return os.path.basename(os.path.normpath(path)) == ".relay"
+
+
+def opened(target):
+    """`(relay directory, model)` for `target`, or `RelayNotFound`.
+
+    The refusal is raised in `relay_model`'s own exception with `relay_model`'s
+    own wording, so there is one vocabulary for "that is not a relay" across
+    the entrypoint, the TUI and the model (ACC-ROBUST-004).
+    """
+    relay_dir = os.path.abspath(resolve(target))
+    model = relay_model.build(relay_dir)
+    if not is_a_relay(model, relay_dir):
+        raise relay_model.RelayNotFound("not a relay directory: %r" % target)
+    return relay_dir, model
+
+
+# --------------------------------------------------------------------------
+# the snapshot
+# --------------------------------------------------------------------------
+
+
+def control_mark(stream):
+    """The theme's mark for a control character, or its ASCII fallback.
+
+    Chosen by what the *stream* can encode rather than by the locale: a
+    snapshot goes down a pipe at least as often as to a terminal, and it is
+    the pipe's encoding that decides whether the mark survives.
+    """
+    mark = theme_tokens.GLYPHS["control"]
+    try:
+        mark.encode(getattr(stream, "encoding", None) or "ascii")
+    except (UnicodeEncodeError, LookupError):
+        return theme_tokens.ASCII_GLYPHS["control"]
+    return mark
+
+
+def prose(text, mark):
+    """Relay prose, safe to paste into a terminal.
+
+    Everything the coach writes is untrusted (ACC-DATA-001), and a snapshot is
+    read in a conversation and pasted into terminals. `chrome.sanitise()` puts
+    one visible mark where a control character was — not a strip, which would
+    read as prose its author wrote that way (ACC-DATA-007).
+    """
+    return chrome.sanitise(str(text), mark)
+
+
+def field(label, value):
+    return "  %-*s%s" % (LABEL, label, value)
+
+
+def counts(figures, order):
+    """`36 total: 27 completed, 1 running, …` from one of the model's count maps."""
+    parts = ["%d %s" % (figures.get(name, 0), name) for name in order]
+    return "%d total: %s" % (figures.get("total", 0), ", ".join(parts))
+
+
+def head_lines(model, mark):
+    """Who this relay is, where it is, and the four figures that summarise it."""
+    relay = model.get("relay") or {}
+    lines = ["  " + prose(chrome.relay_title(model), mark)]
+    if relay.get("path"):
+        lines.append(field("project", prose(relay["path"], mark)))
+    lines.append(field("relay", prose(relay.get("relayDir") or "", mark)))
+    lines.append("")
+    lines.append(field("Phase", prose(relay.get("phase") or "unknown", mark)))
+    stage = relay.get("currentStage") or {}
+    if stage.get("id") or stage.get("name"):
+        named = [part for part in (stage.get("id"), stage.get("name")) if part]
+        lines.append(field("Stage", prose(" - ".join(named), mark)))
+    lines.append(field("Legs", counts(
+        model.get("legCounts") or {},
+        ("completed", "running", "pending", "cancelled"))))
+    lines.append(field("Checks", counts(
+        model.get("checkCounts") or {},
+        ("passed", "failed", "blocked", "pending"))))
+    return lines
+
+
+def active_leg_lines(model, mark):
+    """The running leg and its goal, or the fact that there is not one.
+
+    An absent leg is stated rather than dropped: a section that vanished would
+    read as a rendering fault, and "nothing is running" is a fact a supervisor
+    acts on.
+    """
+    leg = model.get("activeLeg")
+    if not leg:
+        return ["  none - no leg is marked running"]
+    named = [part for part in (leg.get("stage"), leg.get("kind")) if part]
+    head = "  " + prose(leg.get("id") or "(unnamed leg)", mark)
+    if named:
+        head += "  (%s)" % prose(", ".join(named), mark)
+    lines = [head, ""]
+    goal = leg.get("goal")
+    if goal:
+        lines.extend("  " + line
+                     for line in chrome.wrap(prose(goal, mark), WIDTH - 2))
+    else:
+        lines.append("  no goal recorded for this leg")
+    return lines
+
+
+def attention_lines(items, mark):
+    """Every attention item, in the model's order, with its action.
+
+    The heading carries the count so a reader can tell a short list from a
+    truncated one — the same reason every pane in the TUI states the range it
+    drew.
+    """
+    lines = ["Attention (%d)" % len(items), ""]
+    width = max([len(str(item.get("level") or "")) for item in items] or [4])
+    for item in items:
+        prefix = "  [%-*s] " % (width, prose(item.get("level") or "", mark))
+        indent = " " * len(prefix)
+        lines.append(prefix + prose(item.get("label") or "", mark))
+        for line in chrome.wrap(prose(item.get("text") or "", mark),
+                                WIDTH - len(indent)):
+            lines.append(indent + line)
+        if item.get("action"):
+            lines.append(indent + "-> " + prose(item["action"], mark))
+        lines.append("")
+    return lines
+
+
+def launch_line(relay_dir):
+    """The exact shell line that opens the live view on `relay_dir`.
+
+    Both halves absolute and both quoted: the reader is in a conversation and
+    will paste this into some other shell, in some other directory, and the
+    relay this leg is verified against lives under a directory with a space in
+    its name.
+    """
+    return "  %s %s" % (shlex.quote(os.path.realpath(__file__)),
+                        shlex.quote(relay_dir))
+
+
+def snapshot(model, relay_dir, mark):
+    """The whole snapshot, as one block of text.
+
+    A pure function of the model, so what the skill puts in a conversation is
+    exactly what `build()` said and can be asserted without a terminal.
+    """
+    lines = [TITLE_LINE, ""]
+    lines.extend(head_lines(model, mark))
+    lines.extend(["", "Active leg", ""])
+    lines.extend(active_leg_lines(model, mark))
+    lines.append("")
+    lines.extend(attention_lines(model.get("attention") or [], mark))
+    lines.extend(["Open the live view", ""])
+    lines.append(launch_line(relay_dir))
+    lines.append("")
+    lines.extend("  " + line for line in chrome.wrap(
+        "This is a still picture of the relay, taken just now. Nothing has "
+        "been launched - the line above opens the live view in your own "
+        "terminal.", WIDTH - 2))
+    return "\n".join(lines) + "\n"
+
+
+# --------------------------------------------------------------------------
+# entry
+# --------------------------------------------------------------------------
+
+
+def exec_tui(relay_dir):
+    """Replace this process with the TUI, opened on `relay_dir`.
+
+    The clone's `scripts/` goes in *front* of whatever `PYTHONPATH` the user
+    already had, so a module of theirs cannot shadow the one the clone ships.
+    """
+    env = dict(os.environ)
+    existing = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = (SCRIPTS + os.pathsep + existing) if existing else SCRIPTS
+    os.execve(sys.executable,
+              [sys.executable, "-m", "relay_control", relay_dir], env)
+
+
+def parse(argv):
+    parser = argparse.ArgumentParser(
+        prog="relay-control",
+        description="Open the live relay dashboard, or print a snapshot of it.")
+    parser.add_argument("relay_dir", nargs="?", default=None,
+                        help="the relay, or the project above it "
+                             "(default: the nearest .relay)")
+    parser.add_argument("--relay-dir", dest="explicit", default=None,
+                        help="same, named")
+    parser.add_argument("--snapshot", action="store_true",
+                        help="print a text snapshot instead of opening the TUI")
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse(argv)
+    try:
+        relay_dir, model = opened(args.explicit or args.relay_dir or find_relay())
+    except relay_model.RelayNotFound as exc:
+        sys.stderr.write("%s\n" % exc)
+        return 2
+    if not args.snapshot:
+        exec_tui(relay_dir)
+    # Relay prose is whatever the coach wrote and the stream is whatever the
+    # caller piped us into; neither is negotiable, so an unencodable character
+    # is escaped rather than raised. A traceback here would be ACC-ROBUST-004
+    # broken by a paragraph of text.
+    try:
+        sys.stdout.reconfigure(errors="backslashreplace")
+    except (AttributeError, ValueError, OSError):
+        pass
+    sys.stdout.write(snapshot(model, relay_dir, control_mark(sys.stdout)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
