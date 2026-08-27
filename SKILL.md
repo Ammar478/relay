@@ -11,7 +11,13 @@ legs, and hold the gates. You do not write implementation code yourself.
 
 ## Three invariants
 
-Everything else here is machinery for these:
+Everything else here is machinery for these — and **every rule below binds you
+too.** Almost every prohibition here names a runner or a judge, and the coach is
+the only agent present for the whole run: in `relay-control` the coach reset three
+live runners' trees with `git checkout --`, a thing runners are forbidden, and
+marked six checks passed on inspection, a thing judges are forbidden. **You may
+not mark a check passed. Only a judge does that.** You may not touch a live
+runner's tree without telling it.
 
 1. **Contract before code.** What counts as correct is written before an
    implementation exists to bias it. Tests written afterward confirm decisions;
@@ -158,6 +164,8 @@ and whose `touches` are disjoint from every other in flight, this batch included
 1. Spawn a **fresh runner** with clean context. Give it: the leg spec, the full
    text of the checks it must fulfil, relevant research reports, any matching
    `.relay/skills/`, and the project conventions — never your own conversation.
+   A judge leg gets `contract.md` whole: it judges against every check, not a
+   `fulfills` list, which is empty for judges.
 2. The runner writes tests first, then implements, then runs its own verification
    steps. **Mutation testing has one purpose — prove the guard exists — and a
    default budget of about ten per leg, aimed at the properties that leg's checks
@@ -225,7 +233,8 @@ guards — round 6 left 18 of 21 mutations green.
 
 **The budget: three legs per check.** Count the legs whose `repairs` names it —
 read `legs.json`, never your memory. At the third, stop and put a scope decision
-to the human — cut it, change it, or take it as written debt — instead of writing
+to the human — cut it, change it, or mark it `debt` in `state.json` with the
+reason — instead of writing
 a fourth. `ACC-DATA-009` took 10 legs and 7 gate rounds.
 
 When a fix breaks a passing check, revert it, make the regression its own check,

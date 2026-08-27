@@ -53,6 +53,11 @@ code was written, in parallel with each other.
 
 - **Start the product before reading a single check.** Find the way in a user has
   — README command, `bin/`, installed script, `--help` — and run it in a shell.
+  **Run it from outside the tree that built it**: another directory at least, a
+  clean checkout or a fresh venv where the project is only installed the way a
+  user installs it. A judge sitting in the build tree watches it come up and files
+  a truthful pass while the user gets `ImportError` — that is the exact failure
+  this file exists to catch, and it catches itself.
   The report's first line is the exact command typed and its first output; a
   report without that line is not a report.
 - **Never reach past that entrypoint to decide a verdict** — no importing,
