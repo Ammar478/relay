@@ -123,10 +123,10 @@ steps.
 duplicates, and only the leg that makes a check fully testable claims it.
 
 Group legs into **stages**. **Stage 1 ends in a walking skeleton: the user runs
-one command and sees real output from real input, with no stub anywhere on the
-path they walk.** Thin, ugly and incomplete is fine; not runnable is not. Plan
-stage 1 backwards from that command — the entrypoint, the way it is installed or
-invoked, and the check that proves it starts are stage-1 legs, never later ones.
+the command they asked for and sees real output from real input, with no stub on
+the path they walk.** Thin, ugly and incomplete is fine; not runnable is not. Plan
+stage 1 backwards from that command — the entrypoint, how it is invoked, and the
+check that proves it starts are stage-1 legs, never later ones.
 Every later stage is a user-visible slice ending in one more thing the user can do.
 
 **Never group stages by horizontal layer** — model, then chrome, then views, then
