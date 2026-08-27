@@ -1502,6 +1502,63 @@ def test_a_short_answer_from_git_is_not_an_answer(tmp_path, monkeypatch):
 
 
 @pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_a_baton_claiming_a_full_length_sha_is_credited(tmp_path):
+    """Runners write `1a2b3c4` and runners write all forty characters, and the
+    live relay has batons of each kind.
+
+    `git log --format=%h` gives seven, so a claim is cut to seven to make the
+    comparison an EQUALITY rather than a prefix search. Without the cut the
+    claim still RESOLVES - git takes a full sha happily - and then matches no
+    walked commit: the row carries forty characters and the log attributes
+    nothing, which is exactly the disagreement this check forbids.
+
+    Every fixture and every constructed relay in this file writes seven
+    characters, so `commit_claims` dropping its `[:7]` was invisible here and
+    died only on the LIVE relay reading - which a clone does not have, because
+    `.relay/` is git-ignored. A judge reads a clone.
+    """
+    relay_dir = _branch_point_relay(tmp_path / "proj")
+    project = relay_dir.parent
+    _git(project, "commit", "-q", "--allow-empty",
+         "-m", "delta: claimed at full length", when=NOW - 4300)
+    full = _git(project, "rev-parse", "HEAD").stdout.strip()
+    assert len(full) == 40, full
+    _land(relay_dir, "delta", NOW - 4200, full)
+
+    model = relay_model.build(relay_dir, now=NOW)
+    row = {r["leg"]: r for r in model["runners"]}["delta"]
+    assert row["commit"] == full[:7], row["commit"]
+    entry = commit_named(model, "delta: claimed at full length")
+    assert entry is not None, [e["m"] for e in entries_of(model, "commit")]
+    assert entry["leg"] == "delta"
+    assert entry["commit"] == row["commit"]
+    assert assert_the_model_agrees_with_itself(model, relay_dir) == "compared"
+
+
+def test_an_orphan_row_is_ranked_after_the_plan_on_an_exact_tie(tmp_path):
+    """Baton mtimes are the row order and `order` is the tie-break beneath them.
+
+    Two batons written inside the same second is ordinary - a coach who touches
+    them, a runner that lands two - and an orphan has no plan order of its own,
+    so it is GIVEN one after every planned leg. A rank that puts an unplanned
+    leg ahead of the plan is a silent reordering of the runner pane, and it
+    survived a battery until the tie was built deliberately.
+    """
+    relay_dir = tmp_path / ".relay"
+    (relay_dir / "batons").mkdir(parents=True)
+    (relay_dir / "legs.json").write_text(json.dumps({
+        "relay": "tie",
+        "stages": [{"id": "S1", "legs": ["alpha"]}],
+        "legs": [{"id": "alpha", "stage": "S1", "status": "done"}]}))
+    for leg in ("alpha", "b-orphan", "a-orphan"):
+        _land(relay_dir, leg, NOW - 5000)          # the same second, exactly
+
+    rows = relay_model.build(relay_dir, now=NOW)["runners"]
+    assert [r["leg"] for r in rows] == ["alpha", "a-orphan", "b-orphan"], rows
+    assert [r["n"] for r in rows] == [1, 2, 3]
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
 def test_a_claimed_sha_the_repository_does_not_have_is_not_credited(tmp_path):
     """A judge's baton quotes another relay's shas while reporting on it; a
     runner mistypes one. Neither names a commit of this repository, and a
