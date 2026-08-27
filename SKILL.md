@@ -260,10 +260,14 @@ belongs in `relay.md`.
 
 ## Models: match the model to the role
 
-No single provider is best at all three roles. Where you can choose: the **coach**
-needs slow, careful reasoning; the **runner** code fluency and speed; the
-**judge** strict instruction-following and **a different provider from the
-runner**, because same-family models share the blind spot that produced the bug.
+No single provider is best at all three roles. Where you can choose:
+
+| Role | What it needs |
+|---|---|
+| Coach | Slow, careful reasoning: strategy, constraints, long-horizon decomposition. |
+| Runner | Code fluency and speed: fast generation, confident tool use. |
+| Judge | Strict instruction-following, and **a different provider from the runner** — same-family models share the blind spot that produced the bug. |
+
 Keep roles prompt-driven — pinning them all to one family caps the relay at that
 family's weakest capability.
 
