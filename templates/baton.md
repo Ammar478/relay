@@ -1,7 +1,10 @@
 # Baton — <leg id>
 
 **Status:** success | partial | failed
-**Commit:** <sha>
+**Commit:** `<sha>`
+
+Both header fields are read by machine. Keep the labels, and keep the sha inside
+backticks — without them the dashboard shows no commit against this leg.
 
 ## Implemented
 

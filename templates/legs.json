@@ -33,6 +33,7 @@
       "goal": "Tests, types, lint, and a parallel review subagent per leg in S1.",
       "fulfills": [],
       "dependsOn": ["google-sso-auth-flow"],
+      "touches": [],
       "status": "pending"
     },
     {
@@ -42,6 +43,7 @@
       "goal": "Drive the product and collect the evidence every S1 check names.",
       "fulfills": [],
       "dependsOn": ["google-sso-auth-flow"],
+      "touches": [],
       "status": "pending"
     },
     {

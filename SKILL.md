@@ -1,6 +1,6 @@
 ---
 name: relay
-description: Run a long-horizon build as a supervised relay — write the acceptance contract before any code, break the work into legs grouped into stages, run one leg at a time with a fresh runner each time, and gate every stage behind adversarial judges until all checks pass. Use when the user says "run a relay", "build this end to end", "ship this feature", "orchestrate this", or hands over a multi-leg project, spec, PRD, or roadmap too large for one session. Also use for deep technical research that must be exhaustive rather than a single-pass summary.
+description: Run a long-horizon build as a supervised relay — write the acceptance contract before any code, break the work into legs grouped into stages, run every leg with a fresh runner and fan out where their files are disjoint, and gate every stage behind adversarial judges until all checks pass. Use when the user says "run a relay", "build this end to end", "ship this feature", "orchestrate this", or hands over a multi-leg project, spec, PRD, or roadmap too large for one session. Also use for deep technical research that must be exhaustive rather than a single-pass summary.
 ---
 
 # Relay
@@ -18,12 +18,11 @@ Everything else here is machinery for these:
    they do not catch bugs.
 2. **One runner on the track — the track being the files.** The serial rule stops
    two runners making conflicting **architectural** choices, so it binds only legs
-   that share files or a design surface: **legs whose file sets are disjoint run in
-   parallel, from the first leg on**, and read-only work — search, research, review
-   — always fans out. Concurrency is a property of the operation, not the schedule;
-   in one tree, every runner stages by explicit pathspec (Phase 4). When
-   `relay-control` finally fanned out, three runners independently wrote a
-   byte-identical helper: convergence, not divergence.
+   that write the same files: **legs whose file sets are disjoint run in parallel,
+   from the first leg on**, and read-only work always fans out. In one tree every
+   runner stages by explicit pathspec (Phase 4 dispatches the fan-out); when
+   `relay-control` fanned out, three runners wrote a byte-identical helper:
+   convergence, not divergence.
 3. **The baton carries state, not the conversation.** Every leg gets a fresh
    runner that reads state from disk and writes results back. No trajectory is
    carried forward, so there is none for attention to degrade across.
@@ -32,9 +31,9 @@ Everything else here is machinery for these:
 
 A **leg** is one bounded unit of work, finishable by one fresh runner in one
 context. A **stage** is a group of legs judged together, *cleared* once all its
-checks pass. A **check** is one testable behavioural claim, ID `ACC-<AREA>-<NNN>`.
-A **runner** runs exactly one leg; a **judge** verifies, never having seen the code
-written. A **baton** is the handoff a runner writes when its leg ends.
+checks pass. A **check** is one testable claim, ID `ACC-<AREA>-<NNN>` — behavioural
+unless marked `Convention`. A **runner** runs exactly one leg; a **judge** verifies,
+never having seen the code written. A **baton** is a runner's handoff at leg's end.
 
 ## Relay state
 
@@ -46,20 +45,17 @@ Create `.relay/` at the repo root (or working directory) at kickoff:
   contract.md              the acceptance checks that define done
   legs.json                ordered legs in stages; state.json  per-check status
   batons/<leg>.md          one per leg; skills/<name>.md  procedures learned
-  research/                read-only Phase 0 reports
+  research/                read-only Phase 0 reports; evidence/  judge artefacts
   dashboard.json           live view fields; control.html  Relay Control, rendered
 ```
-
-Templates for each are in `templates/`. Read them before writing the files.
 
 ## Relay Control
 
 The human supervising is a project manager, not a co-author: they need one view
-that answers "do I need to do something" without reading code. Regenerate it with
+that answers "do I need to do something" without reading code. Regenerate with
 `python3 scripts/render_dashboard.py --relay-dir .relay` and send it after every
-leg, at every stage gate, and the moment anything needs their attention. Read
-`references/dashboard.md` before the first render — the attention band is what
-earns the dashboard, and the part you write yourself.
+leg, at every gate, and the moment anything needs attention. Read
+`references/dashboard.md` first — the attention band is the part you write.
 
 ## Phases
 
@@ -70,15 +66,13 @@ hard constraints, what is explicitly out of scope, what already exists. Ask once
 in a batch. Do not ask what you can answer by reading the repo.
 
 Then fan out **read-only** research agents in parallel — one per angle, never one
-per query: how the existing codebase does this today (trace the flows); how the
-target library or API actually works (docs, source); production patterns and known
-pitfalls; edge cases and failure modes.
+per query: how the codebase does this today (trace the flows); how the target
+library or API actually works (docs, source); pitfalls, edge cases, failure modes.
 
 Each returns a compressed report into `.relay/research/`. You read the reports,
 not the raw sources. This is also the whole harness when the request is
 research-only: stop after the synthesis and deliver the brief.
-`references/research.md` has the gap-analysis loop that decides when research is
-finished.
+`references/research.md` has the gap-analysis loop that ends research.
 
 ### Phase 1 — Acceptance contract
 
@@ -101,24 +95,26 @@ Rules:
 - Aim for coverage, not volume — a real feature is dozens of checks, not five —
   and spend the time, because ambiguity here becomes rework later.
 - **Write one to three standing checks in the user's own words.** One of them is
-  always the sentence that says what the user runs. Quote sentences
-  from the request verbatim, mark them `Standing`, and re-verify every one of them
-  at **every** stage gate, not once. They are the request; the rest of the
-  contract is only your reading of it.
+  always the sentence that says what the user runs. Quote from the request
+  verbatim, mark them `Standing`, and re-verify every one at **every** stage gate,
+  not once. They are the request; the rest of the contract is your reading of it.
 - **A standing check is never marked passed by inspection** — not by reading code,
-  not by citing a unit test, not from the program's own output. A judge does what a
-  user does, starting the product the way the user starts it, or the check fails.
+  not by citing a unit test, not from the program's own claim about itself. A judge
+  does what a user does, starting the product the way a user starts it, or it fails.
 - **Turn the project's conventions into checks.** Read `CLAUDE.md`, the lint
   config and two neighbouring files, and write what they demand as checks a judge
-  can measure: module size, duplication, seams, dead code. `relay-control` had
-  none, and `tests/frame.py` reached 2900 lines.
+  can measure: module size, duplication, seams, dead code. Mark them `Convention`
+  — the one exemption from "behavioural, not implementational", measured against
+  the tree by the code judge, never reached for by the behaviour judge.
+  `relay-control` had none, and `tests/frame.py` reached 2900 lines.
 
 ### Phase 2 — Leg plan
 
 Decompose into legs in `.relay/legs.json`. Each leg is bounded enough for one
 fresh runner to finish in one context, lists `fulfills` (the check IDs it makes
-true) and `dependsOn` (legs that must land first), and names its own verification
-steps.
+true), `dependsOn` (legs that must land first) and `touches` (every path in the
+work tree it may write, a directory standing for all of it — this is what makes
+fan-out computable), and names its own verification steps.
 
 **Coverage gate:** every check is claimed by exactly one leg — no orphans, no
 duplicates, and only the leg that makes a check fully testable claims it.
@@ -135,8 +131,8 @@ entrypoint. That plan put `relay-control`'s entrypoint check in stage 4 of 4:
 30 hours, 2100 tests, and `No module named relay_control` the first time the human
 typed the command.
 
-End every stage with two **judge legs** (`<stage>/code-judge` and
-`<stage>/behaviour-judge`) in the queue like any other, so judging shows in the
+End every stage with two **judge legs** (`code-judge-<stage>` and
+`behaviour-judge-<stage>`) in the queue like any other, so judging shows in the
 plan, the dashboard and the run count instead of hiding inside a gate.
 
 ### Phase 3 — Approval gate
@@ -156,7 +152,8 @@ Do not start before an explicit go.
 
 ### Phase 4 — Running the legs
 
-Loop over pending legs **in order**. For each one:
+**Dispatch together every pending leg in this stage whose `dependsOn` have landed
+and whose `touches` are disjoint from every other in flight, this batch included:**
 
 1. Spawn a **fresh runner** with clean context. Give it: the leg spec, the full
    text of the checks it must fulfil, relevant research reports, any matching
@@ -170,51 +167,55 @@ Loop over pending legs **in order**. For each one:
    plain `git commit`, never `checkout --`/`stash`/`reset`, and a mutation is
    restored from its own backup, because parallel runners share one index. **Git is
    the exchange zone** — the next runner inherits the codebase, not a message.
-4. The runner writes `.relay/batons/<leg>.md` with five fields: what was
-   implemented, what was left undone, commands run with exit codes, issues
-   discovered, and whether the specified procedure was followed.
+4. The runner writes `.relay/batons/<leg>.md` **in the one shape
+   `templates/baton.md` gives** — status, the commit sha in backticks, then the
+   five sections. The dashboard reads the sha from that field and no other.
 5. You read the baton and **dispose of every item**. Each discovered issue
    becomes a follow-up leg or gets an explicit written dismissal in `relay.md`.
    Nothing is silently dropped.
 6. Update `state.json` and `dashboard.json`, re-render Relay Control, send it.
    One leg done is one dashboard refresh.
 
-Runners may spawn read-only subagents for search and doc lookup; they may not spawn
-other runners, talk to each other, or change the contract. Keep your own context for
-coaching — structural overview, baton synthesis, sequencing, the human — and push
-every deep read into a subagent. `references/execution.md` has the runner briefing
-template and the recovery plays for a stuck, slow or blocked leg.
+Runners may spawn read-only subagents; they may not spawn other runners, talk to
+each other, or change the contract. Keep your own context for coaching and push
+every deep read into a subagent. **Brief every runner from
+`references/execution.md`'s template**, which also has the recovery plays.
 
 ### Phase 5 — Stage judging
 
 When every implementation leg in a stage is done, its two judge legs run with
-**fresh context and no implementation history**, in parallel with each other:
+**fresh context and no implementation history**, in parallel. **Brief both from
+`references/validation.md`** — most of each remit lives there, and a judge that is
+not handed it is the judge that read `relay-control` through `build()` for seven
+rounds:
 
 - **Code judge** — run the test suite, linter, type checker; then spawn a
-  parallel review subagent per completed leg and synthesise their findings into
-  one report. It reads the diff; it does not run the product.
+  parallel review subagent per completed leg and synthesise one report. It reads
+  the diff and the tree — structure and the `Convention` checks included; it does
+  not run the product.
 - **Behaviour judge** — act like a QA engineer. Launch the application, drive the
   real interface, walk each check's flow — including every standing check, at
-  every gate — and collect the evidence it names.
+  every gate — and collect the evidence it names. **It never reaches past the
+  entrypoint to decide a verdict, and "I could not start it" is a failure against
+  the whole stage, not a note.**
 
-Neither judge has seen the code written — judging is adversarial by design. They
-judge against the contract, never the implementation's own assumptions, and where
-models differ a different provider judges than implements: a judge from the same
-family accepts the same mistakes.
+Judging is adversarial by design: judge against the contract, never the
+implementation's own assumptions, and where models differ let a different provider
+judge than implements — the same family accepts the same mistakes.
 
-Update `state.json`: each check becomes `passed`, `failed`, or `blocked`.
+Each judge marks in `state.json` the checks its own evidence covers — `passed`,
+`failed` or `blocked` — and only those, so the two never write the same entry.
 
 ### Phase 6 — Fix loop
 
-**Judging does not pass first time. That is normal.** Expect roughly a third of
-your legs to be fix legs.
-
-For each failure, create a targeted fix leg, insert it at the head of the queue,
-and return to Phase 4. Repeat until every check in the stage reads `passed`, then
-the stage is **cleared** and you advance — but the check that proves the product
-starts is re-verified at every later gate. A cleared stage does not stay cleared
-for free: a later leg that reorganises the package leaves that check reading
-`passed` while the user gets an import error.
+**Judging does not pass first time. That is normal** — expect roughly a third of
+your legs to be fix legs. For each failure, create a targeted fix leg naming in
+`repairs` the checks it is for, insert it at the head of the queue, and return to
+Phase 4. Repeat until every check in the stage reads `passed`, then the stage is
+**cleared** and you advance — but the check that proves the product starts is
+re-verified at every later gate. A cleared stage does not stay cleared for free: a
+later leg that reorganises the package leaves that check reading `passed` while
+the user gets an import error.
 
 **The floor.** A check passes once its behaviour holds and one mutation of the
 property it names fails the suite. A defect in the guard on that guard is written
@@ -222,13 +223,14 @@ into `relay.md` as debt, not turned into a fix leg, unless it hides a behavioura
 defect. `relay-control` had no floor and spent gate rounds 5, 6 and 7 on guards on
 guards — round 6 left 18 of 21 mutations green.
 
-**The budget: three legs per check.** At a check's third failure, stop and put a
-scope decision to the human — cut it, change it, or take it as written debt —
-instead of writing a fourth leg. `ACC-DATA-009` took 10 legs and 7 gate rounds.
+**The budget: three legs per check.** Count the legs whose `repairs` names it —
+read `legs.json`, never your memory. At the third, stop and put a scope decision
+to the human — cut it, change it, or take it as written debt — instead of writing
+a fourth. `ACC-DATA-009` took 10 legs and 7 gate rounds.
 
-If progress stalls otherwise — a fix breaks a previously passing check — **stop
-and hand control back to the human** with what you tried and what you believe is
-wrong. Do not grind.
+When a fix breaks a passing check, revert it, make the regression its own check,
+and re-plan — once. If that same check breaks again, **stop and hand control back
+to the human** with what you tried and what you believe is wrong.
 
 ### Phase 7 — Finish
 
@@ -245,14 +247,12 @@ NEXT       what a human should look at first
 ## Skills: the relay learns as it runs
 
 A long relay repeats itself: the fourth runner rediscovers the build quirk the
-first one hit and throws the finding away with its context. Closing that loop —
-run, observe, encode the rule as a skill — makes hour ten cheaper than hour one.
+first hit and throws it away with its context. Encoding it makes hour ten cheaper.
 
 Keep reusable procedure in `.relay/skills/<name>.md` and name it in the runner
 briefing. Encode one when a baton shows the same friction twice — a non-obvious
-build step, a test-harness gotcha, a convention the repo enforces that no runner
-could infer from the code. Reuse before you write: check `.relay/skills/` at
-planning time, and pull in project skills the repo already has.
+build step, a test-harness gotcha, a convention no runner could infer from the
+code. Reuse before you write: check `.relay/skills/` at planning time.
 
 A skill is a procedure, not a fact. "Run `pnpm -r build --filter crypto` before
 testing sharing, or keywrap resolves stale" is a skill. "The project uses pnpm"
@@ -260,20 +260,18 @@ belongs in `relay.md`.
 
 ## Models: match the model to the role
 
-No single model, and no single provider, is best at all three roles. Where you can
-choose: the **coach** needs slow, careful reasoning (constraint analysis,
-long-horizon decomposition); the **runner** needs code fluency and speed; the
-**judge** needs strict instruction-following and **a different provider from the
+No single provider is best at all three roles. Where you can choose: the **coach**
+needs slow, careful reasoning; the **runner** code fluency and speed; the
+**judge** strict instruction-following and **a different provider from the
 runner**, because same-family models share the blind spot that produced the bug.
-Keep the roles prompt-driven rather than pinned to a model — locking every role to
-one family caps the relay at that family's weakest capability.
+Keep roles prompt-driven — pinning them all to one family caps the relay at that
+family's weakest capability.
 
 ## Scaling down
 
-Not every task deserves a relay — a single-file fix or a question costs more to
-coordinate than to do. Use the harness when the objective spans multiple legs,
-must survive multiple context windows, or must be verifiably rather than plausibly
-correct. For small work keep only invariant one: state what done means first.
+Not every task deserves a relay — a single-file fix costs more to coordinate than
+to do. Use it when the objective spans multiple legs or must be verifiably rather
+than plausibly correct. For small work keep invariant one: define done first.
 
 ## References
 
@@ -281,4 +279,6 @@ correct. For small work keep only invariant one: state what done means first.
 - `references/execution.md` — briefings, batons, parallel runners, recovery plays
 - `references/validation.md` — checks that hold up, and the two judges
 - `references/dashboard.md` — Relay Control: when to render, what to write
-- `templates/` — state files; `assets/control.html` — dashboard template
+- `templates/` — the shapes for `relay.md`, `contract.md`, `legs.json`,
+  `state.json` and the baton; read one before writing that file.
+  `assets/control.html` — dashboard template

@@ -19,11 +19,19 @@ CONTEXT      files and modules that matter, and why
              findings from .relay/research/ and skills from .relay/skills/
              conventions this repo follows
 
+REFERENCES   read these first, by absolute path: references/execution.md for
+             batons and the shared-tree rules - or, for a judge leg,
+             references/validation.md, which is where its whole remit lives
+
 PROCEDURE    1. write the tests for the checks first
              2. implement until they pass
-             3. run: <exact verification commands>
-             4. commit with message "<leg>: <summary>"
-             5. write .relay/batons/sharing-invite-flow.md
+             3. mutate to prove each guard exists — about ten, aimed at the
+                properties these checks name, each restored from your own
+                backup. Exceed ten only with a reason written in the baton
+             4. run: <exact verification commands>
+             5. commit by explicit pathspec, message "<leg>: <summary>"
+             6. write .relay/batons/sharing-invite-flow.md in the shape
+                templates/baton.md gives, its commit sha included
 
 BOUNDARIES   do not touch: <paths, configs, schemas outside scope>
              do not change the acceptance contract
@@ -37,29 +45,17 @@ may not write outside their leg, talk to other runners, or escalate permissions.
 
 ## The baton
 
-Five fields. The runner writes it; you read it; every item gets disposed of.
+**`templates/baton.md` is the shape.** Copy it; do not invent a variant. The
+runner writes it, you read it, every item gets disposed of.
 
-```markdown
-# Baton — sharing-invite-flow
-STATUS: success | partial | failed
-
-## Implemented
-- what actually landed, in specifics
-
-## Left undone
-- anything skipped, stubbed, or deferred — say why
-
-## Commands run
-- `pnpm test sharing` → exit 0
-- `pnpm typecheck` → exit 1 (pre-existing, see issues)
-
-## Issues discovered
-- things noticed that are outside this leg's scope
-
-## Procedure followed
-- yes/no per step; where it diverged from the spec, and why
-- anything a future runner would waste time rediscovering
-```
+Both header fields are read by machine. `**Commit:**` wants its sha **in
+backticks**; without them the dashboard shows no commit against the leg, and
+`relay-control` has already shipped a run log with zero attributed commits.
+`**Status:**` fails worse than silently — a word the reader does not know renders
+as **Success**, on a failed leg too. The five sections below — implemented, left
+undone, commands run with exit codes, issues discovered, procedure followed — are
+what the disposal rule acts on, so a baton missing one has an item nobody must
+dispose of.
 
 **Disposal rule:** every item under "left undone" and "issues discovered" gets a
 follow-up leg or an explicit dismissal in `relay.md` with a real justification;
@@ -100,7 +96,7 @@ tracing, documentation research, per-leg review subagents, the judges at a gate.
 | Runner frozen, no tool calls | Time the suite before calling it a hang — a slow machine misread as one cost a reset of 642 lines. Then stop it, read the partial diff, and re-brief a fresh runner. |
 | Runner grinding on one problem | Cut it. Mark the leg partial, capture the baton, and either narrow the leg or escalate to the human. |
 | Leg keeps failing its checks | After three rounds, stop. The leg spec or the check is wrong, not the code. Re-scope. |
-| Fix breaks a passing check | Regression. Revert, make the regression itself a check, and re-plan the fix. |
+| Fix breaks a passing check | Regression. Revert, make the regression itself a check, and re-plan the fix — once. If that check breaks a second time, stop and hand back to the human. |
 | A mutation battery comes back all-killed | Suspect a driver killed mid-run: the restart reads the mutant as the original and everything looks guarded. `git status` the mutation copy, restore, verify the baseline, re-run. |
 | Human changes direction mid-run | Pause. Update `relay.md` and the contract first, then re-scope remaining legs. Never let the code and the contract drift apart. |
 | Blocked on something external | Halt the relay and hand back to the human with the exact blocker. Do not invent a workaround that violates the contract. |

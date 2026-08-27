@@ -44,7 +44,10 @@ code was written, in parallel with each other.
   largest files the stage touched with their line counts, plus duplication across
   legs, seams that leaked, and dead code. `tests/frame.py` reached 2900 lines over
   eight legs and no judge mentioned it — structure was not in its remit.
-- report findings as blocking / non-blocking / suggestion
+- report findings as blocking / non-blocking / suggestion, and **mark every
+  `Convention` check** in `state.json` — all of them, whatever the project's
+  standards demand, because they are measured from the tree. Nobody else can reach
+  them, and a check nobody marks reads `blocked` for ever.
 
 **Behaviour judge** — the system as a black box:
 
@@ -60,9 +63,9 @@ code was written, in parallel with each other.
   named that interface, while no way to run the product existed at all.
 - walk each check's flow through the running product, collecting its evidence
 - **"I could not start it" blocks the stage** — a failure raised against the
-  stage, not a note. Until something starts, every check in it reads `blocked`.
-- report each check as passed / failed / blocked, with the evidence attached or
-  the reason it could not be obtained
+  stage, not a note. Until something starts, every check it owns reads `blocked`.
+- mark every check that is not a `Convention` one passed / failed / blocked, with
+  the evidence attached or the reason it could not be obtained
 
 A check with no evidence is not passed. It is blocked.
 
@@ -84,6 +87,7 @@ fix legs. This is the architecture working, not failing.
 4. Re-judge the whole stage, not just the fixes. Fixes cause regressions.
 5. The stage is **cleared** only when every check in it reads `passed`.
 
-Stop and get a human when the same check fails three rounds, a fix breaks a
-previously passing check twice, the two judges disagree about whether something
-passed, or passing a check would require changing the contract.
+Stop and get a human when a check already has three fix legs against it — count
+the legs whose `repairs` names it — when a fix breaks a previously passing check
+twice, when the two judges disagree about whether something passed, or when
+passing a check would require changing the contract.
