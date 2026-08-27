@@ -40,16 +40,20 @@ screen's reserved last column — see `.relay/skills/pane-conventions.md`.
 
 What this view does not own
 ---------------------------
-`T` cycles the filter (ACC-NAV-003) because a filter row nobody can move is
-furniture; the selection highlight and the `Enter` detail of ACC-NAV-002/004
-belong to the navigation leg, which will find `state.filter["runners"]` already
-honoured here.
+**No key.** `T` was bound here so that the filter row could be seen moving, and
+this module's own runner asked that the handler be *deleted* rather than left to
+shadow a central one — two handlers for one key is how a view stops responding
+for reasons nobody can find. `navigation-and-filters` deleted it: `T`, `Up`/`Dn`
+and `Enter` are one handler in `app._navigate`. What survives is
+`state.filter["runners"]`, which this view honoured before there was a key to
+move it, and `visible_runners()`, which is the one answer to "which rows is the
+Runners view showing" for the count, the table and the selection alike.
 """
 
 import collections
 import time
 
-from . import chrome
+from . import chrome, navigation
 from . import theme as theme_tokens
 
 TITLE = "Runners"
@@ -86,7 +90,7 @@ def _number(runner):
     return None if n is None else str(n)
 
 
-def _clock(runner):
+def started(runner):
     """When this runner started, as a wall clock reads it. `None` stays `None`.
 
     A runner starts when the previous runner's baton lands, so a row whose
@@ -114,7 +118,7 @@ COLUMNS = (
     _Column("n", "#", _number, theme_tokens.MUTED),
     _Column("leg", "Leg", lambda r: r.get("leg"), theme_tokens.BODY),
     _Column("stage", "Stage", lambda r: r.get("stage"), theme_tokens.MUTED),
-    _Column("start", "Start", _clock, theme_tokens.MUTED),
+    _Column("start", "Start", started, theme_tokens.MUTED),
     _Column("duration", "Duration",
             lambda r: chrome.humanise_duration(r.get("duration")),
             theme_tokens.MUTED),
@@ -149,8 +153,15 @@ DROP_ORDER = ("baton", "commit", "start", "stage", "duration", "n")
 def draw(canvas, model, state):
     runners = model.get("runners") or []
     counts = model.get("runnerCounts") or {}
-    total = _count(counts, "total", runners, None)
-    pane = canvas.full_pane("%s (%d)" % (TITLE, total))
+    chosen = _filter_index(state)
+    # `Runners (N)` is the figure of the filter that is *showing*, taken from
+    # the same `runnerCounts` key the filter row highlights — so the title and
+    # the highlighted filter are one number under every filter (ACC-NAV-003),
+    # and it is still the model's own count and not a re-derived one
+    # (ACC-RUN-002).
+    label, status, key = FILTERS[chosen]
+    pane = canvas.full_pane("%s (%d)"
+                            % (TITLE, _count(counts, key, runners, status)))
     if pane is None:                       # too small for a pane at all
         return
     if not runners:
@@ -158,8 +169,7 @@ def draw(canvas, model, state):
         pane.empty("no runner has been on a leg yet")
         return
 
-    chosen = _filter_index(state)
-    rows = [runner for runner in runners if _matches(runner, chosen)]
+    rows = visible_runners(model, state)
     if pane.body_height <= 0:
         return
     _draw_filters(pane, counts, chosen, runners)
@@ -167,10 +177,11 @@ def draw(canvas, model, state):
         # A filter with nothing in it is not an empty pane: the row above says
         # how many there are of each, and this says which one is showing.
         pane.header("none")
-        pane.line(1, "no runner matches the %s filter" % FILTERS[chosen][0],
+        pane.line(1, "no runner matches the %s filter" % label,
                   theme_tokens.ABSENT)
         return
-    _draw_table(pane, rows, model.get("activeRunner"))
+    _draw_table(pane, rows, model.get("activeRunner"),
+                navigation.selected(state, "runners", len(rows)))
 
 
 def _draw_filters(pane, counts, chosen, runners):
@@ -191,12 +202,13 @@ def _draw_filters(pane, counts, chosen, runners):
                                       pane.theme.glyph("ellipsis")))
 
 
-def _draw_table(pane, rows, active):
+def _draw_table(pane, rows, active, chosen):
     """The column labels and the runner rows, fitted to the pane once.
 
     The layout is computed over *every* row the filter kept rather than over
     the page that fits, so a column neither appears nor changes width as a
-    reader pages through the list.
+    reader pages through the list — or scrolled it, which is now a thing a
+    reader can do (ACC-NAV-002).
     """
     cells = [_cells(runner, pane.theme, runner is active) for runner in rows]
     widths = _widths(cells)
@@ -211,15 +223,21 @@ def _draw_table(pane, rows, active):
                                            pane.body_width))
         top += 1
 
-    shown, hidden = chrome.paginate(cells, pane.body_height - top)
+    start, shown, above, below = navigation.window(
+        cells, pane.body_height - top, chosen)
     # Never a range the pane did not draw: `1-0 of 29` is the same sentence as
     # `1-0 of 0`, so a pane too short for one row says how many there are.
-    pane.header("1-%d of %d" % (len(shown), len(cells)) if shown
-                else "%d runners" % len(cells))
+    pane.header("%d-%d of %d" % (start + 1, start + len(shown), len(cells))
+                if shown else "%d runners" % len(cells))
+    if above:
+        pane.line(top, "+%d earlier" % above, theme_tokens.MUTED)
+        top += 1
     for offset, row in enumerate(shown):
-        pane.segments(top + offset, _row_segments(row, kept, widths,
-                                                  pane.theme, pane.body_width))
-    pane.more(hidden, row=top + len(shown))
+        parts = _row_segments(row, kept, widths, pane.theme, pane.body_width)
+        if start + offset == chosen:
+            parts = navigation.highlight(parts, pane.body_width)
+        pane.segments(top + offset, parts)
+    pane.more(below, row=top + len(shown))
 
 
 def _cells(runner, theme, active):
@@ -346,15 +364,22 @@ COLUMNS_BY_KEY = {column.key: column for column in COLUMNS}
 
 def _filter_index(state):
     """Which filter is showing. Out of range wraps rather than raising."""
-    try:
-        return int(state.filter.get("runners", 0)) % len(FILTERS)
-    except (AttributeError, TypeError, ValueError):  # pragma: no cover
-        return 0
+    return navigation.filter_index(state, "runners", len(FILTERS))
 
 
-def _matches(runner, chosen):
-    wanted = FILTERS[chosen][1]
-    return wanted is None or runner.get("status") == wanted
+def visible_runners(model, state):
+    """The runner rows the active filter selects, in the model's order.
+
+    One answer, used three times: the table draws these rows, the selection
+    indexes into them, and `Enter` opens the detail of one of them. A second
+    list comprehension somewhere else is how a selection comes to point at a
+    row a reader is not looking at.
+    """
+    runners = model.get("runners") or []
+    wanted = FILTERS[_filter_index(state)][1]
+    if wanted is None:
+        return list(runners)
+    return [runner for runner in runners if runner.get("status") == wanted]
 
 
 def _count(counts, key, runners, status):
@@ -374,11 +399,3 @@ def _count(counts, key, runners, status):
         return value
     return sum(1 for runner in runners
                if status is None or runner.get("status") == status)
-
-
-def handle(key, state, model):
-    """`T` cycles the filter row. Everything else — `q` above all — falls through."""
-    if key in (ord("t"), ord("T")):
-        state.filter["runners"] = (_filter_index(state) + 1) % len(FILTERS)
-        return True
-    return False

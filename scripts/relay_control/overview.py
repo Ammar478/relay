@@ -38,7 +38,7 @@ Nothing here reads a file, calls `build()`, or mutates the model; everything is
 `model`. See `.relay/skills/pane-conventions.md`.
 """
 
-from . import chrome
+from . import chrome, navigation
 from . import theme as theme_tokens
 
 TITLE = "Overview"
@@ -269,7 +269,12 @@ def _draw_legs(pane, model):
 
     active = next((index for index, leg in enumerate(legs)
                    if leg.get("isActive")), None)
-    above, shown, below = _leg_window(legs, pane.body_height, active)
+    # `navigation.window()` is `_leg_window()`, moved there whole by
+    # `navigation-and-filters` when the Legs, Runners and Contract views needed
+    # the same window around a *selected* row. One list, one privileged row,
+    # one answer; here the privileged row is the running leg.
+    _start, shown, above, below = navigation.window(
+        legs, pane.body_height, active)
     row = 0
     if above:
         pane.line(row, "+%d earlier" % above, theme_tokens.MUTED)
@@ -277,48 +282,6 @@ def _draw_legs(pane, model):
     for offset, leg in enumerate(shown):
         _draw_leg_row(pane, row + offset, leg)
     pane.more(below, row=row + len(shown))
-
-
-def _leg_window(legs, height, active):
-    """`(above, shown, below)` — the legs to draw, and how many are hidden.
-
-    Plan order throughout; what moves is the window. The running leg is the one
-    row this pane exists for, so it is always inside the window: the live relay
-    is 27 legs into 36, and a pane that drew the first fourteen would answer
-    "which leg is running?" with `+22 more`.
-
-    Each end that hides something spends a row saying so. When only one marker
-    row fits, that marker reports *everything* hidden rather than the half of it
-    below the window — a count that silently omits the legs above it is the same
-    lie as `1-0 of 12`.
-    """
-    total = len(legs)
-    if height <= 0:
-        return 0, [], total
-    if total <= height:
-        return 0, list(legs), 0
-    if active is None or active < height - 1:
-        # Nothing running, or the running leg is inside the first screenful:
-        # plain overflow, one marker at the bottom.
-        shown, hidden = chrome.paginate(legs, height)
-        return 0, shown, hidden
-
-    def start_for(span):
-        # One row of context under the running leg where there is room for it,
-        # and never scrolled past the running leg itself.
-        start = min(max(0, active - span + 2), total - span)
-        return max(0, min(start, active))
-
-    span = max(1, height - 1)
-    start = start_for(span)
-    if start > 0 and start + span < total and height >= 3:
-        span = height - 2                       # a marker at each end
-        start = start_for(span)
-    shown = list(legs[start:start + span])
-    below = total - start - span
-    if height - len(shown) - (1 if below else 0) < 1:
-        return 0, shown, below + start          # only one marker row fits
-    return start, shown, below
 
 
 def _draw_leg_row(pane, row, leg):

@@ -47,15 +47,26 @@ That word, not the glyph, is what ACC-CONT-004's distinction rests on here.
 
 What this view does not own
 ---------------------------
-The selection highlight and the `Enter` detail of ACC-NAV-002/004 belong to the
-navigation leg. `T` is not bound and is not advertised: the Contract view has no
+**No key.** `Up`/`Dn` and `Enter` are one handler in `app._navigate`, for all
+five views. This module supplies the two things only it can answer: the checks
+in the order it draws them (`checks_in_order()`), so a selection indexes the
+list a reader is actually looking at, and `shown_status()`, so the detail a
+reader opens on a check says the same word the row does.
+
+`T` is still not bound and still not advertised: the Contract view has no
 filter row, and a keybar naming a key the view does not take is a lie on every
-frame. See `.relay/skills/pane-conventions.md`.
+frame. ACC-NAV-003 is about "the filter row of the current view", and this view
+does not have one — the checks are already grouped by area, with each group's
+own `N/M evidenced`, which is the cut a supervisor needs here. Flagged in the
+baton for the coach: if a filter row is wanted on this view, its counts must
+come from `shown_status()` and not from `checkCounts`, because those two
+disagree by exactly the checks this view exists to downgrade.
+See `.relay/skills/pane-conventions.md`.
 """
 
 import collections
 
-from . import chrome
+from . import chrome, navigation
 from . import theme as theme_tokens
 
 TITLE = "Contract"
@@ -107,10 +118,20 @@ FIX_LEG = "fix leg: "
 #: Emptiness, in words — never `0/0`, never a blank body.
 EMPTY = "no acceptance checks recorded"
 
-#: `heading` is carried because a heading may not be the last row drawn: it is
-#: a label for the rows under it, and cutting between the two draws exactly the
-#: empty heading `.relay/skills/pane-conventions.md` forbids.
-_Row = collections.namedtuple("_Row", "heading parts")
+#: One drawn row. This view's body is not a list of checks — a check is a row
+#: plus however much prose it has — so a row carries what it belongs to:
+#:
+#: * `heading` — an area heading. A heading may not be the last row drawn: it is
+#:   a label for the rows under it, and cutting between the two draws exactly
+#:   the empty heading `.relay/skills/pane-conventions.md` forbids.
+#: * `check` — the index into `checks_in_order()` of the check this row is part
+#:   of, or None. It is what lets a selection over *checks* be drawn and
+#:   scrolled over *rows* without a second list to keep in step.
+#: * `lead` — the check's own row, as against its prose. The highlight goes on
+#:   it, and a window never opens on a prose row whose check is off the screen
+#:   above it.
+_Row = collections.namedtuple("_Row", "heading parts check lead")
+_Row.__new__.__defaults__ = (None, False)
 
 
 # --------------------------------------------------------------------------
@@ -182,6 +203,18 @@ def _evidenced(checks):
 # --------------------------------------------------------------------------
 
 
+def checks_in_order(model, state=None):
+    """Every check, in the order this view draws them (ACC-CONT-004's order).
+
+    Flat, and across the area headings, because that is the list `Up`/`Dn`
+    walks: a reader pressing `Dn` on the last check of `CRED` expects the first
+    check of `CUTOVER`, not a stop. `state` is accepted and unused — this view
+    has no filter row — so that `app._NAV` can call every view's rows the same
+    way.
+    """
+    return [check for _, members in _groups(model) for check in members]
+
+
 def draw(canvas, model, state):
     pane = canvas.full_pane(TITLE)
     if pane is None:                       # too small for a pane at all
@@ -195,13 +228,18 @@ def draw(canvas, model, state):
     checks = [check for _, members in groups for check in members]
     pane.header(_meta(checks, pane.theme))
 
-    rows = _rows(groups, pane.theme, pane.body_width)
-    shown, hidden = _fit(rows, pane.body_height)
+    chosen = navigation.selected(state, "contract", len(checks))
+    rows = _rows(groups, pane.theme, pane.body_width, chosen)
+    shown, above, below = _window(rows, pane.body_height, chosen)
+    top = 0
+    if above:
+        pane.line(0, "+%d earlier" % above, theme_tokens.MUTED)
+        top = 1
     for index, row in enumerate(shown):
-        pane.segments(index, row.parts)
+        pane.segments(top + index, row.parts)
     # The marker belongs at the end of the region that overflowed, which here
     # runs to the bottom of the pane only when no heading had to be given back.
-    pane.more(hidden, row=len(shown))
+    pane.more(below, row=top + len(shown))
 
 
 def _meta(checks, theme):
@@ -220,17 +258,18 @@ def _meta(checks, theme):
     return meta
 
 
-def _rows(groups, theme, width):
+def _rows(groups, theme, width, chosen):
     """Every row the view would draw, in reading order, before any cutting.
 
-    One list, cut once (`_fit`). Paginating each group separately would spend a
-    row per group on its own `+N more`, and the pane a supervisor reads at
+    One list, cut once (`_window`). Paginating each group separately would spend
+    a row per group on its own `+N more`, and the pane a supervisor reads at
     80x24 has twenty body rows for thirty-nine checks.
     """
     idw = max(len(_id_of(check))
               for _, members in groups for check in members)
     ellipsis = theme.glyph("ellipsis")
     rows = []
+    index = 0
     for area, members in groups:
         rows.append(_Row(True, chrome.fit_parts([
             (area, theme_tokens.PANE_TITLE),
@@ -238,7 +277,9 @@ def _rows(groups, theme, width):
              theme_tokens.PANE_META),
         ], width, ellipsis)))
         for check in members:
-            rows.extend(_check_rows(check, theme, width, idw))
+            rows.extend(_check_rows(check, theme, width, idw, index,
+                                    index == chosen))
+            index += 1
     return rows
 
 
@@ -246,11 +287,15 @@ def _id_of(check):
     return str(check.get("id") or "(unnamed check)")
 
 
-def _check_rows(check, theme, width, idw):
+def _check_rows(check, theme, width, idw, index, chosen):
     """One check: its own row, then whatever prose it has, indented under it.
 
     A check with nothing to say is exactly one row — ACC-CONT-003, which is a
     defect this view shipped once as a glyph split across two lines.
+
+    The highlight goes on the check's own row and not on its prose: the prose
+    is indented *under* the row, and a block of reverse video several lines deep
+    reads as a region rather than as the row the keyboard is on.
     """
     status = shown_status(check)
     glyph, attr = theme.status(status)
@@ -258,15 +303,18 @@ def _check_rows(check, theme, width, idw):
     # The glyph and the word carry the same attribute, from the same call: a
     # view cannot draw the right glyph in the wrong colour (ACC-TUI-006), and
     # the word is what separates blocked from failed, which share a glyph.
-    rows = [_Row(False, chrome.fit_parts([
+    parts = chrome.fit_parts([
         (glyph, attr),
         (" " * GAP, theme_tokens.MUTED),
         (_id_of(check).ljust(idw), theme_tokens.BODY),
         (" " * GAP, theme_tokens.MUTED),
         (status, attr),
-    ], width, ellipsis))]
+    ], width, ellipsis)
+    if chosen:
+        parts = navigation.highlight(parts, width)
+    rows = [_Row(False, parts, index, True)]
     for text, token in _prose(check, status):
-        rows.extend(_prose_rows(text, token, width))
+        rows.extend(_prose_rows(text, token, width, index))
     return rows
 
 
@@ -301,7 +349,7 @@ def _prose(check, status):
     return out
 
 
-def _prose_rows(text, token, width):
+def _prose_rows(text, token, width, index):
     """`text` wrapped into the pane, indented, and cut with `+N more`.
 
     The marker counts *lines*, which is what a reader counts, and it is spent
@@ -318,32 +366,50 @@ def _prose_rows(text, token, width):
     if len(lines) > PROSE_ROWS:
         hidden = len(lines) - (PROSE_ROWS - 1)
         lines = lines[:PROSE_ROWS - 1]
-    rows = [_Row(False, [(" " * INDENT, theme_tokens.MUTED), (line, token)])
+    rows = [_Row(False, [(" " * INDENT, theme_tokens.MUTED), (line, token)],
+                 index, False)
             for line in lines]
     if hidden:
         rows.append(_Row(False, [(" " * INDENT, theme_tokens.MUTED),
-                                 ("+%d more" % hidden, theme_tokens.MUTED)]))
+                                 ("+%d more" % hidden, theme_tokens.MUTED)],
+                         index, False))
     return rows
 
 
-def _fit(rows, height):
-    """`(shown, hidden)` — the rows that fit, one kept back for the marker.
+def _window(rows, height, chosen):
+    """`(shown, above, below)` — the rows that fit, with the selected check in them.
 
-    A heading is never the last row drawn: with no room for anything under it
-    it gives its row back to the count of what was hidden, which is a truer
-    statement than a label pointing at nothing.
+    `navigation.window()` does the arithmetic; what is here is the two things
+    that are true of *this* body and not of a plain list.
+
+    **A window never opens on an orphaned prose row.** A cut that lands between
+    a check and its evidence leaves a line indented under nothing, which reads
+    as a check whose id failed to draw. The start walks forward to the next row
+    that begins something — a heading or a check — and the rows that walk cost
+    are taken back at the bottom.
+
+    **A heading is never the last row drawn**, for the reason above it: with no
+    room for anything under it, it gives its row back to the count of what was
+    hidden, which is a truer statement than a label pointing at nothing.
 
     There is no special case for a pane with no body rows, deliberately:
     `Canvas.pane()` refuses anything under `MIN_PANE_HEIGHT`, so the smallest
-    body this is ever called with is one row and `height - 1` is already right
-    for it — the marker takes that row and reports the whole list. A branch no
-    caller can reach is a branch no test can prove, and this one was written
-    twice as `max(0, height - 1)`, where the clamp was unreachable and therefore
-    could be changed to `max(1, ...)` without any screen moving.
+    body this is ever called with is one row.
     """
-    if len(rows) <= height:
-        return rows, 0
-    shown = rows[:height - 1]
+    focus = next((index for index, row in enumerate(rows)
+                  if row.check == chosen and row.lead), None)
+    start, shown, above, below = navigation.window(rows, height, focus)
+    if start and shown:
+        span = len(shown)
+        moved = start
+        while moved < len(rows) and not (rows[moved].heading or rows[moved].lead):
+            moved += 1
+        if moved != start:
+            end = min(len(rows), moved + span)
+            shown = rows[moved:end]
+            above, below = ((moved, len(rows) - end) if above
+                            else (0, len(rows) - end + moved))
     while shown and shown[-1].heading:
         shown = shown[:-1]
-    return shown, len(rows) - len(shown)
+        below += 1
+    return shown, above, below

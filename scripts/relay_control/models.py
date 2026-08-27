@@ -61,9 +61,7 @@ a heading is never the last row drawn, and `+N more` counts only rows a reader
 would count as a line.
 """
 
-import curses
-
-from . import chrome
+from . import chrome, navigation
 from . import theme as theme_tokens
 
 TITLE = "Models"
@@ -461,33 +459,38 @@ def _note(state):
 
 
 # --------------------------------------------------------------------------
-# keys (ACC-MODEL-003)
+# what the keys reach (ACC-MODEL-003)
 # --------------------------------------------------------------------------
+#
+# This view had the only `handle()` worth keeping and it does not have one
+# either. `Up`/`Dn` and `Enter` are one handler, in `app._navigate`, for all
+# five views; what is left here is the two things only this module can answer —
+# which rows there are, and what `Enter` on one of them *says*.
+#
+# It is deliberately not a `navigation.Detail`. ACC-NAV-004's detail is "a full
+# pane for the selected leg, runner or check", and a toggle is none of the
+# three: what Enter owes a reader here is one sentence saying the TUI is
+# read-only and naming the file to edit, on the pane's own last row, which is
+# what ACC-MODEL-003 is judged on. So `app._NAV` gives this view a `message`
+# where the others have a `detail`, and the wording stays here.
+
+
+def rows(model, state):
+    """The selectable rows of this view: the toggles, in their spelled order."""
+    return list(TOGGLES)
 
 
 def selected(state):
     """Which toggle the keyboard is on. Out of range clamps rather than raising."""
-    try:
-        index = int(state.selection.get("models", 0))
-    except (AttributeError, TypeError, ValueError):  # pragma: no cover
-        return 0
-    return max(0, min(len(TOGGLES) - 1, index))
+    return navigation.selected(state, "models", len(TOGGLES))
 
 
-def handle(key, state, model):
-    """Up/Dn move between the toggles; Enter says why neither of them moves.
+def entered(row):
+    """What `Enter` on `row` says — ACC-MODEL-003's sentence, and nothing else.
 
-    `return False` at the end and nowhere else: a `return True` that fell out of
-    the `if` swallows `Tab`, `Esc` and `q`, and the view becomes a room with no
-    door. Quitting is never a view's decision.
+    A string, which is also how `app._compose` tells it from a navigation
+    detail: a detail is a dict, this is prose, and `_note()` above accepts only
+    the second. The TUI writes nothing anywhere; this module opens no file and
+    the ACC-TUI-007 sweep over the package proves it.
     """
-    if key in (curses.KEY_UP, curses.KEY_DOWN):
-        step = 1 if key == curses.KEY_DOWN else -1
-        state.selection["models"] = max(
-            0, min(len(TOGGLES) - 1, selected(state) + step))
-        state.detail = None                # the message named the other row
-        return True
-    if key in (10, 13, curses.KEY_ENTER):
-        state.detail = "%s %s" % (TOGGLES[selected(state)][1], READ_ONLY)
-        return True
-    return False
+    return "%s %s" % (row[1], READ_ONLY)

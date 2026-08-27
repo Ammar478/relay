@@ -592,11 +592,17 @@ def test_the_completed_filter_lists_no_running_leg():
         assert drawn, table.message("the Completed filter drew nothing")
         assert not set(drawn) & set(running), table.message(
             "a running leg is listed as completed: %r" % (set(drawn) & set(running)))
-        assert len(drawn) < table.count, table.message(
+        figures = dict(table.filter_counts())
+        # Against `All`, not against the view's own heading: since
+        # `navigation-and-filters` the heading is the *filtered* count
+        # (ACC-NAV-003), so `len(drawn) < table.count` would now be asking
+        # whether the Completed filter drew fewer rows than it says it has —
+        # which is not what this test is about. `All` is still the whole list.
+        assert len(drawn) < figures["All"], table.message(
             "the Completed filter drew every runner — it filtered nothing")
-        assert dict(table.filter_counts())["Completed"] == len(drawn), (
-            table.message("Completed (%d) over %d rows"
-                          % (dict(table.filter_counts())["Completed"], len(drawn))))
+        assert figures["Completed"] == len(drawn) == table.count, (
+            table.message("Completed (%d) over %d rows under a heading of %d"
+                          % (figures["Completed"], len(drawn), table.count)))
     finally:
         term.close()
 

@@ -23,17 +23,17 @@ because the obvious answer is wrong:
 
 What this module deliberately does *not* own, and why:
 
-* **Scrolling a long list to follow a selection is ACC-NAV-002's**, and
-  `navigation-and-filters` owns it. This view paginates (`chrome.paginate`) and
-  says `+N more`. At 80x24 the 36-leg fixture overflows and the tail of the
-  plan sits behind that marker; making the window follow
-  `state.selection["legs"]` is that leg's job, and duplicating
-  `overview._leg_window` here to half-do it would leave two answers to one
-  question. Two ends marked, one marker reporting everything hidden: the rule
-  is already written down in `.relay/skills/pane-conventions.md`.
-* **`Up`/`Dn` and `Enter`.** `T` is bound here because a filter row nobody can
-  move is a filter row nobody can see working; the selection and the detail
-  view are ACC-NAV-002/004.
+* **Any key.** `T` was bound here so that the filter row could be seen moving,
+  and `navigation-and-filters` deleted that handler: `T`, `Up`/`Dn` and `Enter`
+  are one handler in `app._navigate`, and a second one here would shadow it
+  silently. What this view keeps is `state.filter["legs"]`, which it honoured
+  before there was a key to move it and honours still.
+* **The shape of the scrolling window.** It is `navigation.window()`, which is
+  `overview._leg_window()` moved: the Overview privileges the *running* leg and
+  this view privileges the *selected* one, and that is the only difference
+  between them. Duplicating it here would have left two answers to one
+  question. Two ends marked, one marker reporting everything hidden when only
+  one row fits: `.relay/skills/pane-conventions.md`.
 
 Nothing here reads a file, calls `build()`, or mutates the model. `relay_model`
 is imported for its *vocabulary* only — the alias table that says which coach
@@ -42,7 +42,7 @@ words mean which state — and never for `build()`; see `raw_status_note()`.
 
 import relay_model
 
-from . import chrome
+from . import chrome, navigation
 from . import theme as theme_tokens
 
 TITLE = "Legs"
@@ -147,7 +147,7 @@ def raw_status_note(leg):
     return None if word in spellings else raw.strip()
 
 
-def _status_word(leg):
+def status_word(leg):
     """What the Status column says about `leg` — its note, or its state."""
     return (raw_status_note(leg) or STATE_WORDS.get(leg.get("status"))
             or str(leg.get("status") or ""))
@@ -175,10 +175,7 @@ def _note_attr(pane, note):
 
 def filter_index(state):
     """Which of `FILTERS` is active. Total over anything `state` may hold."""
-    try:
-        return int(state.filter["legs"]) % len(FILTERS)
-    except (AttributeError, KeyError, TypeError, ValueError):
-        return 0
+    return navigation.filter_index(state, "legs", len(FILTERS))
 
 
 def visible_legs(model, state):
@@ -261,7 +258,7 @@ def _filter_row(pane, counts, active):
 # --------------------------------------------------------------------------
 
 
-def _reference(leg):
+def reference(leg):
     """`S2/credential-parity` — the leg, said the way `Stage/ID` heads it."""
     identifier = leg.get("id") or "(unnamed leg)"
     stage = leg.get("stage")
@@ -293,10 +290,10 @@ def _layout(pane, legs, width):
     the status *word* goes and the glyph stands for it alone.
     """
     lead = max([len(_lead(pane, leg)[0]) for leg in legs] or [3])
-    widest = min(max([len(_status_word(leg)) for leg in legs] or [0]),
+    widest = min(max([len(status_word(leg)) for leg in legs] or [0]),
                  MAX_STATUS_WORD)
     status = max(len(COLUMNS[0]), lead + widest)
-    stage = max([len(_reference(leg))
+    stage = max([len(reference(leg))
                  + (len(_marker(leg)) + 1 if _marker(leg) else 0)
                  for leg in legs] or [0])
     stage = max(len(COLUMNS[1]), stage)
@@ -336,7 +333,7 @@ def _head_row(layout):
     return parts
 
 
-def _leg_row(pane, leg, layout):
+def _leg_row(pane, leg, layout, chosen=False):
     """One leg as one line: status, stage and id with its kind, what it fulfils.
 
     Every cell is clipped to its own column with the *theme's* ellipsis, so the
@@ -356,22 +353,29 @@ def _leg_row(pane, leg, layout):
     room = status_width - len(lead)
     if room > 0:
         note = raw_status_note(leg)
-        parts.append((chrome.clip(_status_word(leg), room, ellipsis)
+        # On the selected row the *word* gives its colour up and the glyph does
+        # not: the two say the same thing, and sixteen cells of un-highlighted
+        # status in front of the bar reads as a highlight that starts a third of
+        # the way across the row. A raw-status note keeps its colour whatever is
+        # selected — `blocked` must never read as `Pending` (ACC-LEGS-004), and
+        # that is the one thing in this cell the glyph does not already say.
+        parts.append((chrome.clip(status_word(leg), room, ellipsis)
                       .ljust(room + GAP),
-                      _note_attr(pane, note) if note else attr))
+                      _note_attr(pane, note) if note
+                      else theme_tokens.BODY if chosen else attr))
     else:
         parts.append((" " * GAP, theme_tokens.BODY))
 
     if stage_width:
         marker = _marker(leg)
         suffix = " " + marker if marker else ""
-        reference = chrome.clip(_reference(leg),
-                                max(1, stage_width - len(suffix)), ellipsis)
-        parts.append((reference, theme_tokens.EMPHASIS if leg.get("isActive")
+        cell = chrome.clip(reference(leg),
+                           max(1, stage_width - len(suffix)), ellipsis)
+        parts.append((cell, theme_tokens.EMPHASIS if leg.get("isActive")
                       else theme_tokens.BODY))
         if marker:
             parts.append((suffix, theme_tokens.KIND))
-        pad = stage_width - len(reference) - len(suffix)
+        pad = stage_width - len(cell) - len(suffix)
         if fulfills_width:
             pad += GAP
         if pad > 0:
@@ -387,7 +391,10 @@ def _leg_row(pane, leg, layout):
         parts.append((chrome.clip(checks, fulfills_width, ellipsis),
                       theme_tokens.MUTED) if checks
                      else (pane.theme.glyph("bullet"), theme_tokens.ABSENT))
-    return parts
+    # The row the keyboard is on is a *row*, padded across the pane, and the
+    # status glyph keeps its own state's colour under it (ACC-TUI-006) — see
+    # `navigation.highlight()` for why that falls out of the token's type.
+    return navigation.highlight(parts, pane.body_width) if chosen else parts
 
 
 # --------------------------------------------------------------------------
@@ -434,25 +441,20 @@ def draw(canvas, model, state):
         pane.segments(row, _head_row(layout))
         row += 1
 
-    drawn, hidden = chrome.paginate(shown, pane.body_height - row)
+    # The window follows the selection (ACC-NAV-002): 36 legs do not fit 80x24,
+    # and a list that drew the first fourteen would answer "where is my
+    # selection?" with `+22 more`.
+    chosen = navigation.selected(state, "legs", len(shown))
+    start, drawn, above, below = navigation.window(
+        shown, pane.body_height - row, chosen)
     # Never a range the pane did not draw: too short for a single leg says how
     # many there are instead (ACC-OVER-004's rule, and the same mistake).
-    pane.header("1-%d of %d" % (len(drawn), len(shown)) if drawn
-                else "%d legs" % len(shown))
+    pane.header("%d-%d of %d" % (start + 1, start + len(drawn), len(shown))
+                if drawn else "%d legs" % len(shown))
+    if above:
+        pane.line(row, "+%d earlier" % above, theme_tokens.MUTED)
+        row += 1
     for offset, leg in enumerate(drawn):
-        pane.segments(row + offset, _leg_row(pane, leg, layout))
-    pane.more(hidden, row=row + len(drawn))
-
-
-def handle(key, state, model):
-    """`T` cycles the filter row. Everything else falls through — `q` above all.
-
-    Bound here rather than in `app.py` because a view owns its own keys, and
-    bound at all because a filter row that cannot move is one nobody can see
-    working. The selection and the detail view are ACC-NAV-002/004 and belong
-    to `navigation-and-filters`.
-    """
-    if key in (ord("t"), ord("T")):
-        state.filter["legs"] = (filter_index(state) + 1) % len(FILTERS)
-        return True
-    return False
+        pane.segments(row + offset,
+                      _leg_row(pane, leg, layout, start + offset == chosen))
+    pane.more(below, row=row + len(drawn))
