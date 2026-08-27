@@ -483,10 +483,20 @@ def take_key():
 
 
 try:
-    if mode == "disciplined":
+    if mode in ("disciplined", "vouched-empty", "ris-honest",
+                "vouched-then-loose"):
         # Bracketed from the very first byte: this program has never put a
         # glyph on the screen that a closed bracket did not cover.
         out(OPEN + "\x1b[2J\x1b[HREADY" + SHUT)
+    elif mode == "wide-disciplined":
+        # The same discipline, painting out towards the right margin, so that
+        # a narrowing resize has drawn cells to delete.
+        out(OPEN + "\x1b[2J\x1b[HREADY\x1b[2;1H" + "EDGE" * 12 + SHUT)
+    elif mode == "ris-fault":
+        # A close with nothing open — the shape a quoted sequence makes — and
+        # then a hard reset, which the emulator used to take as permission to
+        # forget that it had seen one.
+        out("\x1b[2J\x1b[HREADY" + SHUT + "\x1bc" + "\x1b[HREADY")
     else:
         out("\x1b[2J\x1b[HREADY")
     take_key()
@@ -541,9 +551,45 @@ try:
         out("\x1b[2J\x1b[1;1HPANE header")
         flushed()
         os.kill(os.getpid(), signal.SIGKILL)
-    elif mode == "disciplined":
+    elif mode in ("disciplined", "wide-disciplined"):
         # Nothing is painted for this keystroke; the program simply goes,
         # leaving the bracketed screen it already vouched for.
+        flushed()
+        raise SystemExit(0)
+    elif mode == "vouched-empty":
+        # The empty bracket a TUI sends when a keystroke changes nothing —
+        # from a program whose screen was painted inside a bracket it closed.
+        out(OPEN + SHUT)
+    elif mode == "stale-open":
+        # A repaint opened for the PREVIOUS keystroke and still open when the
+        # wait for this one begins, closed the instant the key is read and
+        # covering nothing that was painted since. The answer is a third of a
+        # second away and outside any bracket.
+        out(OPEN + "\x1b[3;1HSTALE line")
+        take_key()
+        out(SHUT)
+        time.sleep(delay)
+        out("\x1b[5;1HANSWER now")
+    elif mode == "ris-fault":
+        out(OPEN + "\x1b[3;1HANSWER now" + SHUT)
+    elif mode == "ris-honest":
+        # A program that has bracketed everything and clears the screen with a
+        # hard reset INSIDE the bracket of the repaint that redraws it — so
+        # nothing is painted outside a bracket, and the close is honest.
+        out(OPEN + "\x1bc" + "\x1b[HDONE well" + SHUT)
+    elif mode == "vouched-then-loose":
+        # It HAS painted inside a bracket it closed — so `bracketed_paints`
+        # has moved — and then paints outside every bracket, before the wait
+        # that matters begins. Its answer is an empty bracket.
+        out("\x1b[3;1HLOOSE line")
+        take_key()
+        out(OPEN + SHUT)
+        time.sleep(delay)
+        out("\x1b[5;1HANSWER now")
+    elif mode == "ris-exit":
+        # Paints outside every bracket, wipes the record of that with a hard
+        # reset, then paints impeccably and goes.
+        out("\x1b[3;1HSCRATCH\x1bc" + OPEN + "\x1b[HDONE" + SHUT)
         flushed()
         raise SystemExit(0)
     elif mode == "final-exit":
@@ -564,6 +610,33 @@ finally:
 # on the way out. This is the ACC-ROBUST-003 / ACC-NAV-005 path: the app is
 # resized while it holds the alternate screen, and what it found must still be
 # there when it quits.
+# Forks a child that goes on writing after the program itself has exited, so
+# the pty is still noisy when the harness reaches "take whatever the exit path
+# wrote". That drain is not a wait with a budget of its own to spend.
+DEMO_LOUD_EXIT = r'''
+import os
+import signal
+import sys
+import time
+
+if os.fork() == 0:
+    # the session leader is about to exit, and the kernel SIGHUPs the
+    # foreground process group when it does
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    stop = time.monotonic() + 5
+    while time.monotonic() < stop:
+        sys.stdout.write("\x1b[9;1Hnoise")
+        sys.stdout.flush()
+        time.sleep(0.001)
+    os._exit(0)
+
+sys.stdout.write("\x1b[2J\x1b[1;1HPARENT DONE")
+sys.stdout.flush()
+time.sleep(0.05)
+os._exit(0)
+'''
+
+
 DEMO_ALT_SCREEN = r'''
 import curses
 import sys
@@ -726,7 +799,7 @@ import frame
 screen = frame.Screen(rows=24, cols=80)
 screen.feed("filler text")
 for _ in range(3):
-    for final in "STLM@PXb":
+    for final in "STLM@PXbZI":
         screen.feed("\x1b[200000000" + final)
     # a digit run past CPython's int-from-string limit: int() raises rather
     # than looping, which wedges feed() just as thoroughly
@@ -1041,6 +1114,172 @@ def test_an_escape_with_an_intermediate_byte_leaves_no_glyph():
     assert feed("\x1b(0lqk\x1b(BX").lines()[0].rstrip() == "┌─┐X"
 
 
+def test_writing_over_half_a_wide_character_destroys_the_whole_glyph():
+    """A double-width glyph is one character standing in two columns.
+
+    Overwrite either column and the glyph is gone — a terminal blanks both
+    halves, because half of a 漢 is not something a screen can show. Editing
+    the halves independently left frames showing a glyph the terminal was not
+    showing, and rows whose display width no longer matched the screen: an
+    erase from the right half of a pair left an eleven-column row on a
+    ten-column screen, which `assert_within_width()` passed, because the
+    orphaned placeholder still made the row the right number of CELLS.
+    """
+    assert feed("漢字\x1b[2GA", 3, 10).lines()[0].rstrip() == " A字"
+    assert feed("漢字\x1b[1GA", 3, 10).lines()[0].rstrip() == "A 字"
+    assert feed("漢字\x1b[2G\x1b[0K", 3, 10).lines()[0].rstrip() == ""
+    assert feed("漢字\x1b[2G\x1b[1K", 3, 10).lines()[0].rstrip() == "  字"
+    # ...and an erase that runs through the LEFT half takes the glyph with it
+    assert feed("漢字\x1b[3G\x1b[1K", 3, 10).lines()[0].rstrip() == ""
+    # and a wide character is not damaged by an edit that leaves it alone
+    assert feed("漢字\x1b[5GA", 3, 10).lines()[0].rstrip() == "漢字A"
+    # an erase that starts inside a pair, and one that ends inside a
+    # different one without starting in any: both ends of the range have to
+    # be asked, and only one of them was
+    assert feed("漢字\x1b[1;3H\x1b[1X", 3, 10).lines()[0].rstrip() == "漢"
+    assert feed("AB漢字\x1b[1;2H\x1b[2X", 3, 10).lines()[0].rstrip() == "A   字"
+    assert feed("AB漢字\x1b[1;2H\x1b[2P", 3, 10).lines()[0].rstrip() == "A 字"
+    assert feed("漢字\x1b[4G\x1b[0K", 3, 10).lines()[0].rstrip() == "漢"
+    # a WIDE character written across the halves of two other pairs
+    assert feed("  漢字\x1b[4G中", 3, 10).lines()[0].rstrip() == "   中"
+    # an edit that shifts the row can separate a pair anywhere in it: DCH
+    # leaves the placeholder at the head of the row with nothing before it,
+    # and ICH pushes a pair's second half off the right edge
+    assert feed("漢字\x1b[1G\x1b[1P", 3, 10).lines()[0].rstrip() == " 字"
+    assert feed("\x1b[1;9H漢\x1b[1;1H\x1b[1@", 3, 10).lines()[0].rstrip() == ""
+    # ...and insert mode shifts the row the same way, one character at a time
+    assert feed("\x1b[1;9H漢\x1b[1;1H\x1b[4hX", 3, 10).lines()[0].rstrip() == "X"
+    # the invariant that all of this exists for: every row is exactly as wide
+    # as the screen, however a pair was broken
+    for case in ("漢字\x1b[2GA", "漢字\x1b[1GA", "漢字\x1b[2G\x1b[0K",
+                 "漢字\x1b[1G\x1b[1@", "漢字\x1b[2G\x1b[1P",
+                 "漢字\x1b[3G\x1b[2X", "  漢字\x1b[1G\x1b[2P",
+                 "漢字\x1b[1G\x1b[1P", "漢字\x1b[4G\x1b[0K",
+                 "  漢字\x1b[4G中", "漢字\x1b[1;3H\x1b[1X",
+                 "\x1b[1;9H漢\x1b[1;1H\x1b[1@",
+                 "\x1b[1;9H漢\x1b[1;1H\x1b[4hX",
+                 "AB漢字\x1b[1;2H\x1b[2X", "AB漢字\x1b[1;2H\x1b[2P"):
+        screen = feed(case, 3, 10)
+        for index, row in enumerate(screen.cells()):
+            width = sum(display_width(cell) for cell in row)
+            assert width == screen.cols, (case, index, width, row)
+
+
+def test_a_resize_does_not_leave_half_a_wide_character_on_the_screen():
+    """The same invariant, when it is the harness that cuts the column."""
+    screen = feed("ab漢字", 3, 10)
+    screen.resize(3, 3)              # the cut falls between 漢's two halves
+    assert screen.lines()[0].rstrip() == "ab"
+    for row in screen.cells():
+        assert sum(display_width(cell) for cell in row) == screen.cols
+
+
+def test_back_tab_and_forward_tab_move_between_the_tab_stops():
+    """`CSI Z` is `cbt` in `xterm-256color`, so ncurses sends it.
+
+    Unimplemented, it left the cursor where it was and every cell drawn after
+    it landed in the wrong column — a frame in which the content is real and
+    the layout is not.
+    """
+    # two tabs put X at column 16; the cursor is at 17, and one back-tab
+    # takes it to the stop at 16, where Y lands on top of the X
+    screen = feed("\t\tX\x1b[ZY", 3, 30)
+    assert screen.lines()[0].rstrip() == " " * 16 + "Y"
+    # two back-tabs from column 25 reach the stop at 16, leaving X at 24
+    assert feed("\t\t\tX\x1b[2ZY", 3, 40).lines()[0].rstrip() == (
+        " " * 16 + "Y" + " " * 7 + "X")
+    # forward tab, its twin
+    screen = feed("\x1b[2IX", 3, 30)
+    assert screen.lines()[0].rstrip() == " " * 16 + "X"
+    # and a count past the row does not run off it
+    assert feed("\x1b[99IX", 3, 30).cursor_col == 29
+    assert feed("\t\t\x1b[99ZX", 3, 30).lines()[0].rstrip() == "X"
+
+
+def test_a_repeat_with_nothing_to_repeat_paints_nothing():
+    """REP repeats the last graphic character. With none, there is nothing.
+
+    `_last_char` was seeded with a blank, so `ESC[3b` before anything had been
+    drawn painted three cells — with the current background on them, which is
+    visible in the attribute plane — and moved the cursor past them.
+    """
+    screen = feed("\x1b[41m\x1b[3bX", 3, 10)
+    assert screen.lines()[0].rstrip() == "X"
+    assert screen.attrs()[0][1].bg is None, "REP painted cells from cold"
+    assert screen.cursor_col == 1
+    # a hard reset takes the last character with the screen
+    after_ris = feed("A\x1bc\x1b[3bX", 3, 10)
+    assert after_ris.lines()[0].rstrip() == "X"
+    # ...and REP still repeats what there is
+    assert feed("A\x1b[3b", 3, 10).lines()[0].rstrip() == "AAAA"
+
+
+def test_a_c1_control_is_a_control_and_not_a_glyph():
+    """U+0080-U+009F are the C1 controls. A terminal never draws one.
+
+    They reach a UTF-8 terminal as the two bytes `C2 8x`, which is exactly
+    what a pane rendering a log line with Windows-1252 mojibake in it puts on
+    the wire — and drawing them was the same leak as an aborted OSC dropping
+    its bytes into the text plane, one byte earlier: `0x9B` IS CSI, so
+    `0x9B 1 ; 1 H` addressed the cursor on a real terminal and left `1;1H` on
+    the screen here. ECMA-48 defines each C1 as `ESC` plus the byte minus
+    0x40, which is how they are read, so nothing new is invented for them.
+    """
+    assert feed("A\x9b1;1HB").lines()[0].rstrip() == "B"        # CSI
+    assert feed("A\x9d0;title\x07B").lines()[0].rstrip() == "AB"  # OSC
+    assert feed("A\x90q\x1b\\B").lines()[0].rstrip() == "AB"      # DCS ... ST
+    assert feed("A\x9eping\x07B").lines()[0].rstrip() == "AB"    # PM
+    nel = feed("A\x85B")                                        # NEL
+    assert [line.rstrip() for line in nel.lines()[:2]] == ["A", "B"]
+    ind = feed("A\x84B")                                        # IND
+    assert ind.lines()[1].rstrip() == " B"
+    reverse = feed("\r\nA\x8dB")                                # RI
+    assert reverse.lines()[0].rstrip() == " B"
+    # ...and the ones this emulator does not model leave nothing behind,
+    # rather than a letter
+    assert feed("A\x8eB").lines()[0].rstrip() == "AB"            # SS2
+    assert feed("A\x86B").lines()[0].rstrip() == "AB"            # SSA
+    # DEL is discarded by every terminal there has ever been
+    assert feed("A\x7fB").lines()[0].rstrip() == "AB"
+
+
+def test_an_escape_begins_a_sequence_from_wherever_the_parser_was():
+    """`ESC` is what makes an escape sequence: it starts one from any state.
+
+    Reading it as a one-character escape "we do not need" in the middle of a
+    half-finished sequence handed the NEXT sequence to the screen with its
+    introducer eaten, so `ESC ESC [ 3 1 m X` drew `[31mX` — the same defect
+    the OSC abort path was fixed for, in three more states. `CAN` and `SUB`
+    cancel the sequence in progress for the same reason, from the same states.
+    """
+    # a stray ESC in front of a real sequence loses neither
+    assert feed("\x1b\x1b[31mX").lines()[0].rstrip() == "X"
+    assert feed("\x1b(\x1b[31mX").lines()[0].rstrip() == "X"
+    assert feed("\x1b#\x1b[31mX").lines()[0].rstrip() == "X"
+    # ...and in the other direction, the sequence still runs: RIS clears
+    assert feed("AB\x1b\x1bc").lines()[0].rstrip() == ""
+    # CAN and SUB end the sequence, and what follows is content again
+    assert feed("\x1b[1\x18mHello").lines()[0].rstrip() == "mHello"
+    assert feed("\x1b[1\x1amHello").lines()[0].rstrip() == "mHello"
+    # the OSC case is the one that ate cells rather than inventing them
+    assert feed("\x1b]0;a\x18bc XYZ").lines()[0].rstrip() == "bc XYZ"
+    # a designation carrying intermediates of its own is consumed whole
+    assert feed("\x1b(%5ABC").lines()[0].rstrip() == "ABC"
+    # and none of that broke the designation every curses border needs
+    assert feed("\x1b(0lqk\x1b(BX").lines()[0].rstrip() == "┌─┐X"
+
+
+def test_a_string_ends_at_the_one_character_form_of_its_terminator():
+    """`ST` is `ESC \\` or the single character 0x9C, and both end the string.
+
+    Reading the one-character form as string content ran the OSC on until the
+    next BEL, swallowing everything the program drew in between — a whole
+    pane missing from a frame, with nothing to show it had ever been drawn.
+    """
+    screen = feed("\x1b]0;title\x9cVISIBLE")
+    assert screen.lines()[0].rstrip() == "VISIBLE"
+
+
 def test_synchronized_output_brackets_are_tracked():
     """DEC 2026 is the one thing a program can say about its own painting."""
     screen = Screen(5, 20)
@@ -1110,6 +1349,139 @@ def test_painting_outside_a_bracket_is_counted():
     held = screen.unbracketed_paints
     screen.feed("\x1b[?2026h\x1b[?1049h\x1b[?1049l\x1b[?2026l")
     assert screen.unbracketed_paints == held
+
+
+def test_the_bracket_record_survives_the_hard_reset_that_wipes_the_screen():
+    """`ESC c` resets the screen. It does not reset what the program has done.
+
+    RIS is a sequence a program emits, and every count beside the grid is a
+    record of that program's own behaviour: a close it sent with nothing open,
+    a glyph it put on the screen outside every bracket. Clearing them with the
+    grid let a program erase the evidence of its own misbehaviour by asking
+    for a blank screen — `unsound` became `synchronised`, `abandoned` became
+    `exited`, and the session-wide backstop had nothing left to refuse.
+    """
+    screen = feed("\x1b[?2026h" + "in a bracket" + "\x1b[?2026l"
+                  + "\x1b[?2026lhello")     # a bracket, a stray close, loose paint
+    assert screen.synchronized_faults == 1
+    record = (screen.synchronized_updates, screen.synchronized_opens,
+              screen.bracketed_paints)
+    assert all(record), record
+    loose = screen.unbracketed_paints
+    assert loose >= 1
+    screen.feed("\x1bc")
+    assert screen.lines()[0].rstrip() == "", "RIS must still clear the screen"
+    assert screen.synchronized_faults == 1, "a hard reset erased a fault"
+    assert (screen.synchronized_updates, screen.synchronized_opens,
+            screen.bracketed_paints) == record, (
+        "a hard reset erased part of the record of what the program had "
+        "already done with its brackets"
+    )
+    assert screen.unbracketed_paints > loose, (
+        "a hard reset erased the painting the program never bracketed — and "
+        "wiping the screen is itself painting"
+    )
+    # ...and inside a bracket the bracket covers it, RIS included
+    loose = screen.unbracketed_paints
+    screen.feed("\x1b[?2026hX\x1bc\x1b[?2026l")
+    assert screen.unbracketed_paints == loose
+    assert screen.synchronized_updates == 2
+    assert screen.synchronized_opens == 2
+
+
+def test_a_hard_reset_decides_nothing_about_the_screen_being_vouched_for():
+    """RIS is painting, and painting is what decides this — not the reset.
+
+    A sweep mutation that had `reset()` set `screen_vouched = True` is the
+    laundering shape in miniature, and it is *nearly* equivalent: RIS is a
+    change to the screen, so `_painted()` runs immediately after the reset and
+    sets the flag from the state of the bracket. Outside a bracket that is
+    always False, whatever the reset said. Inside one it is the close that
+    decides — and between the reset and that close the two answers differ,
+    which is what this pins.
+    """
+    outside = feed("\x1b[?2026hpainted\x1b[?2026l", 3, 10)
+    assert outside.screen_vouched is True
+    outside.feed("\x1bc")
+    assert outside.screen_vouched is False, "a reset outside a bracket vouches"
+
+    inside = feed("loose", 3, 10)
+    assert inside.screen_vouched is False
+    inside.feed("\x1b[?2026h\x1bc")
+    assert inside.screen_vouched is False, (
+        "a reset inside a bracket vouched for the screen before the program "
+        "had closed the bracket"
+    )
+    inside.feed("\x1b[?2026l")
+    assert inside.screen_vouched is True   # the close, on a bracket that painted
+
+
+def test_an_empty_bracket_carries_the_screen_s_proof_and_does_not_create_it():
+    """What a close vouches for is the repaint. `screen_vouched` is the screen.
+
+    A close whose bracket enclosed painting is the program saying the screen
+    it just drew is whole. A close whose bracket enclosed nothing says only
+    that a repaint which drew nothing is over — true, and worth exactly the
+    proof that was already there. So an empty bracket carries the state
+    forward in both directions rather than granting it.
+    """
+    screen = feed("hi", rows=5, cols=20)
+    assert screen.screen_vouched is False        # painted outside a bracket
+    screen.feed("\x1b[?2026h\x1b[?2026l")
+    assert screen.screen_vouched is False, "an empty bracket invented proof"
+    screen.feed("\x1b[?2026h\x1b[2J\x1b[Hok\x1b[?2026l")
+    assert screen.screen_vouched is True
+    screen.feed("\x1b[?2026h\x1b[?2026l")
+    assert screen.screen_vouched is True, "an empty bracket withdrew proof"
+    screen.feed("X")
+    assert screen.screen_vouched is False, "loose painting left the screen proved"
+    # a bracket the program never closes vouches for nothing
+    screen.feed("\x1b[?2026h\x1b[2J\x1b[HY")
+    assert screen.screen_vouched is False
+
+
+def test_a_resize_that_deletes_drawn_cells_leaves_the_screen_unvouched():
+    """The harness's own destruction, recorded where the endings can see it.
+
+    `Screen.resize()` keeps the top-left corner and drops the rest. What it
+    drops are cells a program drew and vouched for, and no statement of the
+    program's covers the screen that is left — least of all if the program has
+    already exited and will never paint again.
+    """
+    screen = feed("\x1b[?2026habcdefghij\x1b[?2026l", rows=5, cols=20)
+    assert screen.screen_vouched is True
+    screen.resize(5, 12)                 # nothing was drawn past column 10
+    assert screen.screen_vouched is True, "a resize that dropped nothing"
+    screen.resize(4, 20)                 # nothing was drawn on the bottom row
+    assert screen.screen_vouched is True
+    screen.resize(4, 4)                  # this deletes "efghij"
+    assert screen.screen_vouched is False, "the harness deleted drawn cells"
+    assert screen.lines()[0].rstrip() == "abcd"
+    # and the program painting a whole repaint again puts it back, which is
+    # what every resize test in this project depends on
+    screen.feed("\x1b[?2026h\x1b[2J\x1b[Hok\x1b[?2026l")
+    assert screen.screen_vouched is True
+
+    # a row falling off the bottom is the same loss as a column off the side
+    rows = feed("\x1b[?2026h\x1b[4;1Hbottom row\x1b[?2026l", rows=5, cols=20)
+    assert rows.screen_vouched is True
+    rows.resize(4, 20)                   # row 4 is empty; row 3 is not
+    assert rows.screen_vouched is True
+    rows.resize(3, 20)
+    assert rows.screen_vouched is False, "the harness deleted a drawn row"
+
+    # ...and a cell whose content is a background is drawn too. Back-colour
+    # erase is how a pane paints its own ground, so a frame full of nothing
+    # but colour is a frame full of what the program drew.
+    ground = feed("\x1b[?2026h\x1b[1;10H\x1b[41m\x1b[5X\x1b[?2026l",
+                  rows=5, cols=20)
+    assert ground.screen_vouched is True
+    assert ground.lines()[0].rstrip() == ""          # nothing but colour
+    ground.resize(5, 9)
+    assert ground.screen_vouched is False, (
+        "the harness deleted cells the program had coloured and called what "
+        "was left the screen the program painted"
+    )
 
 
 def test_the_alternate_screen_is_kept_when_the_program_gives_it_back():
@@ -1366,6 +1738,52 @@ REPEAT_COUNTS = [0, 1, 19, 20, 21, 99, 100, 101, 150, 199, 200, 201, 219, 220,
                  250, 5007]
 
 
+def test_one_cell_cannot_be_grown_without_limit():
+    """A cell holds a cluster, not a stream.
+
+    A zero-width mark joins the cell before it, and nothing bounded how many.
+    U+0301 written for as long as a program cares to write grew ONE cell
+    without limit — and every mark rewrote the whole cell string, so the cost
+    of each 64KB read rose with everything read before it: a measured 0.16s
+    per read at 65k marks, 0.97s at half a million, inside a `feed()` that
+    checks no deadline at all. That is `ESC[200000000S` arriving one byte at a
+    time.
+
+    `REP` then multiplies it: the count is clamped to the grid in CELLS, which
+    is not a clamp in bytes when the cell is unbounded — a 6x20 screen carried
+    a 24MB frame, and every `wait_for` poll builds a frame.
+    """
+    screen = Screen(6, 20)
+    screen.feed("X" + "\u0301" * 200_000)
+    cell = screen.cells()[0][0]
+    assert cell.startswith("X")
+    assert len(cell) < 64, len(cell)
+    assert display_width(cell) == 1              # still one column, as before
+    screen.feed("\x1b[9999999b")                 # ...and REP cannot multiply it
+    assert len(screen.frame().text) < 4000, len(screen.frame().text)
+    # the cluster a program actually draws is untouched
+    assert feed("e\u0301!").lines()[0].rstrip() == "e\u0301!"
+
+
+def test_the_unknown_parameter_record_cannot_be_grown_without_limit():
+    """`CellAttrs.other` records what the harness does not model. Bounded.
+
+    Every distinct unknown SGR parameter was kept forever, in a set copied on
+    every SGR and referenced by every cell drawn afterwards — `ESC[0<0m`,
+    `ESC[0<1m`, ... measured 3.5s for the first twenty thousand and 14.3s for
+    the next twenty thousand, all of it inside `feed()`.
+    """
+    screen = Screen(5, 20)
+    screen.feed("".join("\x1b[0<%dm" % i for i in range(5000)))
+    screen.feed("X")
+    other = screen.attrs()[0][0].other
+    assert len(other) < 500, len(other)
+    assert "0<0" in other, "the cap dropped the record instead of bounding it"
+    # and unknown parameters are still recorded, which is the point of them
+    assert ">2" in feed("\x1b[1;>2mX").attrs()[0][0].other
+    assert 73 in feed("\x1b[73mY").attrs()[0][0].other
+
+
 @pytest.mark.parametrize("count", REPEAT_COUNTS)
 @pytest.mark.parametrize("start", [0, 7, 43])
 def test_a_repeat_leaves_the_screen_writing_the_characters_would(count, start):
@@ -1396,6 +1814,26 @@ def test_inserting_more_characters_than_the_row_holds():
     step = feed("abcdef\x1b[1;3H" + "\x1b[@" * 5000)
     assert clamped.lines() == step.lines()
     assert clamped.lines()[0] == "ab" + " " * 18
+
+
+def test_a_csi_too_long_to_be_a_sequence_leaves_nothing_behind():
+    """The parameter buffer is the one buffer a program sizes. Cap it.
+
+    Past the cap the sequence is still parsed to its final byte — those bytes
+    are not content — and then dropped, because dispatching what was kept
+    would act on a cell the program never named: `CSI <400k semicolons> H`
+    reads as a cursor address to the home position, and the program asked for
+    no such thing. What follows the sequence is drawn normally, so the parser
+    is not left wedged.
+    """
+    overlong = "\x1b[" + ";" * 400_000 + "H"
+    screen = feed("\x1b[3;4Hhere" + overlong + "X", 6, 20)
+    assert screen.cursor_row == 2, "an overlong CSI addressed the cursor"
+    assert screen.lines()[2].rstrip() == "   hereX"
+    assert screen.lines()[0].rstrip() == ""
+    # a long-but-readable sequence is unaffected: five thousand digits is a
+    # parameter this emulator is required to survive, not to drop
+    assert feed("one\r\ntwo\x1b[" + "9" * 5000 + "S").lines()[0].rstrip() == ""
 
 
 def test_a_parameter_too_long_to_be_a_number_is_survived():
@@ -2336,8 +2774,15 @@ def test_a_repaint_that_found_nothing_to_change_still_ends_the_wait(brackets):
 
     Which is why the rule is about painting the close did not cover, and not
     about the bracket being empty.
+
+    The program here is one whose screen a closed bracket does cover — it
+    painted READY inside one, exactly as the TUI's first repaint does — so its
+    empty bracket has a proof to carry forward. An empty bracket from a
+    program that never vouched for anything carries nothing, and
+    `test_an_empty_bracket_certifies_nothing_when_nothing_was_vouched` is that
+    half of the same sentence.
     """
-    with session(brackets, "honest-empty", "0.3", rows=10, cols=60,
+    with session(brackets, "vouched-empty", "0.3", rows=10, cols=60,
                  paint=0.05, redraw=3.0) as term:
         term.wait_for("READY")
         frame = term.send("x", expect="READY")
@@ -2673,6 +3118,86 @@ def test_a_resize_carries_the_same_boundary_and_the_same_knob(program):
         assert whole.contains("BODY resized"), whole.text
 
 
+def test_a_wait_keeps_to_its_own_budget_against_a_program_that_never_stops(
+        noisy):
+    """A wait may not outlast the budget its caller gave it.
+
+    The drain underneath every wait returns when the program goes quiet, and
+    its own cap — the one that decides how long "never goes quiet" costs — was
+    the SESSION timeout, not the caller's. So a program that writes a tick
+    every millisecond made `wait_for(timeout=0.4)` cost the session's five
+    seconds, and a session opened with `timeout=60` for a slow program gave
+    every wait in it a sixty-second floor. Each of those loops checks its own
+    deadline only BETWEEN drains, so the overrun is a whole drain long.
+
+    The ending is unchanged and is asserted here too: the needle never
+    appeared, and the failure says so with the screen.
+    """
+    with session(noisy, "chatty", "0.001", rows=10, cols=60,
+                 timeout=4.0, redraw=0.3) as term:
+        term.wait_for("READY")
+        term.send("x")                     # the ticking starts here
+        started = time.monotonic()
+        with pytest.raises(AssertionError) as excinfo:
+            term.wait_for("NEVER PAINTED", timeout=0.4)
+        elapsed = time.monotonic() - started
+    assert "never appeared" in str(excinfo.value)
+    assert "tick" in str(excinfo.value)     # with the screen it did have
+    assert elapsed < 2.0, (
+        "a wait given 0.4s ran for %.2fs — to the session timeout, not its "
+        "own" % elapsed
+    )
+
+
+def test_taking_what_the_exit_path_wrote_is_not_an_open_ended_wait(program):
+    """What a program wrote on its way out is finite. A grandchild is not.
+
+    Three drains exist only to collect what the exit path wrote, and they took
+    their cap from the session timeout — so a process still holding the pty
+    and writing could spend all of it. They carry a bound of their own now.
+
+    What this test measures is that the exit path is prompt with somebody else
+    still writing to the pty, and that the ending is unchanged — the program
+    never bracketed anything, so its exit says nothing about the screen. It
+    does NOT pin the bound's value, and a sweep mutation raising it to ten
+    minutes survives: once the program is gone the pty hands the drain an
+    error rather than the grandchild's bytes, and it returns in under a
+    millisecond whatever the cap says. The bound is what happens on the
+    platform that does not.
+    """
+    path = program("loud-exit", DEMO_LOUD_EXIT)
+    with session(path, rows=10, cols=60, timeout=8.0, redraw=1.0) as term:
+        started = time.monotonic()
+        frame = term.wait_for("PARENT DONE")
+        elapsed = time.monotonic() - started
+    assert frame.paint_end == PAINT_ABANDONED
+    assert elapsed < 3.0, (
+        "the exit drain ran for %.2fs against a pty somebody else was still "
+        "writing to" % elapsed
+    )
+
+
+def test_the_response_wait_keeps_to_its_own_budget_too(noisy):
+    """The same bound, on the wait `send()` uses when no text is named.
+
+    `send(settle=...)` is the caller saying how long a keystroke that draws
+    nothing may cost. Against a program that never stops writing it cost the
+    session timeout instead, because the drain underneath took its cap from
+    the session rather than from the window it was given.
+    """
+    with session(noisy, "chatty", "0.001", rows=10, cols=60,
+                 timeout=4.0, redraw=0.3) as term:
+        term.wait_for("READY")
+        started = time.monotonic()
+        frame = term.send("x", settle=0.2)
+        elapsed = time.monotonic() - started
+    assert frame.contains("PANE header"), frame.text
+    assert elapsed < 2.0, (
+        "a send given a 0.2s window ran for %.2fs — to the session timeout, "
+        "not its own" % elapsed
+    )
+
+
 def test_expect_refuses_a_screen_the_program_had_not_stopped_writing(noisy):
     """The one case a terminal is certain about is a failure, not a frame.
 
@@ -2712,6 +3237,262 @@ def test_a_program_that_has_exited_left_a_screen_it_never_vouched_for(program):
         with pytest.raises(AssertionError) as excinfo:
             frame.assert_finished()
         assert "nothing more is coming" in str(excinfo.value)
+
+
+# --------------------------------------------------------------------------
+# The four laundering routes
+#
+# ACC-FRAME-001: a frame reports `synchronised` or `exited` ONLY when the
+# screen it carries is one the program vouched for, and neither a sequence a
+# program can emit nor an action of the harness's own may launder a refused
+# ending into a proved one. Four routes could. Each test below drives one of
+# them, deterministically, and asserts the ending the harness is entitled to.
+# Every one of them reported a proved ending before this leg.
+# --------------------------------------------------------------------------
+
+
+def test_a_hard_reset_does_not_erase_the_fault_it_has_already_seen(brackets):
+    """Route 1, mid-run: `ESC c` wiping `synchronized_faults`.
+
+    The program sends a close with nothing open — byte for byte the shape a
+    pane quoting the sequence makes — and then a hard reset. RIS resets the
+    *screen*; it is not a statement about the program's brackets, and what
+    this stream has already put on the wire is not the screen's to forget.
+    Erasing it turned `unsound` into `synchronised` for every frame that
+    followed, and took the session-wide backstop with it: the run ended green
+    on a stream whose brackets do not balance.
+    """
+    captured = []
+    with pytest.raises(AssertionError) as teardown:
+        with session(brackets, "ris-fault", "0.3", rows=10, cols=60,
+                     paint=0.05, redraw=3.0) as term:
+            term.wait_for("READY")
+            captured.append(term.send("x", expect="ANSWER now"))
+    frame = captured[0]
+    assert frame.paint_end == PAINT_UNSOUND, (
+        "a hard reset laundered a stream whose brackets do not balance into "
+        "the strongest label the harness has: %s" % frame.paint_end
+    )
+    with pytest.raises(AssertionError) as excinfo:
+        frame.assert_finished()
+    assert "not proof" in str(excinfo.value)
+    assert "did not balance" in str(teardown.value), (
+        "the session-wide backstop was erased along with the fault"
+    )
+
+
+def test_a_hard_reset_does_not_erase_the_painting_it_never_bracketed(brackets):
+    """Route 1, at the exit: `ESC c` wiping `unbracketed_paints`.
+
+    This program paints outside every bracket, wipes the screen with RIS and
+    goes. The exit branch asks a property of the whole session — did this
+    program ever put a glyph on the screen that a bracket it closed did not
+    cover — and RIS used to zero the answer. So a program that never bracketed
+    anything in its life was handed `exited`, which is the label for one that
+    bracketed everything.
+    """
+    with session(brackets, "ris-exit", "0.3", rows=10, cols=60,
+                 paint=0.05, redraw=3.0) as term:
+        term.wait_for("READY")
+        frame = term.send("x", expect="DONE")
+    assert frame.paint_end == PAINT_ABANDONED, (
+        "a hard reset laundered a program that never bracketed a glyph into "
+        "one whose exit proves the screen: %s" % frame.paint_end
+    )
+    assert frame.paint_finished is False
+    with pytest.raises(AssertionError) as excinfo:
+        frame.assert_finished()
+    assert "nothing more is coming" in str(excinfo.value)
+
+
+def test_a_hard_reset_does_not_cost_a_program_the_proof_it_can_still_give(
+        brackets):
+    """The mirror image of the two routes above, and it is why they are two.
+
+    RIS must not erase what the program has done. It must not erase what the
+    program can still DO either: a mutation that zeroed `synchronized_updates`
+    on reset — leaving the faults and the loose painting alone, so no screen
+    was laundered — quietly cost every later close its meaning, because the
+    wait compares that count against a baseline taken before the reset. The
+    frame goes back on the 0.2s guess instead of the program's own word, and
+    nothing fails.
+
+    The reset here is inside the bracket of the repaint that redraws the
+    screen, which is the only shape in which a close after a reset can be
+    proof at all: a reset outside one is painting outside a bracket, and the
+    close then falls back to silence like any other.
+    """
+    with session(brackets, "ris-honest", "0.3", rows=10, cols=60,
+                 paint=0.05, redraw=3.0) as term:
+        term.wait_for("READY")
+        frame = term.send("x", expect="DONE well")
+    assert frame.paint_end == PAINT_SYNCHRONISED, (
+        "a hard reset inside a bracket cost that bracket's close the meaning "
+        "it had: %s" % frame.paint_end
+    )
+    frame.assert_finished()
+
+
+def test_an_empty_bracket_does_not_carry_proof_across_loose_painting(brackets):
+    """Route 3 again, from the program the TUI actually looks like.
+
+    The empty bracket carries the screen's proof forward, and the question is
+    what "forward" means for a program that HAS bracketed repaints before —
+    which is every real TUI, and which the first version of this guard got
+    wrong: it asked whether the program had ever painted inside a bracket
+    rather than whether THIS bracket enclosed anything. Here the program
+    brackets its first repaint, then paints outside every bracket while the
+    harness is not in a wait, then answers the keystroke with an empty
+    bracket. The screen carries a line no closed bracket covers.
+    """
+    with session(brackets, "vouched-then-loose", "0.3", rows=10, cols=60,
+                 paint=0.05, redraw=3.0) as term:
+        term.wait_for("READY")
+        loose = term.send("x")           # drains the unbracketed painting
+        assert loose.contains("LOOSE line"), loose.text
+        frame = term.send("y", expect="LOOSE line", quiet=0.6)
+    assert frame.paint_end == PAINT_QUIET, (
+        "an empty bracket certified a screen carrying painting no bracket "
+        "enclosed, because an earlier repaint had been bracketed: %s"
+        % frame.paint_end
+    )
+    assert frame.contains("ANSWER now"), frame.text
+    with pytest.raises(AssertionError):
+        frame.assert_finished()
+
+
+def test_a_bracket_already_open_when_the_wait_begins_does_not_end_it(brackets):
+    """Route 2: a close whose bracket predates the keystroke.
+
+    The program opens a repaint for the previous keystroke and the harness
+    drains it, so when the wait for the next key begins a bracket is open and
+    everything inside it was painted before that key existed. Closing it the
+    instant the key is read ended the wait: `send()` handed back the
+    PRE-KEYSTROKE screen stamped `synchronised`, and a negative assertion on
+    it passed against a screen the keystroke had never touched. The answer was
+    a third of a second away, and outside any bracket.
+
+    A bracket that straddles the start of a wait can still end it — the second
+    keystroke in `test_a_close_that_does_not_cover_what_was_painted_is_not_
+    the_end_of_it` is exactly that shape, and it is honest, because it
+    enclosed the painting the wait was there for. This one enclosed nothing
+    that happened after the baseline.
+    """
+    with session(brackets, "stale-open", "0.3", rows=10, cols=60,
+                 paint=0.05, redraw=3.0) as term:
+        term.wait_for("READY")
+        opened = term.send("x")        # drains the bracket the program opens
+        assert opened.contains("STALE line"), opened.text
+        # A quiet window wider than the program's pause, so that the frame
+        # that comes back is decided by what the harness makes of the close
+        # and not by the harness giving up first.
+        frame = term.send("y", expect="STALE line", quiet=0.6)
+    assert frame.contains("ANSWER now"), (
+        "a bracket opened before the keystroke was taken for the answer to "
+        "it, and the wait ended before the answer was painted: %s" % frame.text
+    )
+    assert frame.paint_end == PAINT_QUIET, (
+        "a close that covered nothing painted since the wait began was read "
+        "as the end of the repaint that answered the key: %s" % frame.paint_end
+    )
+    assert frame.paint_finished is False
+    with pytest.raises(AssertionError) as excinfo:
+        frame.assert_finished()
+    assert "not proof" in str(excinfo.value)
+
+
+def test_an_empty_bracket_certifies_nothing_when_nothing_was_vouched(brackets):
+    """Route 3: the empty bracket, on a screen no closed bracket covers.
+
+    This program painted READY outside every bracket and answered the key with
+    `ESC[?2026h ESC[?2026l` — a well-formed close of a repaint that drew
+    nothing. The close is honest about its own bracket and says nothing
+    whatever about the screen, which is painting the program never vouched
+    for. The harness stamped the frame `synchronised` anyway.
+
+    The asymmetry that hid this: `unbracketed_paints` was read from the wait's
+    baseline for a close and across the whole session for an exit, so THE SAME
+    SCREEN from THE SAME PROGRAM was proof one moment and `abandoned` the
+    next. What a close honestly carries forward is the proof that was already
+    there; where there was none, an empty bracket adds nothing to it.
+    """
+    with session(brackets, "honest-empty", "0.3", rows=10, cols=60,
+                 paint=0.05, redraw=3.0) as term:
+        term.wait_for("READY")
+        frame = term.send("x", expect="READY")
+    assert frame.contains("READY")
+    assert frame.paint_end == PAINT_QUIET, (
+        "an empty bracket certified a screen that no bracket ever enclosed: "
+        "%s" % frame.paint_end
+    )
+    assert frame.paint_finished is False
+    with pytest.raises(AssertionError) as excinfo:
+        frame.assert_finished()
+    assert "not proof" in str(excinfo.value)
+
+
+def test_a_resize_of_the_harness_own_does_not_leave_proof_behind(brackets):
+    """Route 4: the harness deleting drawn cells and calling the result proof.
+
+    This program brackets every glyph it paints, out towards the right margin,
+    and then exits — `exited`, honestly, on the screen it left. Then the
+    harness narrows the grid, which deletes cells the program had drawn and
+    which nobody will paint again, because the program is gone. The screen is
+    now one no program ever produced, and the exit branch — which asks only
+    what the PROGRAM did — still called it proof. The harness laundering its
+    own destruction is the worst of the four, because no program's discipline
+    can defend against it.
+    """
+    with session(brackets, "wide-disciplined", "0.3", rows=10, cols=60) as term:
+        term.wait_for("READY")
+        whole = term.send("x", expect="READY")
+        assert whole.paint_end == PAINT_EXITED
+        assert whole.contains("EDGE" * 12), whole.text
+        damaged = term.resize(10, 24, expect="READY")
+    assert not damaged.contains("EDGE" * 12), (
+        "the resize was supposed to delete drawn cells: %s" % damaged.text
+    )
+    assert damaged.paint_end == PAINT_ABANDONED, (
+        "the harness deleted cells the program had drawn and handed the "
+        "wreckage back as proof: %s" % damaged.paint_end
+    )
+    assert damaged.paint_finished is False
+    with pytest.raises(AssertionError):
+        damaged.assert_finished()
+
+
+def test_a_negative_assertion_is_refused_on_a_screen_known_to_be_torn(
+        brackets):
+    """The evidence debt this leg could close inside its own boundary.
+
+    Twenty-seven accessors read a `Frame`, and exactly one of them — 
+    `assert_finished()` — consulted `paint_end`. That is how every laundering
+    route stayed invisible for eight legs: a test reads the text, the rows,
+    the attributes of a frame without ever learning that the frame is not
+    trustworthy, and the assertions that pass for the wrong reason on a torn
+    screen are the negative ones, which say nothing about what WAS drawn.
+
+    So the two endings that are positive evidence the screen cannot be read —
+    the program died inside a bracket, or its brackets did not balance —
+    refuse a negative assertion instead of passing it. `abandoned` and `quiet`
+    still pass: they mean nothing vouched for this screen, which is weaker
+    than knowing it is half of one, and a program that prints a message and
+    exits is `abandoned`.
+    """
+    with session(brackets, "torn", "0.3", rows=10, cols=60) as term:
+        term.wait_for("READY")
+        frame = term.send("x", expect="PANE header")
+    assert frame.paint_end == PAINT_TORN
+    frame.assert_contains("PANE header")            # positive: still allowed
+    with pytest.raises(AssertionError) as excinfo:
+        frame.assert_not_contains("BODY middle")
+    assert "negative assertion" in str(excinfo.value)
+    assert "PANE header" in str(excinfo.value)      # with the screen
+    # ...and the endings that are not that evidence are not refused
+    quiet = Frame(["only a screen"], paint_end=PAINT_QUIET)
+    quiet.assert_not_contains("nope")
+    Frame(["only a screen"], paint_end=PAINT_ABANDONED).assert_not_contains("x")
+    Frame(["only a screen"]).assert_not_contains("x")
 
 
 # --------------------------------------------------------------------------
