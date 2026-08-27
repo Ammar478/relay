@@ -526,11 +526,34 @@ def commit_claims(text):
 
     Seven characters each, the width `git log --format=%h` gives a repository
     this size, so a claim and a commit compare as equals rather than by prefix.
+
+    LOWER CASE, WHICH IS GIT'S OWN SPELLING, AND THIS IS THE ONE PLACE A SHA IS
+    NORMALISED (ACC-DATA-009, 2026-08-27). An object name is hex: git resolves
+    `37C9718` and `37c9718` to the same commit, `%h` prints the lower-case
+    spelling, and the three claim patterns above are `re.I` - so a runner who
+    wrote a sha in upper case, or pasted one out of a tool that upper-cases,
+    made a claim this model must read as naming that commit.
+
+    It used to be kept VERBATIM, and that was the third spine disagreement:
+    `cat-file` confirmed the upper-case spelling, so the runner row carried it,
+    while `_commit_entries` keys its attribution on `%h` and missed - the leg's
+    own commit was attributed to NOBODY, sometimes appearing twice, with no
+    warning. Six rounds of judging missed it because every sha in every corpus
+    was lower case: a guard whose population has only one kind of thing in it
+    cannot fail, which is the same defect as an unclaimed population that is
+    always empty.
+
+    Normalising HERE rather than at the attribution key is deliberate. This is
+    the boundary a sha enters the model at, and there are two consumers - the
+    runner row and the log - that must agree; normalising at one of them leaves
+    the row quoting one spelling and the log the other, which is the same
+    disagreement wearing different clothes. A claim is therefore reported in
+    the spelling the repository uses, not the spelling the baton typed.
     """
     seen = {}
     for pattern in COMMIT_CLAIM_RES:
         for match in pattern.finditer(text):
-            seen.setdefault(match.group(1)[:7], match.start())
+            seen.setdefault(match.group(1)[:7].lower(), match.start())
     return sorted(seen, key=seen.get)
 
 
@@ -1440,8 +1463,9 @@ def _settle_commits(repo, batons, warnings):
                    if repo is None else "its repository could not be asked")
             warnings.append(
                 "the commit claims in this relay's batons cannot be confirmed "
-                f"({why}); the runner rows quote them as their batons wrote "
-                "them and the log attributes none of them")
+                f"({why}); the runner rows and the log's landings carry them "
+                "unconfirmed, on their batons' word alone, and no commit "
+                "entry is derived for them")
         return
     for leg, baton in sorted(batons.items()):
         baton["commit"] = next((sha for sha in baton["claims"] if sha in resolved),
@@ -1542,12 +1566,12 @@ def _mtime(path):
     return st.st_mtime if stat.S_ISREG(st.st_mode) else None
 
 
-def _relay_records(relay_dir, runners, batons, checks, events):
-    """What the relay has RECORDED about itself: `(has_records, floor)`.
+def _record_floor(relay_dir, runners, batons, checks):
+    """The relay's EARLIEST RECORD of itself, or None where it has none.
 
     THE INVARIANT (ACC-DATA-009): the commit window is a property of what the
     relay has recorded on disk, and never a property of what the log derivation
-    has so far produced. `events` is one input here and never the deciding one.
+    has so far produced. Nothing this function reads is a derived entry.
 
     That distinction is the whole reason this function exists. A relay one leg
     in - a single `running` leg holding the only baton - derives no entry at
@@ -1558,17 +1582,18 @@ def _relay_records(relay_dir, runners, batons, checks, events):
     Four fixes to that class landed and the class stayed open, because each was
     written against the shape in front of it rather than against the rule.
 
-    `has_records` is the contract's degenerate carve-out read backwards. A
-    relay has no window only when it has no baton, no running leg and no judged
-    check - and there, showing recent commits is the only story there is. Every
-    other relay has a window, INCLUDING one whose records have produced no
-    visible entry yet.
+    None is the contract's degenerate carve-out, and it arrives two ways that
+    come to the same thing: a relay with no baton, no running leg and no judged
+    check has recorded nothing, and there, showing recent commits is the only
+    story there is; a relay whose records exist but cannot be TIMED - an
+    unreadable mtime - has nothing to open a window at either. A separate
+    `has_records` flag used to be returned beside this and consulted before it.
+    It was redundant on every input: a relay with no records has no timed
+    record either, so the flag could only ever repeat what `None` already says,
+    and two mutants that flipped it outright left the whole suite green
+    (2026-08-27). One answer, from one place.
 
-    `floor` is the earliest of those records, or None when none of them can be
-    timed - a relay can have a record whose time is unreadable, and a window
-    with no floor is still a window: the budget still applies, and a claimed
-    commit never needed a floor to begin with. Three sources, in decreasing
-    order of how well they date themselves:
+    Three sources, in decreasing order of how well they date themselves:
 
     * a baton's mtime is when its runner landed. Every baton counts, including
       the running leg's, which is exactly the one the entry list drops.
@@ -1578,23 +1603,25 @@ def _relay_records(relay_dir, runners, batons, checks, events):
     * `state.json` records that a check was judged. Same reasoning, same file
       mtime.
 
-    Derived event times join the union because the contract names them, but
-    they can only ever agree with it: every entry the log derives is timed by a
-    baton mtime already in the set, so including them can lower the floor and
-    never raise it, and they never decide whether there is a floor at all.
+    DERIVED ENTRIES ARE NOT A SOURCE, and they used to be added to this union
+    "because the contract names them". The contract says the opposite in as
+    many words - "records on disk, never entries this function is deriving" -
+    and every entry the log derives is timed by a baton mtime that is already
+    here: a landing IS a baton mtime, a handoff is the PREVIOUS baton's mtime,
+    and a check transition is anchored to the mtime of the baton that claimed
+    it. So the term could never move the answer, which is why deleting it left
+    the whole suite green (2026-08-27). It is deleted rather than defended.
     """
     running = any(row["status"] == "running" for row in runners)
     judged = any(_is_judged(check) for check in checks)
-    has_records = bool(batons) or running or judged
 
     times = [baton["mtime"] for baton in batons.values()]
     if running:
         times.append(_mtime(relay_dir / "legs.json"))
     if judged:
         times.append(_mtime(relay_dir / "state.json"))
-    times.extend(entry["t"] for entry in events)
     times = [t for t in times if t is not None]
-    return has_records, (min(times) if times else None)
+    return min(times) if times else None
 
 
 def _is_judged(check):
@@ -1654,34 +1681,55 @@ def _floored(commits, floor):
     return [c for c in commits if c[0] >= floor]
 
 
-def _commit_entries(repo, batons, records, budget, now):
+def _commit_entries(repo, batons, floor, now):
     """Commit entries for the log: the run's own commits first (ACC-DATA-009).
 
-    `records` is `(has_records, floor)` from `_relay_records`: what the relay
-    has recorded about itself, read off disk. It is the floor of the unclaimed
-    population here and the walk's coverage test in `_relay_commits`, and
-    `budget` is how many unattributed commits may sit beside the relay's own
-    events.
+    `floor` is the relay's earliest record, from `_record_floor`, read off
+    disk. It is the floor of the unclaimed population, and after 2026-08-27 it
+    is the only thing this function bounds that population by. None means the
+    relay has recorded nothing this walk can be floored at, and the walk then
+    comes through as it came - the contract's degenerate carve-out.
 
-    RULE: `has_records` decides whether there is a window, and it is NOT
-    "did the derivation produce an entry". A relay whose only records are a
-    running leg and its baton derives no entry at all and still has a window -
-    it is a relay one leg in, not a relay that has done nothing (ACC-DATA-009,
-    as amended 2026-08-25). Gating on the entry list is how a run one leg in
-    came to report forty of its project's unrelated commits as its own.
+    RULE: the floor comes from the RECORDS, and it is NOT "did the derivation
+    produce an entry". A relay whose only records are a running leg and its
+    baton derives no entry at all and still has a window - it is a relay one
+    leg in, not a relay that has done nothing (ACC-DATA-009, as amended
+    2026-08-25). Gating on the entry list is how a run one leg in came to
+    report forty of its project's unrelated commits as its own.
 
-    WHICH commits the budget buys is the property, not how many. A relay's own
-    commits are the *oldest* inside its own window, so a budget spent newest
-    first removes exactly them and keeps the project's unrelated traffic: the
-    live agent-service relay carried 12 commit entries under that rule, none of
-    them attributable to a leg, which satisfies a count bound while inverting
-    what the log is for.
+    THERE IS NO ENTRY BUDGET HERE ANY MORE (ACC-DATA-009, rewritten
+    2026-08-27), and it is the root cause of six judging rounds. This function
+    took one - `len(events)`, the relay's own dated events - and spent the
+    confirmed claims OUT OF IT before the rest:
 
-    RULE: an attributed commit is not a budget line. Every commit a baton
-    claims is kept, and `budget` buys only the newest of what is left over.
-    The budget used to be `min(events, MAX - events)` spent on attribution
-    first, which above 150 relay events starts discarding attributed commits
-    oldest-first and re-inverts the property at scale.
+        kept = attributed + rest[:max(0, budget - len(attributed))]
+
+    Both populations came from one pool, so a relay with three legs and three
+    claims had NOTHING left for the commits nobody claimed. Measured at the
+    round-7 gate: three legs, three batons each claiming a real commit, three
+    unclaimed commits above the record floor, reachable from HEAD and well
+    inside both the walk and the 300-entry bound - 0 of 3 in the log, and 0
+    warnings. What was admitted tracked the RECORD count and neither the floor
+    nor the depth: 0 records bought 5 of 5 commits, 1 bought 1, 2 bought 2.
+    A relay with a running leg and no baton yet - the shape of every relay's
+    FIRST leg - derives no event at all, so its budget was zero and its log
+    came back EMPTY beside a drawn runner row, silently, while its branch
+    carried five commits above its records.
+
+    That one line is also why the runner rows and the log could never disagree
+    and why 25 topology cells could not fail: claims are fetched by name, and a
+    budget that starts at the event count can never be smaller than the claim
+    count, so attribution was total by construction and the unclaimed
+    population was empty by construction. Five rounds of topology fixes kept
+    relocating the defect because none of them touched the arithmetic.
+
+    RULE: a confirmed claim is not charged to the unclaimed allowance. Every
+    commit a baton claims and the repository confirms is kept, however many
+    there are, and the remainder is bounded ELSEWHERE - by the record floor
+    here, and by the entry bound in `_derived_log`, which is the one seam that
+    owns how much of the log fits in a pane. One bound per question: a second
+    count here could only re-decide what that one decided, and the last time
+    two bounds shared one pool this is what came of it.
 
     RULE: ONE floor, and it governs one population (ACC-DATA-009, simplified
     2026-08-26). A commit a baton claims and the repository confirms is this
@@ -1698,17 +1746,13 @@ def _commit_entries(repo, batons, records, budget, now):
     a worse failure than one that omits, and under the rule above it cannot:
     the runner row and the commit entry read the same settled claim.
 
-    A commit must still be absent from the log because it is out of window,
-    never because the budget ran out before reaching it - the two are
-    indistinguishable on the pane and only one of them is the property.
+    A commit is absent from the log because it is out of window, never because
+    a count ran out before reaching it - the two are indistinguishable on the
+    pane and only one of them is the property.
 
-    Only commits are budgeted. A baton, a handoff or a check transition is
-    never dropped to make room: they are the events a supervisor came to the
-    pane for. And a relay with no records at all has neither a window nor
-    anything to budget against, so the walk comes through as it came: see
-    `_relay_commits`.
+    A relay with no records at all has no window, so the walk comes through as
+    it came: see `_relay_commits`.
     """
-    has_records, since = records
     # Attribution comes from the batons rather than from the runner rows, for
     # the same reason the landings above do: a baton is what happened, and a
     # leg that `legs.json` forgot - or has not marked done yet - has no runner
@@ -1728,18 +1772,20 @@ def _commit_entries(repo, batons, records, budget, now):
     # The claims are handed to the walk, not filtered out of it afterwards: a
     # claimed commit no walk on this topology would have reached is fetched by
     # name, which is what makes the rule above hold on ANY topology.
-    commits = sorted(_relay_commits(repo, by_commit), key=lambda c: -c[0])
-    if has_records:
-        # One floor, one population. A claim carries its own evidence and is
-        # kept unconditionally; the record floor bounds everything else.
-        attributed = [c for c in commits if by_commit.get(c[1])]
-        rest = _floored(
-            [c for c in commits if not by_commit.get(c[1])], since)
-        kept = attributed + rest[:max(0, budget - len(attributed))]
-        # `git log` already yields newest first; sorting states the intent and
-        # is stable, so equal commit times keep git's own order and the merge
-        # stays deterministic across builds.
-        commits = sorted(kept, key=lambda c: -c[0])
+    # One floor, one population. A claim carries its own evidence and is kept
+    # unconditionally; the record floor bounds everything else, and `_floored`
+    # answers "all of them" where there is no floor - the carve-out needs no
+    # branch of its own, and a `has_records` flag that gave it one was
+    # redundant on every input (see `_record_floor`).
+    commits = _relay_commits(repo, by_commit)
+    attributed = [c for c in commits if by_commit.get(c[1])]
+    rest = _floored([c for c in commits if not by_commit.get(c[1])], floor)
+    # NEWEST FIRST, ON A TOTAL KEY. `git log` already yields newest first, so
+    # the time alone would leave equal-time commits in git's order and the
+    # concatenation above deciding a tie; the sha settles it instead, so which
+    # commits the entry bound keeps cannot depend on the order two disjoint
+    # lists happened to be joined in.
+    commits = sorted(attributed + rest, key=lambda c: (-c[0], c[1]))
 
     return [
         _log_entry(when, True, "commit", "note", f"commit {sha}: {subject}", now,
@@ -1809,26 +1855,21 @@ def _derived_log(relay_dir, repo, runners, batons, checks, now):
                 leg=check["claimedBy"], check=check["id"]))
 
     # 2. commits, last: `entries` is now the relay's own record of itself, and
-    # it is what bounds them (ACC-DATA-009).
+    # it is what the WINDOW is derived from (ACC-DATA-009).
     #
-    # The budget is how many UNATTRIBUTED commits may sit beside the relay's
-    # own record of itself, and it is the relay's own event count: a log where
-    # the project's traffic outnumbers the run's events buries the run
-    # (ACC-DATA-009). Attributed commits are not bought with it - see
-    # `_commit_entries` - so what is left after them is what it buys.
-    #
-    # It is deliberately NOT `min(events, LOG_MAX_ENTRIES - events)` any more.
-    # That form made the outer entry bound decide the attribution question,
-    # and above 150 events it decided it backwards. The entry bound is applied
-    # once, at the end, to the merged log: it is the loosest bound in the
-    # module and it stays the last word rather than a second opinion on which
-    # commits belong.
+    # `events` is NOT a count handed to `_commit_entries` any more, and this
+    # is the round-7 fix. It used to be the unclaimed population's budget, and
+    # confirmed claims were spent from the same pool, so three legs with three
+    # claims left nothing for the commits nobody claimed and a relay with no
+    # baton yet left nothing for anything at all. Which commits belong is
+    # settled entirely below the record floor and the claims; how many entries
+    # fit in a pane is settled once, here, at the end.
     events = sorted(entries, key=lambda e: -e["t"])
     # THE INVARIANT: the window comes from the relay's records on disk, not
     # from `events`. `events` is what this function has so far DERIVED, and a
     # relay one leg in derives nothing while holding two records.
-    records = _relay_records(relay_dir, runners, batons, checks, events)
-    commits = _commit_entries(repo, batons, records, len(events), now)
+    floor = _record_floor(relay_dir, runners, batons, checks)
+    commits = _commit_entries(repo, batons, floor, now)
 
     # The outer entry bound, applied once and last. It decides how much of the
     # log fits in a pane, and it must not decide which commits belong: that is
@@ -1847,14 +1888,14 @@ def _derived_log(relay_dir, repo, runners, batons, checks, now):
     #    relay's recorded events either way - each one is claimed by a baton,
     #    and every baton is an event.
     # 2. The relay's own events, newest first, in whatever room is left.
-    # 3. Unattributed commits, with what remains. There is deliberately no
-    #    second "never more of them than there are events to bury" clause here.
-    #    There was one, and a mutation deleting it left the suite green because
-    #    it could not change an outcome: `_commit_entries` already hands back
-    #    at most `len(events) - len(attributed)` unattributed commits, and
-    #    `kept` is a prefix of `events`, so the room left after `kept` can only
-    #    exceed that count when `kept` IS all of `events` - and then the two
-    #    bounds are the same bound. One bound, at the seam that owns it.
+    # 3. Unattributed commits, with what remains. `spare` is the WHOLE of the
+    #    bound on that population now (ACC-DATA-009, rewritten 2026-08-27):
+    #    `_commit_entries` hands back every unclaimed commit above the record
+    #    floor that the walk reached, and this slice is what keeps the merged
+    #    log inside `LOG_MAX_ENTRIES`. There is deliberately no second count
+    #    upstream - a relay's own events used to be one, and charging the
+    #    confirmed claims to it is what emptied the unclaimed population of
+    #    every relay this module has ever read.
     attributed = [e for e in commits if e["leg"]]
     # THE BOUND YIELDS TO ATTRIBUTION, AT ANY SIZE (ACC-DATA-009, amended
     # 2026-08-26). `LOG_MAX_ENTRIES - len(attributed)` goes NEGATIVE past 300

@@ -1054,6 +1054,25 @@ CORPUS_COMMITS = [
 #: repository that does not have them — anywhere the suite runs.
 CORPUS_DENIED_CLAIMS = ("4f0b17c", "8036f9f")
 
+#: Legs whose baton claims its own commit in UPPER CASE once the graft has
+#: substituted the repository's real shas in (ACC-DATA-009, 2026-08-27).
+#:
+#: An object name is hex and git resolves either spelling, so `cat-file`
+#: confirms an upper-case claim and the runner row carries it — while
+#: attribution is keyed on `%h`, which git prints lower case. Storing a claim
+#: verbatim therefore credited a leg's own commit to NOBODY, with no warning,
+#: and the round-7 code judge measured `rows {'37C9718'} vs log-attributed
+#: set()`. Six rounds of judging could not see it because every sha in every
+#: corpus was lower case: one kind of thing in the population, and a guard that
+#: cannot fail — the same defect as an unclaimed population that is always
+#: empty.
+#:
+#: TWO legs, in two of the claim forms the real batons use, so the dimension is
+#: not one instance wearing a corpus's clothes. Neither is a denied claim: a
+#: withheld token is never substituted, so upper-casing one would be a no-op in
+#: `corpus_relay_denied` and the dimension would quietly halve.
+CORPUS_UPPER_CASE_CLAIMS = ("reconcile-develop", "thread-id-ownership")
+
 
 def _graft_agent_service(root, withheld=()):
     """The frozen agent-service batons, on a repository holding their commits.
@@ -1097,6 +1116,15 @@ def _graft_agent_service(root, withheld=()):
         text = original = path.read_text()
         for token, real in sha_of.items():
             text = text.replace(token, real)
+        # ...and then this baton's OWN claim is re-spelled in upper case, if it
+        # is one of the two the corpus carries that way. Only its own claim:
+        # the shas these batons merely quote stay as they were, so the corpus
+        # holds both spellings rather than trading one uniform population for
+        # another.
+        if path.stem in CORPUS_UPPER_CASE_CLAIMS:
+            own = sha_of.get(CORPUS_OWN[path.stem])
+            assert own, (path.stem, "a claim the graft did not make")
+            text = text.replace(own, own.upper())
         if text != original:
             path.write_text(text)
         when = AGENT_SERVICE_BATON_MTIMES[path.stem]
@@ -1145,6 +1173,11 @@ def test_the_denied_corpus_claims_two_shas_its_repository_does_not_have(
         CORPUS_OWN["pg-repository-correctness"],
         CORPUS_OWN["create-path-credential-guard"],
     }, CORPUS_DENIED_CLAIMS
+    # A withheld token is never substituted, so a leg whose claim the graft
+    # upper-cases must not also be one the graft denies - the dimension would
+    # be silently absent from this corpus.
+    assert not set(CORPUS_UPPER_CASE_CLAIMS) & {
+        leg for leg, sha in CORPUS_OWN.items() if sha in CORPUS_DENIED_CLAIMS}
     for sha in CORPUS_DENIED_CLAIMS:
         assert sha not in sha_of, sha
         leg = next(k for k, v in CORPUS_OWN.items() if v == sha)
@@ -1158,6 +1191,33 @@ def test_the_denied_corpus_claims_two_shas_its_repository_does_not_have(
     for sha in sha_of.values():
         assert subprocess.run(["git", "-C", str(project), "cat-file", "-t", sha],
                               capture_output=True, text=True).returncode == 0, sha
+
+
+@pytest.mark.skipif(not HAS_GIT, reason="git is not installed")
+def test_the_corpus_claims_two_of_its_shas_in_upper_case(corpus_relay):
+    """Non-vacuity for `CORPUS_UPPER_CASE_CLAIMS` (ACC-DATA-009, 2026-08-27).
+
+    A corpus dimension that quietly reverts takes every test that reads this
+    corpus back to a population with one spelling in it, which is exactly how
+    the defect survived six rounds. So the dimension is asserted where it is
+    built: the sha is on disk in upper case, and the model credits the leg with
+    the repository's own lower-case spelling all the same.
+    """
+    relay_dir, sha_of = corpus_relay
+    assert CORPUS_UPPER_CASE_CLAIMS, "a corpus dimension that is empty is none"
+    model = relay_model.build(relay_dir, now=None)
+    rows = {r["leg"]: r["commit"] for r in model["runners"]}
+    entries = {e["leg"]: e["commit"] for e in model["log"]
+               if e["kind"] == "commit" and e["leg"]}
+    for leg in CORPUS_UPPER_CASE_CLAIMS:
+        real = sha_of[CORPUS_OWN[leg]]
+        written = (relay_dir / "batons" / f"{leg}.md").read_text()
+        assert real.upper() in written, (leg, real)
+        assert real not in written, (leg, real)   # the ONLY spelling on disk
+        assert rows[leg] == real, (leg, rows[leg])
+        assert entries[leg] == real, (leg, entries.get(leg))
+    # And the corpus still holds lower-case claims beside them.
+    assert set(CORPUS_OWN) - set(CORPUS_UPPER_CASE_CLAIMS)
 
 
 def test_the_corpus_fixture_still_names_the_shas_these_tests_read():
