@@ -206,8 +206,8 @@ Update `state.json`: each check becomes `passed`, `failed`, or `blocked`.
 
 ### Phase 6 — Fix loop
 
-**Judging does not pass on the first attempt. This is normal, not failure.**
-Expect roughly a third of your total legs to be fix legs.
+**Judging does not pass first time. That is normal.** Expect roughly a third of
+your legs to be fix legs.
 
 For each failure, create a targeted fix leg, insert it at the head of the queue,
 and return to Phase 4. Repeat until every check in the stage reads `passed`, then
@@ -278,7 +278,7 @@ correct. For small work keep only invariant one: state what done means first.
 ## References
 
 - `references/research.md` — the deep-search loop and gap analysis
-- `references/execution.md` — runner briefings, batons, parallel runners, recovery plays
-- `references/validation.md` — writing checks that hold up, and the two judges
+- `references/execution.md` — briefings, batons, parallel runners, recovery plays
+- `references/validation.md` — checks that hold up, and the two judges
 - `references/dashboard.md` — Relay Control: when to render, what to write
-- `templates/` — the five state files; `assets/control.html` — dashboard template
+- `templates/` — state files; `assets/control.html` — dashboard template
