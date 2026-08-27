@@ -1,10 +1,13 @@
 # Baton — <leg id>
 
-**Status:** success | partial | failed
-**Commit:** `<sha>`
+**Status**: success | partial | failed
+**Commit**: `<sha>`
 
-Both header fields are read by machine. Keep the labels, and keep the sha inside
-backticks — without them the dashboard shows no commit against this leg.
+Both header fields are read by machine and both are fussy about punctuation. Keep
+the colon **outside** the bold and the sha **inside** backticks, exactly as above.
+Written `**Status:**` the status word is not found at all, and the dashboard then
+shows the leg as Success whatever actually happened; written without backticks the
+commit is never attributed to the leg.
 
 ## Implemented
 

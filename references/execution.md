@@ -48,14 +48,14 @@ may not write outside their leg, talk to other runners, or escalate permissions.
 **`templates/baton.md` is the shape.** Copy it; do not invent a variant. The
 runner writes it, you read it, every item gets disposed of.
 
-Both header fields are read by machine. `**Commit:**` wants its sha **in
-backticks**; without them the dashboard shows no commit against the leg, and
-`relay-control` has already shipped a run log with zero attributed commits.
-`**Status:**` fails worse than silently — a word the reader does not know renders
-as **Success**, on a failed leg too. The five sections below — implemented, left
-undone, commands run with exit codes, issues discovered, procedure followed — are
-what the disposal rule acts on, so a baton missing one has an item nobody must
-dispose of.
+Both header fields are read by machine and both are fussy: `**Status**:` and
+`**Commit**:` want the colon **outside** the bold, and the sha **inside**
+backticks. Write `**Status:**` and the status is not found at all — the dashboard
+shows the leg as **Success** whatever happened. Drop the backticks and the commit
+goes unattributed; `relay-control` already shipped a run log with zero attributed
+commits. The five sections below — implemented, left undone, commands run with
+exit codes, issues discovered, procedure followed — are what the disposal rule
+acts on, so a baton missing one has an item nobody must dispose of.
 
 **Disposal rule:** every item under "left undone" and "issues discovered" gets a
 follow-up leg or an explicit dismissal in `relay.md` with a real justification;
