@@ -1083,16 +1083,28 @@ def test_the_skill_declares_its_name_and_a_description():
     assert len(fields.get("description", "")) > 40, fields
 
 
+def snapshot_block(text):
+    """The first block that runs `--snapshot`.
+
+    Picked by what it runs, not by position: the skill's first block opens a
+    Terminal window through `osascript`, and executing that here would print
+    nothing and open a real window on the machine running the tests.
+    """
+    blocks = [b for b in shell_blocks(text) if "--snapshot" in b]
+    assert blocks, "the skill names no --snapshot command"
+    return blocks[0]
+
+
 def test_the_skill_runs_the_snapshot_command_as_written(tmp_path):
-    """The block in the skill is executed verbatim, with only the override the
-    skill itself documents supplied. A command that has drifted from the
-    entrypoint fails here rather than in a user's session."""
+    """The snapshot block in the skill is executed verbatim, with only the
+    override the skill itself documents supplied. A command that has drifted
+    from the entrypoint fails here rather than in a user's session."""
     work = project(tmp_path)
-    blocks = shell_blocks(SKILL.read_text())
-    assert blocks, "the skill names no command"
+    block = snapshot_block(SKILL.read_text())
+    assert "osascript" not in block, "the snapshot block would open a window"
     env = env_without_pythonpath(RELAY_CONTROL=str(ENTRYPOINT))
     done = subprocess.run(
-        ["/bin/sh", "-e", "-c", blocks[0]], cwd=str(work), env=env,
+        ["/bin/sh", "-e", "-c", block], cwd=str(work), env=env,
         capture_output=True, text=True, timeout=60)
     assert done.returncode == 0, done.stderr
     assert TITLE_LINE in done.stdout, done.stdout

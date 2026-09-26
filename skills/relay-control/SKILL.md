@@ -60,8 +60,10 @@ one, name it — the relay directory itself or the project above it:
    a paraphrase is a second answer that nothing checked.
 2. **Keep the last section.** It carries the exact line the user runs to open
    the live view, with the relay's path already in it.
-3. **Say nothing about having launched anything.** You have printed a still
-   picture. If the user wants the live view, they run that line.
+3. **Claim only the window step 1 proved.** Say the live view is open only if
+   step 1 replied `tab N of window id …`; otherwise say it did not open and
+   point to that line. The snapshot itself is a still picture and launches
+   nothing — never describe it as live.
 4. After the block you may add at most two sentences of your own — what you
    would look at first, or what an attention item implies. Nothing that
    restates a figure.
