@@ -197,6 +197,9 @@ End every stage with two **judge legs** (`code-judge-<stage>` and
 `behaviour-judge-<stage>`) in the queue like any other, so judging shows in the
 plan, the dashboard and the run count instead of hiding inside a gate.
 
+With Jev on, lint the finished contract (`relay-contract`) and plan
+(`relay-leg`) before the approval gate — see **Advisory decisions**.
+
 ### Phase 3 — Approval gate
 
 Present to the human, then stop and wait:
@@ -208,6 +211,7 @@ STAGES     S1: name (n legs) → S2: ...
 SKELETON   the command the user can run once S1 clears
 FIRST LEG  the opening leg
 RISKS      the two or three things most likely to go wrong
+ADVISORS   jev on | off  (see Advisory decisions; off if code may not leave the org)
 ```
 
 Do not start before an explicit go.
@@ -236,7 +240,8 @@ and whose `touches` are disjoint from every other in flight, this batch included
    five sections. The dashboard reads the sha from that field and no other.
 5. You read the baton and **dispose of every item**. Each discovered issue
    becomes a follow-up leg or gets an explicit written dismissal in `relay.md`.
-   Nothing is silently dropped.
+   Nothing is silently dropped. With Jev on, ask `relay-baton` first (see
+   **Advisory decisions**).
 6. Update `state.json` and `dashboard.json`, re-render Relay Control, send it.
    One leg done is one dashboard refresh.
 
@@ -273,7 +278,8 @@ Each judge marks in `state.json` the checks its own evidence covers — `passed`
 ### Phase 6 — Fix loop
 
 **Judging does not pass first time. That is normal** — expect roughly a third of
-your legs to be fix legs. For each failure, create a targeted fix leg naming in
+your legs to be fix legs. With Jev on, triage each failure with `relay-failure`
+first; a `contract` answer goes to the human. For each failure, create a targeted fix leg naming in
 `repairs` the checks it is for, insert it at the head of the queue, and return to
 Phase 4. Repeat until every check in the stage reads `passed`, then the stage is
 **cleared** and you advance — but the check that proves the product starts is
@@ -451,6 +457,44 @@ family's weakest capability.
 Not every task deserves a relay — a single-file fix costs more to coordinate than
 to do. Use it when the objective spans multiple legs or must be verifiably rather
 than plausibly correct. For small work keep invariant one: define done first.
+
+## Advisory decisions (Jev)
+
+The coach makes the same kinds of call many times a run. When the relay has
+Jev switched on, the coach **must** ask the `jev` skill at each point below
+before deciding — a one-second typed second opinion — and then decide itself.
+
+**Switch.** Jev is on only when `relay.md` records `Advisors: jev`, agreed at the
+Phase 3 approval gate (the `ADVISORS` line). It sends contract, leg, baton and
+diff text to OpenRouter, so it stays off for a codebase whose data may not leave
+the organisation. If the call fails (no key, network), note it once in
+`relay.md` and continue without it; a missing advisor never blocks a leg.
+
+```bash
+J="python3 ~/.claude/skills/jev/scripts/jev.py"
+```
+
+| When | Decision | Call | Coach does with the answer |
+|---|---|---|---|
+| Kickoff, if the user asked for Jev | Relay or single session? | `$J relay-scale --input <objective>` | Weigh it in **Scaling down** |
+| Phase 1, after drafting | Is each check behavioural, clear, evidenced? | `$J relay-contract --input .relay/contract.md --split-on '^### ACC-' --summary` | Rewrite every check answering `False` or `vague` |
+| Phase 2, after planning | Does each leg fit one runner? Is a stage a horizontal layer? | `$J relay-leg --input <leg or stage json>` | Split `no` legs; re-slice `horizontal_layer` stages |
+| Phase 4 step 5 | What happens to each baton item? Does the human need to act? Repeated friction? | `$J relay-baton --input .relay/batons/<leg>.md` | Dispose using `disposition`; `attention` → attention band; `repeat_friction` → `.relay/skills/` |
+| Phase 6, per failed check | Code, test, environment or ambiguous contract? | `jq -r '.checks["<ID>"].reason' .relay/state.json \| $J relay-failure` | `contract` → ask the human, never a fix leg |
+| Before the merge gate | Best practice and reuse per file | `git diff origin/<target>...HEAD \| $J code-practice --split-on '^diff --git ' --threshold 0.6 --summary` | Hand the table to the reviewer as leads, not findings |
+
+Rules that do not bend:
+
+- **Advice, never evidence.** Jev never marks a check, never replaces a judge,
+  the reviewer or a test run, and is never cited as proof in `state.json`.
+- **Low confidence goes up, not through.** An answer marked `?` (`needs_human`)
+  is decided by the coach reading the material itself, or goes to the attention
+  band — never taken as-is.
+- **Log the call.** Each disposition, split or rewrite Jev informed gets one line
+  in `relay.md`'s decisions log: the set, its answer, and what the coach did —
+  including when it overrode Jev.
+- **Deterministic stays deterministic.** Coverage, `touches` disjointness,
+  `rev-list` freshness and the three-legs-per-check count are computed, not asked.
 
 ## References
 
