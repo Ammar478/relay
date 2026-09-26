@@ -79,6 +79,15 @@ Runners in one tree share an index, a working tree and a scratchpad:
   files appeared staged mid-leg and `HEAD` moved under a running runner.
 - **Never `git checkout --`, `git stash` or `git reset`.** Undoing a mutation
   that way would have destroyed another runner's uncommitted work.
+- **A separate worktree does not make this safe.** Worktrees isolate the working
+  tree and the index; they share the repository — including **one stash stack**.
+  Two legs in their own worktrees of the same repo both stashed, and one `pop`
+  took the other's entry: its work vanished from disk and was rebuilt from edit
+  history. Set work aside with a throwaway WIP commit on your own branch, or a
+  file copy. If a stash is truly unavoidable, `git stash push -u -m "<leg-id>"`,
+  capture the sha at once from `git stash list --format='%H %gs'`, restore with
+  `git stash apply <sha>` — never `pop` — and drop that entry by finding it by
+  tag.
 - **Restore a mutated file from your own backup copy**, never from git.
 - **Prefix every scratch file with the leg id.** Two runners overwrote each
   other's `mutate.py` and a mutation run had to be redone.
