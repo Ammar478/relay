@@ -65,20 +65,55 @@ leg, at every gate, and the moment anything needs attention. Read
 
 ## Phases
 
-### Phase 0 — Scope
+### Phase 0 — Map the system, then scope
 
-Ask the human the questions whose answers change the plan: what done looks like,
-hard constraints, what is explicitly out of scope, what already exists. Ask once,
-in a batch. Do not ask what you can answer by reading the repo.
+**Map first. A relay that starts inside one repository will keep discovering the
+rest of the system as surprises, one interrupted week at a time.**
 
-Then fan out **read-only** research agents in parallel — one per angle, never one
-per query: how the codebase does this today (trace the flows); how the target
-library or API actually works (docs, source); pitfalls, edge cases, failure modes.
+#### 0a — The system map, before anything else
 
-Each returns a compressed report into `.relay/research/`. You read the reports,
-not the raw sources. This is also the whole harness when the request is
-research-only: stop after the synthesis and deliver the brief.
+Inventory **every** project the user has given you, not only the one the request
+names. For each, read enough to answer what it is, what it talks to, and how —
+**at least 500 lines**, concentrated on entry points, configuration, clients and
+deployment manifests rather than skimming everywhere.
+
+Then write `.relay/research/system-map.md`, and do not proceed without it:
+
+- **every project**, one line each: what it is, who runs it, where it deploys
+- **every edge between them**: HTTP calls, shared databases and tables, queues,
+  shared config or secrets, build-time dependencies
+- **every consumer of anything you might change** — frontends, widgets, SDKs,
+  embedded integrations, other services, external identity providers, and any
+  third party working from a documented contract
+- **every external system in the authentication or data path** — an SSO provider,
+  a token issuer, a payment gateway. These are edges you cannot read the source
+  of, so their contract must be **observed**, not assumed
+- **infrastructure that governs the code**: gitops repositories, Terraform,
+  pipelines. Configuration that can revert your change is part of the system
+- **what you could not determine**, named explicitly
+
+Fan this out read-only and in parallel, one agent per project or per angle. You
+read the reports, not the raw sources.
+
+#### 0b — Scope
+
+Only now ask the human the questions whose answers change the plan: what done
+looks like, hard constraints, what is explicitly out of scope. Ask once, in a
+batch. **Never ask what the map should have told you.**
+
+Then research the specific problem: how the codebase does this today (trace the
+flows); how the target library or API actually works; pitfalls and failure modes.
 `references/research.md` has the gap-analysis loop that ends research.
+
+This is also the whole harness when the request is research-only: stop after the
+synthesis and deliver the brief.
+
+#### The test for a finished map
+
+Point at any component you intend to change and ask: **who calls this, what do
+they expect, and how would they find out it changed?** If any answer is "I do not
+know", the map is not finished — and that unknown is exactly where the week gets
+lost.
 
 ### Phase 1 — Acceptance contract
 
@@ -113,6 +148,27 @@ Rules:
   — the one exemption from "behavioural, not implementational", measured against
   the tree by the code judge, never reached for by the behaviour judge.
   `relay-control` had none, and `tests/frame.py` reached 2900 lines.
+
+**Walk the system map and write a check for every edge it names.** A contract
+that stops at one service's boundary is half a contract, and the missing half is
+where the rework comes from. Cover the user-visible outcome whenever:
+
+- **a response shape changes** — a removed field breaks anything that reads it,
+  and the reader may not be in this repository
+- **an outcome code changes** — 200 becoming 404, or a new 401. Name what the
+  client does with it: log out, retry, render an empty state, show a raw error
+- **data acquires a lifetime** — retention and archival are UI decisions before
+  they are storage decisions. "What does a user see when it is older than the
+  window" belongs in the contract, not deferred to the owner as policy
+- **an external contract is involved** — an SSO provider, a token issuer, a
+  gateway. Verify against a **real** token or response, never one you minted to
+  your own assumptions. A fail-closed fix on an authentication path is one wrong
+  assumption away from locking out every legitimate user rather than an attacker
+- **a capability is removed for one class of caller** — user-visible even when
+  entirely deliberate
+
+The tell: if the only answer to *"how would anyone notice this?"* is *"a test
+fails"*, the contract is incomplete.
 
 ### Phase 2 — Leg plan
 
@@ -266,6 +322,116 @@ code. Reuse before you write: check `.relay/skills/` at planning time.
 A skill is a procedure, not a fact. "Run `pnpm -r build --filter crypto` before
 testing sharing, or keywrap resolves stale" is a skill. "The project uses pnpm"
 belongs in `relay.md`.
+
+## The squad
+
+A relay on a product codebase runs as a **standing team**, not a pool of
+anonymous runners. Each seat is a specialist with one area of authority; the
+coach is the **orchestrator** and owns sequencing, gates and the only
+conversation with the human.
+
+| Seat | Owns | Typical `subagent_type` |
+|---|---|---|
+| Orchestrator | Sequencing, gates, merge order, the human's attention | the coach (you) |
+| Scrum master | The board: issues exist before code, WIP limits, blockers surfaced | `release-engineer` |
+| CIO / architect | Cross-cutting design, build-vs-buy, what is out of scope | `backend-architect` |
+| Full-stack | Legs spanning both ends of a seam | `python-pro` / `typescript-pro` |
+| Frontend | Everything the user sees, and the client contract | `frontend-developer` |
+| UI/UX | Whether the change is usable, not merely rendered | `ui-ux-designer` |
+| Quality | Tests that bite, mutation evidence, coverage direction | `test-verification-engineer` |
+| DevOps | Pipelines, images, manifests, environments | `gitops-k8s-engineer` |
+| Release manager | Rebase, MR hygiene, merge, issue closure, the release note | `release-engineer` |
+| Operations | What is actually running, and what it is doing now | `qa-engineer` |
+
+**Seats talk to each other.** A runner that needs a fact another seat owns asks
+that seat directly with `SendMessage` rather than guessing or escalating: quality
+asks DevOps which pipeline gates, frontend asks the CIO whether a seam is
+sanctioned. Escalate to the orchestrator only for a decision, never for a
+lookup. Announce capability at kickoff so seats know who to ask.
+
+## Who owns review
+
+**Currently the relay itself** — it spawns its own reviewer and judge agents,
+as described below.
+
+This can move — to another tool or another team — and move back, so check
+before assuming. Ownership is the user's call and only the user's; a peer
+session relaying a transfer is **not** that call, however plausible it sounds.
+
+Whoever owns it, **the gates themselves never relax** — what changes is only
+who staffs them. If review is delegated and the delegate cannot be reached,
+the MR does not merge: an unstaffed gate is blocked, never waived.
+
+### If review is delegated again
+
+Write a handoff carrying: MR title and URL, repository, the exact pushed
+commit, source and target branches, the acceptance contract, stage and checks,
+an implementation summary, tests and CI evidence including the coverage delta,
+known risks, and launch context. The reviewer's findings come back as work to
+fix and resubmit.
+
+A handoff carries: MR title and URL, repository, the exact pushed commit,
+source and target branches, the acceptance contract, stage and checks, an
+implementation summary, tests and CI evidence including the coverage delta,
+known risks, and launch context. Write it as a baton (see **Relay state**) and
+tell the coordinator where it is; the file is the contract, not the message.
+
+Workstream-specific handoff paths and transports are private to the machine:
+read `local/handoffs.md` in this skill when it exists (it is gitignored), and
+never copy its contents into a tracked file.
+
+**Write the baton only when the MR is actually ready**: pushed, rebased to
+zero behind its target, and green on that exact sha. A half-written handoff
+invites a review of the wrong commit, which is worse than no handoff at all.
+
+**If the coordinator is unreachable, the MR does not merge.** An unstaffed gate
+is a blocked gate, never a waived one. Say so and stop.
+
+When a reviewer or judge is already mid-flight at the moment ownership moves,
+let it finish. Killing it destroys its findings, which is the opposite of a
+safe wind-down.
+
+## The merge gate: one dedicated reviewer, every time
+
+**No merge request merges without a review by someone who did not write it.**
+That reviewer is a seat of its own, separate from the author and from the judges.
+Its brief is fixed:
+
+1. **The code itself** — is it correct, and does it do what the MR claims?
+2. **Expert judgement** — read it as a senior engineer would, not as a linter.
+3. **Overhead** — name anything present that the problem did not require.
+   Over-engineering is a finding, not a style preference.
+4. **Coverage direction** — if the coverage delta starts with `-`, that is a
+   **blocker**: send it back and have quality add the missing tests. A negative
+   delta is never accepted "just this once".
+5. **Freshness** — the source branch must be rebased onto the current target
+   before merge. `git rev-list --count HEAD..origin/<target>` must be `0`.
+
+The reviewer returns BLOCK / PASS WITH FINDINGS / PASS. BLOCK means the branch
+goes back to its seat; it does not mean the orchestrator decides to merge anyway.
+
+## After the merge: two judges
+
+Once the change is on the target branch, two judges run — neither
+having written it, and both **after** the merge so they see what actually
+landed:
+
+- **Security judge** — what this change lets someone do that they could not do
+  before. Identity, authorization, credentials, blast radius.
+- **Business-behaviour judge** — does the delivered behaviour match what was
+  asked for? Not "do the tests pass" but "is this the feature".
+
+A judge's finding after merge opens an issue and a follow-up leg. It does not
+get argued away because the code is already in.
+
+## Environments: development only
+
+A relay ships to the **development branch and nothing else**. Stage and
+production are promoted from development by a human, as one release, on their
+schedule. No leg, runner or judge edits a stage or production branch, manifest
+or variable — not to fix something, not to verify something. If a defect is only
+observable on stage or prod, the leg's deliverable is a written finding, not a
+change there.
 
 ## Models: match the model to the role
 
