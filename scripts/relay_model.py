@@ -100,6 +100,7 @@ import typing
 __all__ = [
     "build",
     "baton_text",
+    "contract_ids",
     "normalise_status",
     "normalise_check",
     "normalise_phase",
@@ -569,6 +570,25 @@ def baton_text(path):
     """
     raw, _mtime, _why = _read_relay_file(path)
     return None if raw is None else raw.decode("utf-8", "replace")
+
+
+CONTRACT_ID_RE = re.compile(r"^#{2,4}\s+(ACC-[A-Z0-9]+-\d+)\b", re.M)
+
+
+def contract_ids(relay_dir):
+    """Check ids declared in `contract.md`, in file order, each once - or None
+    when there is no contract to read.
+
+    The coverage gate needs the contract's own list, not `state.json`'s: a check
+    the coach wrote into the contract and forgot to copy into state is exactly
+    the orphan the gate exists to catch. Read here, through the one guarded
+    door, so the decision module never opens a relay file itself (ACC-DATA-001).
+    """
+    raw, _mtime, _why = _read_relay_file(pathlib.Path(relay_dir) / "contract.md")
+    if raw is None:
+        return None
+    text = raw.decode("utf-8", "replace")
+    return list(dict.fromkeys(CONTRACT_ID_RE.findall(text)))
 
 
 def _read_baton(path):
