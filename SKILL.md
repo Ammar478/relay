@@ -460,19 +460,21 @@ Phase 3 approval gate (the `ADVISORS` line). It sends contract, leg, baton and
 diff text to OpenRouter, so it stays off for a codebase whose data may not leave
 the organisation. If the call fails (no key, network), note it once in
 `relay.md` and continue without it; a missing advisor never blocks a leg.
+The key is the human's OpenRouter key, stored by them (`jev auth login openrouter`);
+never ask for it in the conversation.
 
 ```bash
-J="python3 ~/.claude/skills/jev/scripts/jev.py"
+J=~/.claude/skills/jev/scripts/jev.py   # call as python3 "$J": zsh does not word-split $J
 ```
 
 | When | Decision | Call | Coach does with the answer |
 |---|---|---|---|
-| Kickoff, if the user asked for Jev | Relay or single session? | `$J relay-scale --input <objective>` | Weigh it in **Scaling down** |
-| Phase 1, after drafting | Is each check behavioural, clear, evidenced? | `$J relay-contract --input .relay/contract.md --split-on '^### ACC-' --summary` | Rewrite every check answering `False` or `vague` |
-| Phase 2, after planning | Does each leg fit one runner? Is a stage a horizontal layer? | `$J relay-leg --input <leg or stage json>` | Split `no` legs; re-slice `horizontal_layer` stages |
-| Phase 4 step 5 | What happens to each baton item? Does the human need to act? Repeated friction? | `$J relay-baton --input .relay/batons/<leg>.md` | Dispose using `disposition`; `attention` → attention band; `repeat_friction` → `.relay/skills/` |
-| Phase 6, per failed check | Code, test, environment or ambiguous contract? | `jq -r '.checks["<ID>"].reason' .relay/state.json \| $J relay-failure` | `contract` → ask the human, never a fix leg |
-| Before the merge gate | Best practice and reuse per file | `git diff origin/<target>...HEAD \| $J code-practice --split-on '^diff --git ' --threshold 0.6 --summary` | Hand the table to the reviewer as leads, not findings |
+| Kickoff, if the user asked for Jev | Relay or single session? | `python3 "$J" relay-scale --input <objective>` | Weigh it in **Scaling down** |
+| Phase 1, after drafting | Is each check behavioural, clear, evidenced? | `python3 "$J" relay-contract --input .relay/contract.md --split-on '^### ACC-' --summary` | Rewrite every check answering `False` or `vague` |
+| Phase 2, after planning | Does each leg fit one runner? Is a stage a horizontal layer? | `python3 "$J" relay-leg --input <leg or stage json>` | Split `no` legs; re-slice `horizontal_layer` stages |
+| Phase 4 step 5 | What happens to each baton item? Does the human need to act? Repeated friction? | one call per item: `python3 scripts/relay_decide.py items <leg> --relay-dir .relay` → each item's text into `python3 "$J" relay-baton` | `follow_up_leg`: write the leg; `dismiss`: your written reason; `debt` or `human`: to the human, who alone records debt; `attention` → attention band; `repeat_friction` → `.relay/skills/` |
+| Phase 6, per failed check | Code, test, environment or ambiguous contract? | `jq -r '.checks["<ID>"].reason' .relay/state.json \| python3 "$J" relay-failure` | `contract` → ask the human, never a fix leg |
+| Before the merge gate | Best practice and reuse per file | `git diff origin/<target>...HEAD \| python3 "$J" code-practice --split-on '^diff --git ' --threshold 0.6 --summary` | Hand the table to the reviewer as leads, not findings |
 
 Rules that do not bend:
 
@@ -485,7 +487,9 @@ Rules that do not bend:
   in `relay.md`'s decisions log: the set, its answer, and what the coach did —
   including when it overrode Jev.
 - **Deterministic stays deterministic.** Coverage, `touches` disjointness,
-  `rev-list` freshness and the three-legs-per-check count are computed, not asked.
+  `rev-list` freshness and the three-legs-per-check count are computed, not asked:
+  `python3 scripts/relay_decide.py dispatch|coverage|budget --relay-dir .relay`,
+  which exits 1 on a blocker.
 
 ## References
 

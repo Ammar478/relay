@@ -3991,10 +3991,11 @@ PINNED_PATTERNS = {
     ],
     "STATUS_RE": r"^\W*(?:\*\*)?status(?:\*\*)?\s*:\s*(\w+)",
     "LABEL_RE": r"^([A-Z][A-Z0-9 /_-]{1,40}):\s*(.+)$",
+    "CONTRACT_ID_RE": r"^#{2,4}\s+(ACC-[A-Z0-9]+-\d+)\b",
 }
 
 #: The module's public surface. A name leaving it is an import a view loses.
-PINNED_ALL = ["build", "baton_text", "normalise_status", "normalise_check",
+PINNED_ALL = ["build", "baton_text", "contract_ids", "normalise_status", "normalise_check",
               "normalise_phase", "kind_of", "RelayNotFound", "LEG_STATES",
               "CHECK_STATES"]
 
@@ -4092,6 +4093,7 @@ def test_the_path_shapes_and_the_patterns_are_what_this_file_says_they_are():
         PINNED_PATTERNS["COMMIT_CLAIM_RES"]
     assert relay_model.STATUS_RE.pattern == PINNED_PATTERNS["STATUS_RE"]
     assert relay_model.LABEL_RE.pattern == PINNED_PATTERNS["LABEL_RE"]
+    assert relay_model.CONTRACT_ID_RE.pattern == PINNED_PATTERNS["CONTRACT_ID_RE"]
     assert relay_model.__all__ == PINNED_ALL
 
 
@@ -4114,6 +4116,7 @@ UNPINNED_MODULE_NAMES = {
     "COMMIT_CLAIM_RES": "pinned as its patterns in `PINNED_PATTERNS`",
     "STATUS_RE": "pinned as its pattern in `PINNED_PATTERNS`",
     "LABEL_RE": "pinned as its pattern in `PINNED_PATTERNS`",
+    "CONTRACT_ID_RE": "pinned as its pattern in `PINNED_PATTERNS`",
     "_SHA": "pinned as its pattern in `PINNED_PATTERNS`",
     "PLACEHOLDERS": "pinned in `PINNED_PLACEHOLDERS`",
     "STATUS_ALIASES": "pinned in `PINNED_STATUS_ALIASES`",
