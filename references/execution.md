@@ -104,7 +104,7 @@ tracing, documentation research, per-leg review subagents, the judges at a gate.
 |---|---|
 | Runner frozen, no tool calls | Time the suite before calling it a hang — a slow machine misread as one cost a reset of 642 lines. Then stop it, read the partial diff, and re-brief a fresh runner. |
 | Runner grinding on one problem | Cut it. Mark the leg partial, capture the baton, and either narrow the leg or escalate to the human. |
-| Leg keeps failing its checks | After three rounds, stop. The leg spec or the check is wrong, not the code. Re-scope. |
+| Leg keeps failing its checks | At the third leg against that check (the leg that claimed it plus its `repairs` legs — SKILL.md's budget), stop. The leg spec or the check is wrong, not the code. Re-scope. |
 | Fix breaks a passing check | Regression. Revert, make the regression itself a check, and re-plan the fix — once. If that check breaks a second time, stop and hand back to the human. |
 | A mutation battery comes back all-killed | Suspect a driver killed mid-run: the restart reads the mutant as the original and everything looks guarded. `git status` the mutation copy, restore, verify the baseline, re-run. |
 | Human changes direction mid-run | Pause. Update `relay.md` and the contract first, then re-scope remaining legs. Never let the code and the contract drift apart. |

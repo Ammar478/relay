@@ -15,9 +15,10 @@ Everything else here is machinery for these — and **every rule below binds you
 too.** Almost every prohibition here names a runner or a judge, and the coach is
 the only agent present for the whole run: in `relay-control` the coach reset three
 live runners' trees with `git checkout --`, a thing runners are forbidden, and
-marked six checks passed on inspection, a thing judges are forbidden. **You may
-not mark a check passed. Only a judge does that.** You may not touch a live
-runner's tree without telling it.
+marked six checks passed on inspection, a thing judges are forbidden. **You may not
+mark a check passed. Only a judge does that. You may not record `debt` either —
+only the human does.** You must never run `git checkout --`, `git stash`, or `git
+reset` on a live runner's tree.
 
 1. **Contract before code.** What counts as correct is written before an
    implementation exists to bias it. Tests written afterward confirm decisions;
@@ -25,10 +26,9 @@ runner's tree without telling it.
 2. **One runner on the track — the track being the files.** The serial rule stops
    two runners making conflicting **architectural** choices, so it binds only legs
    that write the same files: **legs whose file sets are disjoint run in parallel,
-   from the first leg on**, and read-only work always fans out. In one tree every
-   runner stages by explicit pathspec (Phase 4 dispatches the fan-out); when
-   `relay-control` fanned out, three runners wrote a byte-identical helper:
-   convergence, not divergence.
+   from the first leg on**, and read-only work always fans out (Phase 4 dispatches
+   the fan-out; the shared-tree staging rules and the `relay-control` convergence
+   evidence live in `references/execution.md`).
 3. **The baton carries state, not the conversation.** Every leg gets a fresh
    runner that reads state from disk and writes results back. No trajectory is
    carried forward, so there is none for attention to degrade across.
@@ -57,11 +57,10 @@ Create `.relay/` at the repo root (or working directory) at kickoff:
 
 ## Relay Control
 
-The human supervising is a project manager, not a co-author: they need one view
-that answers "do I need to do something" without reading code. Regenerate with
-`python3 scripts/render_dashboard.py --relay-dir .relay` and send it after every
-leg, at every gate, and the moment anything needs attention. Read
-`references/dashboard.md` first — the attention band is the part you write.
+The human supervising is a project manager, not a co-author: one view answers "do
+I need to do something" without reading code. Read `references/dashboard.md`
+first for the regeneration command and when to send it — the attention band is
+the part you write.
 
 ## Phases
 
@@ -231,10 +230,9 @@ and whose `touches` are disjoint from every other in flight, this batch included
    default budget of about ten per leg, aimed at the properties that leg's checks
    name.** A runner may exceed it for a stated reason; `relay-control`'s batteries
    of 60–90 were 20 of its 30 hours, and the 60th found nothing the 10th did not.
-3. The runner commits **by explicit pathspec** — never a bare `git add`, never a
-   plain `git commit`, never `checkout --`/`stash`/`reset`, and a mutation is
-   restored from its own backup, because parallel runners share one index. **Git is
-   the exchange zone** — the next runner inherits the codebase, not a message.
+3. The runner commits **by explicit pathspec**, per `references/execution.md`'s
+   shared-tree rules. **Git is the exchange zone** — the next runner inherits the
+   codebase, not a message.
 4. The runner writes `.relay/batons/<leg>.md` **in the one shape
    `templates/baton.md` gives** — status, the commit sha in backticks, then the
    five sections. The dashboard reads the sha from that field and no other.
@@ -254,26 +252,20 @@ every deep read into a subagent. **Brief every runner from
 
 When every implementation leg in a stage is done, its two judge legs run with
 **fresh context and no implementation history**, in parallel. **Brief both from
-`references/validation.md`** — most of each remit lives there, and a judge that is
-not handed it is the judge that read `relay-control` through `build()` for seven
-rounds:
+`references/validation.md`** — the full remit for each lives there, including the
+code judge's structure duties; a judge not handed it is the judge that read
+`relay-control` through `build()` for seven rounds.
 
-- **Code judge** — run the test suite, linter, type checker; then spawn a
-  parallel review subagent per completed leg and synthesise one report. It reads
-  the diff and the tree — structure and the `Convention` checks included; it does
-  not run the product.
-- **Behaviour judge** — act like a QA engineer. Launch the application, drive the
-  real interface, walk each check's flow — including every standing check, at
-  every gate — and collect the evidence it names. **It never reaches past the
-  entrypoint to decide a verdict, and "I could not start it" is a failure against
-  the whole stage, not a note.**
+The **behaviour judge** acts like a QA engineer: it starts the product the way a
+user reaches it, walks each check's flow — including every standing check, at
+every gate — and collects the evidence named. **It never reaches past the
+entrypoint to decide a verdict, and "I could not start it" is a failure against
+the whole stage, not a note.**
 
-Judging is adversarial by design: judge against the contract, never the
-implementation's own assumptions, and where models differ let a different provider
-judge than implements — the same family accepts the same mistakes.
-
-Each judge marks in `state.json` the checks its own evidence covers — `passed`,
-`failed` or `blocked` — and only those, so the two never write the same entry.
+Judging is adversarial: judge against the contract, never the implementation's
+own assumptions, and where models differ let a different provider judge than
+implements. Each judge marks in `state.json` only the checks its own evidence
+covers — `passed`, `failed` or `blocked` — so the two never write the same entry.
 
 ### Phase 6 — Fix loop
 
@@ -281,11 +273,11 @@ Each judge marks in `state.json` the checks its own evidence covers — `passed`
 your legs to be fix legs. With Jev on, triage each failure with `relay-failure`
 first; a `contract` answer goes to the human. For each failure, create a targeted fix leg naming in
 `repairs` the checks it is for, insert it at the head of the queue, and return to
-Phase 4. Repeat until every check in the stage reads `passed`, then the stage is
-**cleared** and you advance — but the check that proves the product starts is
-re-verified at every later gate. A cleared stage does not stay cleared for free: a
-later leg that reorganises the package leaves that check reading `passed` while
-the user gets an import error.
+Phase 4. Repeat until every check in the stage reads `passed` or carries recorded
+`debt`, then the stage is **cleared** and you advance — but the check that proves
+the product starts is re-verified at every later gate. A cleared stage does not
+stay cleared for free: a later leg that reorganises the package leaves that check
+reading `passed` while the user gets an import error.
 
 **The floor.** A check passes once its behaviour holds and one mutation of the
 property it names fails the suite. A defect in the guard on that guard is written
@@ -293,11 +285,11 @@ into `relay.md` as debt, not turned into a fix leg, unless it hides a behavioura
 defect. `relay-control` had no floor and spent gate rounds 5, 6 and 7 on guards on
 guards — round 6 left 18 of 21 mutations green.
 
-**The budget: three legs per check.** Count the legs whose `repairs` names it —
-read `legs.json`, never your memory. At the third, stop and put a scope decision
-to the human — cut it, change it, or mark it `debt` in `state.json` with the
-reason — instead of writing
-a fourth. `ACC-DATA-009` took 10 legs and 7 gate rounds.
+**The budget: three legs per check.** Count every leg against it — the leg that
+claims it in `fulfills`, plus each leg whose `repairs` names it. Stop at the third
+failure and put a scope decision to the human — cut it, change it, or mark it `debt`
+in `state.json` with the reason — rather than writing a fourth leg. `ACC-DATA-009`
+took 10 legs and 7 gate rounds.
 
 When a fix breaks a passing check, revert it, make the regression its own check,
 and re-plan — once. If that same check breaks again, **stop and hand control back
@@ -305,7 +297,7 @@ to the human** with what you tried and what you believe is wrong.
 
 ### Phase 7 — Finish
 
-The relay completes when every check in `state.json` reads `passed`. Report:
+The relay completes when every check reads `passed` or recorded `debt`. Report:
 
 ```
 SHIPPED    legs run, of which N were fixes
@@ -449,8 +441,7 @@ No single provider is best at all three roles. Where you can choose:
 | Runner | Code fluency and speed: fast generation, confident tool use. |
 | Judge | Strict instruction-following, and **a different provider from the runner** — same-family models share the blind spot that produced the bug. |
 
-Keep roles prompt-driven — pinning them all to one family caps the relay at that
-family's weakest capability.
+Keep roles prompt-driven — one family caps the relay at its weakest capability.
 
 ## Scaling down
 

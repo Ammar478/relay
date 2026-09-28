@@ -70,9 +70,12 @@ project above it:
 
 Inside a Claude Code session, `/relay-control` prints a snapshot of the relay
 into the conversation — phase, leg and check counts, the active leg, the
-attention items — plus that shell line. It reports; it cannot hand your terminal
-to a full-screen program, so the live view is always something you open
-yourself. Link the skill once to get the command:
+attention items — plus that shell line. It cannot hand *its own* terminal to a
+full-screen program (a slash command gets no TTY), but on macOS it opens the
+live view for you in a new Terminal window via `osascript`, and prints the
+still snapshot alongside it. Off macOS, or if the launch fails, it falls back
+to reporting the shell line so you can open the live view yourself. Link the
+skill once to get the command:
 
 ```bash
 ln -s ~/.claude/skills/relay/skills/relay-control ~/.claude/skills/relay-control

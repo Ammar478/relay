@@ -15,16 +15,30 @@ settled (`.relay/research/slash-command-mechanism.md`).
 
 **But on macOS you can open the dashboard in a new terminal window, and you
 should.** `osascript` asks Terminal.app to start it, which gives it a real TTY of
-its own. Do that first, then print the snapshot into the conversation so the user
-has both: the live view in a window, and a still picture here.
+its own. Print the snapshot into the conversation first, then open that window,
+so the user has both: a still picture here, and the live view in a window.
 
 If the launch fails — not macOS, Terminal.app unavailable, `osascript` missing —
-say so plainly, print the snapshot, and give the user the line to run themselves.
-Never claim to have opened a window you did not open.
+say so plainly and give the user the line to run themselves. Never claim to have
+opened a window you did not open.
 
 ## Run this, exactly as written
 
-**Step 1 — open the live dashboard in its own window.**
+**Step 1 — print the snapshot into the conversation.**
+
+```bash
+RELAY_CONTROL="${RELAY_CONTROL:-$HOME/.claude/skills/relay/relay-control}"
+"$RELAY_CONTROL" --snapshot
+```
+
+It reports the relay found from the working directory. To report a different
+one, name it — the relay directory itself or the project above it:
+
+```bash
+"$RELAY_CONTROL" --snapshot ~/work/some-project
+```
+
+**Step 2 — open the live dashboard in its own window.**
 
 ```bash
 RELAY_CONTROL="${RELAY_CONTROL:-$HOME/.claude/skills/relay/relay-control}"
@@ -33,24 +47,10 @@ osascript -e "tell application \"Terminal\" to do script \"cd '$PWD' && '$RELAY_
 ```
 
 A `tab N of window id …` reply means it opened. Anything else means it did not —
-report that honestly and skip to step 2 alone.
+report that honestly and stop there.
 
-**Step 2 — print the snapshot into the conversation.**
-
-```bash
-RELAY_CONTROL="${RELAY_CONTROL:-$HOME/.claude/skills/relay/relay-control}"
-"$RELAY_CONTROL" --snapshot
-```
-
-Tell the user the window is open and that `q` closes it. The snapshot below it is
+Tell the user the window is open and that `q` closes it. The snapshot above it is
 a still picture — say so, so the two are not confused.
-
-It reports the relay found from the working directory. To report a different
-one, name it — the relay directory itself or the project above it:
-
-```bash
-"$RELAY_CONTROL" --snapshot ~/work/some-project
-```
 
 ## Then
 
@@ -60,8 +60,8 @@ one, name it — the relay directory itself or the project above it:
    a paraphrase is a second answer that nothing checked.
 2. **Keep the last section.** It carries the exact line the user runs to open
    the live view, with the relay's path already in it.
-3. **Claim only the window step 1 proved.** Say the live view is open only if
-   step 1 replied `tab N of window id …`; otherwise say it did not open and
+3. **Claim only the window step 2 proved.** Say the live view is open only if
+   step 2 replied `tab N of window id …`; otherwise say it did not open and
    point to that line. The snapshot itself is a still picture and launches
    nothing — never describe it as live.
 4. After the block you may add at most two sentences of your own — what you
