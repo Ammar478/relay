@@ -60,8 +60,8 @@ a still picture — say so, so the two are not confused.
    a paraphrase is a second answer that nothing checked.
 2. **Keep the last section.** It carries the exact line the user runs to open
    the live view, with the relay's path already in it.
-3. **Claim only the window step 1 proved.** Say the live view is open only if
-   step 1 replied `tab N of window id …`; otherwise say it did not open and
+3. **Claim only the window step 2 proved.** Say the live view is open only if
+   step 2 replied `tab N of window id …`; otherwise say it did not open and
    point to that line. The snapshot itself is a still picture and launches
    nothing — never describe it as live.
 4. After the block you may add at most two sentences of your own — what you
