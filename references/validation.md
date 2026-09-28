@@ -52,7 +52,7 @@ code was written, in parallel with each other.
   behaviour holds and one mutation of the property it names fails the suite. A
   defect in the guard on that guard — a test about a test, a mutation-harness bug
   — is `debt` in `relay.md`, not a blocking finding, unless it hides a behavioural
-  defect that the floor above has not already been met for.
+  defect.
 
 **Behaviour judge** — the system as a black box:
 

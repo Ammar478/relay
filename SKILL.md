@@ -15,9 +15,10 @@ Everything else here is machinery for these — and **every rule below binds you
 too.** Almost every prohibition here names a runner or a judge, and the coach is
 the only agent present for the whole run: in `relay-control` the coach reset three
 live runners' trees with `git checkout --`, a thing runners are forbidden, and
-marked six checks passed on inspection, a thing judges are forbidden. **You may
-not mark a check passed. Only a judge does that.** You may not touch a live
-runner's tree without telling it.
+marked six checks passed on inspection, a thing judges are forbidden. **You may not
+mark a check passed. Only a judge does that. You may not record `debt` either —
+only the human does.** You must never run `git checkout --`, `git stash`, or `git
+reset` on a live runner's tree.
 
 1. **Contract before code.** What counts as correct is written before an
    implementation exists to bias it. Tests written afterward confirm decisions;
@@ -440,8 +441,7 @@ No single provider is best at all three roles. Where you can choose:
 | Runner | Code fluency and speed: fast generation, confident tool use. |
 | Judge | Strict instruction-following, and **a different provider from the runner** — same-family models share the blind spot that produced the bug. |
 
-Keep roles prompt-driven — pinning them all to one family caps the relay at that
-family's weakest capability.
+Keep roles prompt-driven — one family caps the relay at its weakest capability.
 
 ## Scaling down
 
