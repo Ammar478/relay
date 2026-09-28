@@ -281,11 +281,11 @@ Each judge marks in `state.json` the checks its own evidence covers — `passed`
 your legs to be fix legs. With Jev on, triage each failure with `relay-failure`
 first; a `contract` answer goes to the human. For each failure, create a targeted fix leg naming in
 `repairs` the checks it is for, insert it at the head of the queue, and return to
-Phase 4. Repeat until every check in the stage reads `passed`, then the stage is
-**cleared** and you advance — but the check that proves the product starts is
-re-verified at every later gate. A cleared stage does not stay cleared for free: a
-later leg that reorganises the package leaves that check reading `passed` while
-the user gets an import error.
+Phase 4. Repeat until every check in the stage reads `passed` or carries recorded
+`debt`, then the stage is **cleared** and you advance — but the check that proves
+the product starts is re-verified at every later gate. A cleared stage does not
+stay cleared for free: a later leg that reorganises the package leaves that check
+reading `passed` while the user gets an import error.
 
 **The floor.** A check passes once its behaviour holds and one mutation of the
 property it names fails the suite. A defect in the guard on that guard is written
@@ -293,11 +293,11 @@ into `relay.md` as debt, not turned into a fix leg, unless it hides a behavioura
 defect. `relay-control` had no floor and spent gate rounds 5, 6 and 7 on guards on
 guards — round 6 left 18 of 21 mutations green.
 
-**The budget: three legs per check.** Count the legs whose `repairs` names it —
-read `legs.json`, never your memory. At the third, stop and put a scope decision
-to the human — cut it, change it, or mark it `debt` in `state.json` with the
-reason — instead of writing
-a fourth. `ACC-DATA-009` took 10 legs and 7 gate rounds.
+**The budget: three legs per check.** Count every leg against it — the leg that
+claims it in `fulfills`, plus each leg whose `repairs` names it. Stop at the third
+failure and put a scope decision to the human — cut it, change it, or mark it `debt`
+in `state.json` with the reason — rather than writing a fourth leg. `ACC-DATA-009`
+took 10 legs and 7 gate rounds.
 
 When a fix breaks a passing check, revert it, make the regression its own check,
 and re-plan — once. If that same check breaks again, **stop and hand control back
@@ -305,7 +305,7 @@ to the human** with what you tried and what you believe is wrong.
 
 ### Phase 7 — Finish
 
-The relay completes when every check in `state.json` reads `passed`. Report:
+The relay completes when every check reads `passed` or recorded `debt`. Report:
 
 ```
 SHIPPED    legs run, of which N were fixes

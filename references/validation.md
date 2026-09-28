@@ -48,6 +48,11 @@ code was written, in parallel with each other.
   `Convention` check** in `state.json` — all of them, whatever the project's
   standards demand, because they are measured from the tree. Nobody else can reach
   them, and a check nobody marks reads `blocked` for ever.
+- **apply the floor before calling anything blocking**: a check passes once its
+  behaviour holds and one mutation of the property it names fails the suite. A
+  defect in the guard on that guard — a test about a test, a mutation-harness bug
+  — is `debt` in `relay.md`, not a blocking finding, unless it hides a behavioural
+  defect that the floor above has not already been met for.
 
 **Behaviour judge** — the system as a black box:
 
@@ -86,13 +91,25 @@ only — a wrong contract is a finding for the coach, not something to work arou
 Expect two to four rounds per stage, and roughly a third of your total legs to be
 fix legs. This is the architecture working, not failing.
 
-1. Collect every failure and blocking finding.
+**The floor.** A check passes once its behaviour holds and one mutation of the
+property it names fails the suite. A defect in the guard on that guard is `debt`
+in `relay.md`, not a fix leg, unless it hides a behavioural defect — the guard on
+the guard is not itself proof that the underlying behaviour is broken.
+`relay-control` had no floor and spent gate rounds 5, 6 and 7 on guards on guards.
+
+1. Collect every failure and blocking finding that does not clear the floor above.
 2. Group them by root cause — one fix leg per cause, not per symptom.
 3. Insert the fix legs at the head of the queue and run Phase 4 on them.
 4. Re-judge the whole stage, not just the fixes. Fixes cause regressions.
-5. The stage is **cleared** only when every check in it reads `passed`.
+5. The stage is **cleared** once every check in it reads `passed` or carries
+   recorded `debt`.
 
-Stop and get a human when a check already has three fix legs against it — count
-the legs whose `repairs` names it — when a fix breaks a previously passing check
-twice, when the two judges disagree about whether something passed, or when
-passing a check would require changing the contract.
+**The budget: three legs per check.** Count every leg against it — the leg that
+claims it plus each leg whose `repairs` names it, read from `legs.json`. Stop and
+get a human at the third failure, rather than writing a fourth leg — cut the
+check, change it, or mark it `debt` with the reason. `ACC-DATA-009` took 10 legs
+and 7 gate rounds.
+
+Stop and get a human when a fix breaks a previously passing check twice, when the
+two judges disagree about whether something passed, or when passing a check would
+require changing the contract.
