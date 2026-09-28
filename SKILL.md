@@ -25,10 +25,9 @@ runner's tree without telling it.
 2. **One runner on the track — the track being the files.** The serial rule stops
    two runners making conflicting **architectural** choices, so it binds only legs
    that write the same files: **legs whose file sets are disjoint run in parallel,
-   from the first leg on**, and read-only work always fans out. In one tree every
-   runner stages by explicit pathspec (Phase 4 dispatches the fan-out); when
-   `relay-control` fanned out, three runners wrote a byte-identical helper:
-   convergence, not divergence.
+   from the first leg on**, and read-only work always fans out (Phase 4 dispatches
+   the fan-out; the shared-tree staging rules and the `relay-control` convergence
+   evidence live in `references/execution.md`).
 3. **The baton carries state, not the conversation.** Every leg gets a fresh
    runner that reads state from disk and writes results back. No trajectory is
    carried forward, so there is none for attention to degrade across.
@@ -57,11 +56,10 @@ Create `.relay/` at the repo root (or working directory) at kickoff:
 
 ## Relay Control
 
-The human supervising is a project manager, not a co-author: they need one view
-that answers "do I need to do something" without reading code. Regenerate with
-`python3 scripts/render_dashboard.py --relay-dir .relay` and send it after every
-leg, at every gate, and the moment anything needs attention. Read
-`references/dashboard.md` first — the attention band is the part you write.
+The human supervising is a project manager, not a co-author: one view answers "do
+I need to do something" without reading code. Read `references/dashboard.md`
+first for the regeneration command and when to send it — the attention band is
+the part you write.
 
 ## Phases
 
@@ -231,10 +229,9 @@ and whose `touches` are disjoint from every other in flight, this batch included
    default budget of about ten per leg, aimed at the properties that leg's checks
    name.** A runner may exceed it for a stated reason; `relay-control`'s batteries
    of 60–90 were 20 of its 30 hours, and the 60th found nothing the 10th did not.
-3. The runner commits **by explicit pathspec** — never a bare `git add`, never a
-   plain `git commit`, never `checkout --`/`stash`/`reset`, and a mutation is
-   restored from its own backup, because parallel runners share one index. **Git is
-   the exchange zone** — the next runner inherits the codebase, not a message.
+3. The runner commits **by explicit pathspec**, per `references/execution.md`'s
+   shared-tree rules. **Git is the exchange zone** — the next runner inherits the
+   codebase, not a message.
 4. The runner writes `.relay/batons/<leg>.md` **in the one shape
    `templates/baton.md` gives** — status, the commit sha in backticks, then the
    five sections. The dashboard reads the sha from that field and no other.
@@ -254,26 +251,20 @@ every deep read into a subagent. **Brief every runner from
 
 When every implementation leg in a stage is done, its two judge legs run with
 **fresh context and no implementation history**, in parallel. **Brief both from
-`references/validation.md`** — most of each remit lives there, and a judge that is
-not handed it is the judge that read `relay-control` through `build()` for seven
-rounds:
+`references/validation.md`** — the full remit for each lives there, including the
+code judge's structure duties; a judge not handed it is the judge that read
+`relay-control` through `build()` for seven rounds.
 
-- **Code judge** — run the test suite, linter, type checker; then spawn a
-  parallel review subagent per completed leg and synthesise one report. It reads
-  the diff and the tree — structure and the `Convention` checks included; it does
-  not run the product.
-- **Behaviour judge** — act like a QA engineer. Launch the application, drive the
-  real interface, walk each check's flow — including every standing check, at
-  every gate — and collect the evidence it names. **It never reaches past the
-  entrypoint to decide a verdict, and "I could not start it" is a failure against
-  the whole stage, not a note.**
+The **behaviour judge** acts like a QA engineer: it starts the product the way a
+user reaches it, walks each check's flow — including every standing check, at
+every gate — and collects the evidence named. **It never reaches past the
+entrypoint to decide a verdict, and "I could not start it" is a failure against
+the whole stage, not a note.**
 
-Judging is adversarial by design: judge against the contract, never the
-implementation's own assumptions, and where models differ let a different provider
-judge than implements — the same family accepts the same mistakes.
-
-Each judge marks in `state.json` the checks its own evidence covers — `passed`,
-`failed` or `blocked` — and only those, so the two never write the same entry.
+Judging is adversarial: judge against the contract, never the implementation's
+own assumptions, and where models differ let a different provider judge than
+implements. Each judge marks in `state.json` only the checks its own evidence
+covers — `passed`, `failed` or `blocked` — so the two never write the same entry.
 
 ### Phase 6 — Fix loop
 
