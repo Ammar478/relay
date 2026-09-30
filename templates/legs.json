@@ -1,36 +1,67 @@
 {
   "relay": "<name>",
+  "concurrency": {
+    "runners": 3,
+    "uiJudges": 2,
+    "apiJudges": 4,
+    "note": "The ceiling dispatch honours. Judges run beside the app; see references/environment.md."
+  },
   "stages": [
     {
       "id": "S1",
       "name": "<logical unit of functionality>",
-      "legs": ["bootstrap-workspace", "google-sso-auth-flow", "code-judge-S1", "behaviour-judge-S1"]
+      "legs": ["bootstrap-workspace", "declare-services", "google-sso-auth-flow",
+               "code-judge-S1", "behaviour-judge-S1"]
     },
     {
       "id": "S2",
       "name": "<...>",
-      "legs": ["sharing-core", "code-judge-S2", "behaviour-judge-S2"]
+      "legs": ["sharing-core", "code-judge-S2", "behaviour-judge-S2-api",
+               "behaviour-judge-S2-ui"]
     }
   ],
   "legs": [
     {
+      "id": "declare-services",
+      "stage": "S1",
+      "kind": "impl",
+      "skillName": "relay-devops",
+      "goal": "One command brings the whole stack up, healthchecked, logs on disk.",
+      "fulfills": ["ACC-STANDING-001"],
+      "dependsOn": ["bootstrap-workspace"],
+      "touches": [".relay/services.yaml", ".relay/init.sh"],
+      "verification": ["python3 scripts/relay_services.py check --relay-dir .relay",
+                       "python3 scripts/relay_services.py up --relay-dir .relay"],
+      "status": "pending"
+    },
+    {
       "id": "google-sso-auth-flow",
       "stage": "S1",
       "kind": "impl",
+      "skillName": "relay-fullstack",
       "goal": "What exists after this leg is done.",
       "fulfills": ["ACC-AUTH-001", "ACC-AUTH-002"],
       "dependsOn": ["bootstrap-workspace"],
       "touches": ["src/auth/", "tests/auth/"],
       "boundaries": ["do not modify the database schema"],
+      "isolation": {
+        "ports": "8100-8109",
+        "dataNamespace": "relay_s1_auth",
+        "credentials": "the seeded manager for this slot",
+        "logs": "/tmp/relay-google-sso-auth-flow.log",
+        "scratchPrefix": "google-sso-auth-flow-"
+      },
       "skills": ["monorepo-build-order"],
       "verification": ["pnpm test auth", "pnpm typecheck"],
-      "status": "pending"
+      "status": "pending",
+      "sessionId": null
     },
     {
       "id": "code-judge-S1",
       "stage": "S1",
       "kind": "judge",
-      "goal": "Tests, types, lint, and a parallel review subagent per leg in S1.",
+      "skillName": "relay-code-judge",
+      "goal": "Tests, types, lint, structure, and the per-leg review reports for S1.",
       "fulfills": [],
       "dependsOn": ["google-sso-auth-flow"],
       "touches": [],
@@ -40,6 +71,7 @@
       "id": "behaviour-judge-S1",
       "stage": "S1",
       "kind": "judge",
+      "skillName": "relay-behaviour-judge",
       "goal": "Drive the product and collect the evidence every S1 check names.",
       "fulfills": [],
       "dependsOn": ["google-sso-auth-flow"],
@@ -50,6 +82,7 @@
       "id": "sharing-core",
       "stage": "S2",
       "kind": "impl",
+      "skillName": "relay-fullstack",
       "goal": "Per-entry key wrapping so an entry can be granted to another user.",
       "fulfills": ["ACC-SHARE-001"],
       "dependsOn": ["google-sso-auth-flow"],
@@ -58,9 +91,35 @@
       "status": "pending"
     },
     {
+      "id": "behaviour-judge-S2-api",
+      "stage": "S2",
+      "kind": "judge",
+      "skillName": "relay-behaviour-judge",
+      "goal": "One shard of the S2 behaviour gate: every check whose Tool is curl.",
+      "fulfills": [],
+      "repairs": [],
+      "shard": {"tool": "curl", "checks": ["ACC-SHARE-001", "ACC-SHARE-002"]},
+      "dependsOn": ["sharing-core"],
+      "touches": [],
+      "isolation": {"ports": "8200-8209", "dataNamespace": "relay_s2_api"},
+      "status": "pending"
+    },
+    {
+      "id": "review-s2-sharing",
+      "stage": "S2",
+      "kind": "review",
+      "skillName": "relay-reviewer",
+      "goal": "The merge gate for S2: correctness, overhead, coverage direction, freshness.",
+      "fulfills": [],
+      "dependsOn": ["behaviour-judge-S2-api", "behaviour-judge-S2-ui"],
+      "touches": [],
+      "status": "pending"
+    },
+    {
       "id": "fix-session-cookie-safari",
       "stage": "S1",
       "kind": "fix",
+      "skillName": "relay-frontend",
       "goal": "ACC-AUTH-001 passes on Safari as well as Chrome.",
       "fulfills": [],
       "repairs": ["ACC-AUTH-001"],

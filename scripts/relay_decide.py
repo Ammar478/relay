@@ -15,17 +15,23 @@ reasoning them out on a slow model pays for every one and still gets them
 wrong - `ACC-DATA-009` reached 10 repair legs because the count was taken from
 memory, not from `legs.json`. These are code's job, not the model's.
 
+`dispatch` also enforces the concurrency ceiling the plan declares in
+`legs.json` (`concurrency`, references/environment.md). Disjoint `touches`
+keeps two runners out of each other's files and says nothing about the port,
+the database and the log file two legs that both start the stack share, so a
+ceiling the view merely displays is not a ceiling - this is where it binds.
+
 What it does not decide
 -----------------------
-Nothing here marks a check, writes a file, or disposes of a baton item. It
+Nothing here marks a check, writes a file, or disposes of a handoff item. It
 reads through `relay_model.build()`, the only reader of relay files, and
-prints JSON the coach acts on. Judgement - what a baton issue means, whether a
-check passed - stays with the coach and the judges.
+prints JSON the coach acts on. Judgement - what a handoff issue means, whether
+a check passed - stays with the coach and the judges.
 
 Exit status: 0 when the answer needs no action beyond following it, 1 when it
 names a blocker (an orphaned or double-claimed check, a check at its repair
-budget or a fix leg outside it, a leg with no baton), 2 when there is no relay
-to read.
+budget or a fix leg outside it, a leg with no baton, a ceiling already full),
+2 when there is no relay to read.
 """
 
 import argparse
@@ -33,6 +39,7 @@ import json
 import re
 import sys
 
+import relay_handoff
 import relay_model
 
 #: The baton sections whose every item the coach must dispose of.
@@ -69,11 +76,14 @@ def paths_overlap(a, b):
 def legs_conflict(leg, other):
     """True unless the two legs' write sets are provably disjoint.
 
-    A judge writes nothing to the work tree, so it never conflicts. A leg that
-    writes and declares no `touches` cannot be proven disjoint from anything,
-    so it conflicts with everything: running it beside another is a guess.
+    A leg of a non-writing kind (`relay_model.NON_WRITING_KINDS` - a judge, a
+    review, a read-only fan-out) writes nothing to the work tree, so it never
+    conflicts. A leg that writes and declares no `touches` cannot be proven
+    disjoint from anything, so it conflicts with everything: running it beside
+    another is a guess.
     """
-    if "judge" in (leg["kind"], other["kind"]):
+    if (leg["kind"] in relay_model.NON_WRITING_KINDS
+            or other["kind"] in relay_model.NON_WRITING_KINDS):
         return False
     if not leg["touches"] or not other["touches"]:
         return True
@@ -92,20 +102,22 @@ def dispatch(model):
     """Every pending leg of the current stage that may start now.
 
     A leg starts when every leg it `dependsOn` has landed, its `touches` are
-    disjoint from every leg in flight and every leg already in this batch, and -
-    for a judge - every implementation and fix leg of its stage has landed.
-    Plan order breaks ties: the earlier leg takes the files.
+    disjoint from every leg in flight and every leg already in this batch, it
+    fits under the plan's concurrency ceiling, and - for a judge - every
+    implementation and fix leg of its stage has landed. Plan order breaks
+    ties: the earlier leg takes the files.
     """
     legs = [leg for leg in model["legs"] if leg["id"]]
     status = {leg["id"]: leg["status"] for leg in legs}
     stage = current_stage(model)
     in_flight = [leg for leg in legs if leg["status"] == "running"]
+    ceiling = model["relay"]["concurrency"]
     batch, waiting = [], []
 
     for leg in legs:
         if leg["stage"] != stage or leg["status"] != "pending":
             continue
-        reason = _why_not(leg, legs, status, in_flight + batch)
+        reason = _why_not(leg, legs, status, in_flight + batch, ceiling)
         if reason:
             waiting.append({"leg": leg["id"], "reason": reason})
         else:
@@ -116,10 +128,44 @@ def dispatch(model):
         "inFlight": [leg["id"] for leg in in_flight],
         "dispatch": [leg["id"] for leg in batch],
         "waiting": waiting,
+        "ceiling": ceiling,
     }
 
 
-def _why_not(leg, legs, status, occupied):
+def _over_ceiling(leg, occupied, ceiling):
+    """A reason string when `leg` would breach the concurrency ceiling.
+
+    Two legs with disjoint `touches` that both start the stack still share a
+    port, a database and a log file, which is why this is a second gate after
+    `legs_conflict` and not a refinement of it. Writing legs (impl, fix) count
+    against `runners`; everything else against the judge seats.
+
+    RELAY CANNOT TELL A UI JUDGE FROM AN API JUDGE - `legs.json` has no field
+    for it - so where both ceilings are declared the conservative sum is used:
+    under-dispatching a gate by one shard is a slower round, while two browser
+    drivers on one machine's RAM is a round that times out and lies about why.
+    """
+    limits = ceiling or {}
+    if leg["kind"] in ("impl", "fix"):
+        limit = limits.get("runners")
+        if limit is None:
+            return None
+        busy = [o for o in occupied if o["kind"] in ("impl", "fix")]
+        what = "runner"
+    else:
+        ui, api = limits.get("uiJudges"), limits.get("apiJudges")
+        limit = ((ui + api) if ui is not None and api is not None
+                 else ui if ui is not None else api)
+        if limit is None:
+            return None
+        busy = [o for o in occupied if o["kind"] not in ("impl", "fix")]
+        what = "judge"
+    if len(busy) >= limit:
+        return (f"the {what} ceiling is {limit}, with {len(busy)} in flight")
+    return None
+
+
+def _why_not(leg, legs, status, occupied, ceiling):
     if (leg["rawStatus"] or "").strip().lower() == "blocked":
         return "marked blocked in legs.json"
     unknown = [d for d in leg["dependsOn"] if d not in status]
@@ -137,7 +183,7 @@ def _why_not(leg, legs, status, occupied):
     clash = [other["id"] for other in occupied if legs_conflict(leg, other)]
     if clash:
         return f"touches overlap {', '.join(clash)}"
-    return None
+    return _over_ceiling(leg, occupied, ceiling)
 
 
 def coverage(model, contract):
@@ -217,13 +263,31 @@ def baton_items(text):
 
 
 def items(model, leg_id):
-    """The disposal items of one leg's baton, read through `relay_model`."""
+    """The disposal items of one leg's handoff, read through `relay_model`.
+
+    A JSON handoff and a prose baton carry the same duty - every item under
+    `leftUndone` and `discoveredIssues` gets disposed of - so the caller sees
+    one shape either way. The schema module (`relay_handoff.items`) owns what
+    counts as an item for the JSON form, for the same reason `baton_items`
+    owns it for the prose form: two callers parsing one file is two answers
+    to "what must the coach dispose of".
+    """
     row = next((r for r in model["runners"] if r["leg"] == leg_id), None)
     path = row["batonPath"] if row else None
     if path is None:
         return {"leg": leg_id, "baton": None, "items": []}
+    if path.endswith(".json"):
+        return _handoff_items(path, leg_id)
     return {"leg": leg_id, "baton": path,
             "items": baton_items(relay_model.baton_text(path))}
+
+
+def _handoff_items(path, leg_id):
+    data, why = relay_model.handoff_data(path)
+    if data is None:
+        return {"leg": leg_id, "baton": path, "items": [],
+                **({"warning": why} if why else {})}
+    return {"leg": leg_id, "baton": path, "items": relay_handoff.items(data)}
 
 
 def _blocked(command, result):

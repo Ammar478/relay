@@ -27,7 +27,8 @@ opened a window you did not open.
 **Step 1 — print the snapshot into the conversation.**
 
 ```bash
-RELAY_CONTROL="${RELAY_CONTROL:-$HOME/.claude/skills/relay/relay-control}"
+RELAY_CONTROL="${RELAY_CONTROL:-$(ls ~/.factory/skills/relay/relay-control \
+  ~/.claude/skills/relay/relay-control 2>/dev/null | head -1)}"
 "$RELAY_CONTROL" --snapshot
 ```
 
@@ -41,7 +42,8 @@ one, name it — the relay directory itself or the project above it:
 **Step 2 — open the live dashboard in its own window.**
 
 ```bash
-RELAY_CONTROL="${RELAY_CONTROL:-$HOME/.claude/skills/relay/relay-control}"
+RELAY_CONTROL="${RELAY_CONTROL:-$(ls ~/.factory/skills/relay/relay-control \
+  ~/.claude/skills/relay/relay-control 2>/dev/null | head -1)}"
 osascript -e "tell application \"Terminal\" to do script \"cd '$PWD' && '$RELAY_CONTROL'\"" \
   -e 'tell application "Terminal" to activate'
 ```
@@ -74,14 +76,18 @@ relay the user means rather than guessing.
 
 ## Installing this skill
 
-A skill directory exposes exactly one command and is not searched recursively,
-so a skill nested inside the relay skill is never loaded. Link it to the top
-level once:
+How this nested skill is discovered differs by harness, and at least one of them
+has changed, so check rather than assume: Claude Code used not to search a skill
+directory recursively, while Factory does. Run `/skills` (or the harness's own
+manager) with the relay installed and see whether `relay-control` is listed.
+
+If it is not, link it to the top level once:
 
 ```bash
+ln -s ~/.factory/skills/relay/skills/relay-control ~/.factory/skills/relay-control
+# or, for a Claude Code install:
 ln -s ~/.claude/skills/relay/skills/relay-control ~/.claude/skills/relay-control
 ```
 
 `/relay-control` is then available in every session. The live dashboard needs no
-such step — `~/.claude/skills/relay/relay-control` is runnable straight out of
-the clone.
+such step — `<the clone>/relay-control` is runnable straight out of it.

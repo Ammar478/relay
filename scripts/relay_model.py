@@ -280,8 +280,20 @@ def normalise_phase(value):
     return None
 
 
+#: The kinds that write nothing to the work tree. `judge` and `review` staff a
+#: gate; `read` is a read-only leg the coach dispatches for a deep search, a
+#: flow trace or one of the per-leg reviews behind a code judge - fan-out the
+#: judge cannot perform itself, because a dispatched agent may not dispatch
+#: another (references/harness.md). They matter to two callers: a view shows
+#: them in the queue like any other leg, and `relay_decide.legs_conflict` may
+#: run them beside anything, since a leg that writes nothing cannot collide.
+NON_WRITING_KINDS = ("judge", "review", "read")
+
+LEG_KINDS = ("impl", "fix") + NON_WRITING_KINDS
+
+
 def kind_of(leg):
-    """impl | fix | judge — explicit `kind` wins, then the id, then the default.
+    """impl | fix | judge | review | read — explicit `kind` wins, then the id.
 
     Every input is untrusted: a leg that is not a record at all, or whose id is
     a number, a list or null, is an `impl` leg rather than an exception.
@@ -289,7 +301,7 @@ def kind_of(leg):
     if not isinstance(leg, dict):
         return "impl"
     kind = leg.get("kind")
-    if kind in ("impl", "fix", "judge"):
+    if kind in LEG_KINDS:
         return kind
     if leg.get("isFix") or leg.get("repairs"):
         return "fix"
@@ -464,6 +476,18 @@ def _load(path):
     raw, _mtime, why = _read_relay_file(path)
     if raw is None:
         return ({}, "missing", None) if why is None else ({}, "malformed", why)
+    return _parse(raw)
+
+
+def _parse(raw):
+    """(data, state, why) for bytes already read: ok | malformed.
+
+    Split out of `_load` so a caller that has the bytes in hand - `_read_handoff`
+    needs the mtime and the line count from the same read - parses them without
+    opening the path a second time. A relay file read twice inside one build is a
+    file that can change between the two reads, which is how a mid-write file
+    produces a model that disagrees with itself.
+    """
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
@@ -572,6 +596,24 @@ def baton_text(path):
     return None if raw is None else raw.decode("utf-8", "replace")
 
 
+def handoff_data(path):
+    """(dict, why) for a JSON handoff, or (None, why) when it cannot be read.
+
+    Kept beside `baton_text` for the same reason that exists: every relay-file
+    read stays inside this module (ACC-DATA-001), so the decision module parses
+    a handoff without opening the path itself. `why` names the repair - not
+    valid UTF-8, not valid JSON, nested too deep, not an object - because
+    "malformed" and "absent" are different problems for whoever wrote it.
+    """
+    raw, _mtime, why = _read_relay_file(path)
+    if raw is None:
+        return None, why
+    data, src, load_why = _parse(raw)
+    if src != "ok":
+        return None, load_why or "it is not a readable JSON handoff"
+    return data, None
+
+
 CONTRACT_ID_RE = re.compile(r"^#{2,4}\s+(ACC-[A-Z0-9]+-\d+)\b", re.M)
 
 
@@ -624,6 +666,83 @@ def _read_baton(path):
         "lines": text.count("\n") + 1,
         "mtime": mtime,
         "path": resolved,
+        "format": "prose",
+        "sessionId": None,
+    }, None
+
+
+#: A JSON handoff's `status` mapped onto a row status. `BATON_STATUS`'s five
+#: words plus `blocked`, which only the JSON shape can say.
+#:
+#: BLOCKED READS AS FAILED, and deliberately. A runner row has four states and
+#: the Runners view filters on exactly those four, so a fifth word would draw a
+#: row that no filter counts - present on screen, absent from `All (29) |
+#: Active | Completed | Failed`, which is worse than a status that overstates.
+#: Of the four, `failed` is the one a supervisor opens, and a leg stopped by
+#: something outside it needs exactly that attention; `partial` would file it
+#: with the legs that made progress. The runner's own word survives untouched
+#: in the handoff file the row points at.
+#:
+#: Kept separate from `BATON_STATUS` rather than added to it because that table
+#: is keyed on what a runner typed on a prose `**Status**:` line, and a prose
+#: baton has never had this word to type.
+HANDOFF_STATUS = dict(BATON_STATUS, blocked="failed")
+
+_HEX40 = re.compile(r"^[0-9a-f]{7,40}$")
+
+
+def _read_handoff(path):
+    """(baton, why) for a JSON handoff, in the same shape `_read_baton` returns.
+
+    The two formats reconcile here rather than in the views, so nothing
+    downstream needs to know which one a leg wrote (`format` says, for a view
+    that wants to show it).
+
+    It exists because the prose baton was parsed by regex and failed silently
+    in both directions: `**Status:**` rather than `**Status**:` and the status
+    was not found at all, so the dashboard showed a failed leg as Success; a sha
+    without backticks and the commit went unattributed, and one run shipped a
+    log with zero attributed commits. `scripts/relay_handoff.py validate`
+    refuses a malformed handoff at the moment it is written, and here a status
+    outside the table stays None and falls back to the leg's own state exactly
+    as an unreadable prose status does.
+
+    One claim, not several: the handoff states its commit in a field rather than
+    quoting shas in prose, so there is nothing to disambiguate and no reason to
+    scrape. `_settle_commits` still confirms it against the repository - a field
+    is a claim like any other (ACC-DATA-009).
+    """
+    raw, mtime, why = _read_relay_file(path)
+    if raw is None:
+        return None, why
+    text = raw.decode("utf-8", "replace")
+    data, src, load_why = _parse(raw)
+    if src != "ok":
+        return None, load_why or "it is not a readable JSON handoff"
+    status = data.get("status")
+    commit = data.get("commit")
+    # The sha is normalised the way `commit_claims` normalises one, and for the
+    # same reason: `_commit_entries` keys attribution on `%h`, so a handoff that
+    # spelled it in upper case would have its leg's own commit attributed to
+    # nobody. Anything that is not a sha at all is no claim, not a warning -
+    # `relay_handoff.py validate` is where that is someone's problem.
+    claims = ([commit[:7].lower()] if isinstance(commit, str)
+              and _HEX40.match(commit.strip().lower()) else [])
+    session = data.get("sessionId")
+    try:
+        resolved = str(path.resolve())
+    except OSError:
+        resolved = str(path)
+    return {
+        "status": (HANDOFF_STATUS.get(status.strip().lower())
+                   if isinstance(status, str) else None),
+        "claims": claims,
+        "commit": claims[0] if claims else None,
+        "lines": text.count("\n") + 1,
+        "mtime": mtime,
+        "path": resolved,
+        "format": "json",
+        "sessionId": session if isinstance(session, str) and session.strip() else None,
     }, None
 
 
@@ -934,18 +1053,30 @@ def _read_batons(relay_dir, warnings):
         # is an error this function sees rather than an empty result it cannot
         # tell from a relay whose runners have written nothing.
         with os.scandir(bdir) as entries:   # guarded read: OSError below
-            names = sorted(e.name for e in entries if e.name.endswith(".md"))
+            names = sorted(e.name for e in entries
+                           if e.name.endswith((".json", ".md")))
     except OSError as exc:
         warnings.append(f"the batons directory could not be listed "
                         f"({_errno_reason(exc)}); no runner row carries a baton")
         return batons
+    # JSON FIRST, and the order of `names` is what does it: `.json` sorts before
+    # `.md` for one stem, and a leg that wrote both keeps the structured one.
+    # Both can exist honestly - a relay that began before the schema, a runner
+    # that wrote notes beside its handoff - and the prose form is the one whose
+    # status a misplaced colon can lose, so it loses the tie.
     for name in names:
         path = bdir / name
-        baton, why = _read_baton(path)
+        read = _read_handoff if name.endswith(".json") else _read_baton
+        baton, why = read(path)
         if baton is None:
             if why is not None:
                 warnings.append(f"batons/{name} could not be read: {why}; "
                                 "its runner row carries no baton")
+            continue
+        if path.stem in batons:
+            warnings.append(
+                f"batons/{name} is a second handoff for leg '{path.stem}'; the "
+                f"{batons[path.stem]['format']} one is being used")
             continue
         batons[path.stem] = baton
     return batons
@@ -1067,6 +1198,12 @@ def _runner_rows(batons, leg_rows, active_leg, now, warnings):
             "commit": baton["commit"] if baton else None,
             "batonLines": baton["lines"] if baton else None,
             "batonPath": baton["path"] if baton else None,
+            # The runner's own session, when the harness gave it one and the
+            # handoff recorded it. It is the only route from a row on screen to
+            # the transcript of the agent that produced it; a prose baton never
+            # carried it, so a relay that predates the schema leaves it None.
+            "sessionId": baton["sessionId"] if baton else None,
+            "handoffFormat": baton["format"] if baton else None,
             "status": "running" if is_running else status,
         })
         if leg is active_leg:
@@ -2233,6 +2370,91 @@ def _log(extras, relay_dir, repo, runners, batons, checks, now, warnings,
 # build
 # --------------------------------------------------------------------------
 
+RUN_STATE_ALIASES = {
+    "running": {"running", "active", "in_progress", "in-progress", "executing"},
+    "paused":  {"paused", "pause", "held", "suspended", "on_hold"},
+    "blocked": {"blocked", "stalled", "halted", "stuck", "waiting"},
+    "complete": {"complete", "completed", "done", "finished", "shipped"},
+}
+
+#: The run fields that are counts, and must be whole numbers or absent.
+_RUN_WHOLE = ("initialLegCount", "handoffsDisposed")
+
+
+def normalise_run_state(value):
+    """running | paused | blocked | complete, or None when the word is not one.
+
+    Separate from `normalise_phase` because the two answer different questions
+    and `normalise_phase` folds `paused` into `blocked`. A phase says where the
+    relay is in its own loop - planning, running, judging; a run state says
+    whether it is *moving*, and "the human paused it" and "it is stuck on
+    something external" are the two answers a supervisor acts on differently.
+    """
+    v = str(value if value is not None else "").strip().lower().replace(" ", "_")
+    for canon, aliases in RUN_STATE_ALIASES.items():
+        if v in aliases:
+            return canon
+    return None
+
+
+def _run_block(state, warnings):
+    """`state.json.run`, coerced - the run's own bookkeeping, not a check's.
+
+    It exists so a resumed relay can tell what happened to it. A coach that
+    pauses for a schema change, hands back to the human and returns an hour
+    later has no record of either the pause or how many handoffs it had already
+    disposed of, and re-disposing nine handoffs is how an item becomes a second
+    follow-up leg. Absent entirely is the ordinary case for a relay that has
+    never paused, and every field is None rather than a placeholder
+    (ACC-DATA-007).
+    """
+    raw = state.get("run")
+    block = {"state": None, "workingDirectory": None, "startedAt": None,
+             "updatedAt": None, "pausedReason": None,
+             "initialLegCount": None, "handoffsDisposed": None}
+    if raw is None:
+        return block
+    if not isinstance(raw, dict):
+        warnings.append(
+            f"state.json: `run` is {_render(raw)}, not an object; the run's "
+            "state, working directory and disposal count are unavailable")
+        return block
+    block["state"] = normalise_run_state(raw.get("state"))
+    if raw.get("state") is not None and block["state"] is None:
+        warnings.append(
+            f"state.json: run.state is {_render(raw.get('state'))}, which is "
+            "not one of running, paused, blocked, complete")
+    for field in ("workingDirectory", "startedAt", "updatedAt", "pausedReason"):
+        block[field] = _text(raw.get(field))
+    for field in _RUN_WHOLE:
+        block[field] = _whole(raw.get(field))
+    return block
+
+
+def _concurrency_block(legsfile, warnings):
+    """`legs.json.concurrency`, coerced - the ceiling dispatch honours.
+
+    Disjoint `touches` keeps two runners out of each other's files and says
+    nothing about the port, the database and the log file they share, so the
+    plan carries a ceiling as well as a file map (references/environment.md).
+    The model only reports it; `scripts/relay_decide.py dispatch` is what
+    enforces it, because a ceiling a view merely displays is not a ceiling.
+    """
+    raw = legsfile.get("concurrency")
+    block = {"runners": None, "uiJudges": None, "apiJudges": None, "note": None}
+    if raw is None:
+        return block
+    if not isinstance(raw, dict):
+        warnings.append(
+            f"legs.json: `concurrency` is {_render(raw)}, not an object; no "
+            "ceiling is being reported")
+        return block
+    for field in ("runners", "uiJudges", "apiJudges"):
+        block[field] = _whole(raw.get(field))
+    block["note"] = _text(raw.get("note"))
+    return block
+
+
 def build(relay_dir, now=_NO_CLOCK):
     """Build the reconciled view-model of the relay at `relay_dir`.
 
@@ -2403,6 +2625,8 @@ def build(relay_dir, now=_NO_CLOCK):
             "phaseSource": phase_source,
             "currentStage": current_stage,
             "currentLegDeclared": declared,
+            "run": _run_block(state, warnings),
+            "concurrency": _concurrency_block(legsfile, warnings),
         },
         "metrics": metrics,
         "stages": stages,

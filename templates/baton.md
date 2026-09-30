@@ -1,13 +1,25 @@
-# Baton — <leg id>
+# Baton — <leg id>  (legacy prose form)
+
+**`templates/handoff.json` is the current shape.** A runner writes
+`.relay/batons/<leg>.json` and validates it:
+
+```bash
+python3 scripts/relay_handoff.py validate <leg> --relay-dir .relay
+```
+
+This file remains because the dashboard still reads a prose baton when it finds
+one, so a relay part-way through an older run keeps rendering. Do not write a new
+one, and do not invent a variant of either shape.
+
+Why it was replaced: both header fields below are parsed by regex and both are
+fussy about punctuation. Written `**Status:**` rather than `**Status**:` the status
+is not found at all, and the dashboard then shows the leg as **Success** whatever
+actually happened; written without backticks the commit is never attributed to the
+leg, and one run shipped a log with zero attributed commits. A schema that refuses
+a malformed handoff at the moment it is written cannot fail that way.
 
 **Status**: success | partial | failed
 **Commit**: `<sha>`
-
-Both header fields are read by machine and both are fussy about punctuation. Keep
-the colon **outside** the bold and the sha **inside** backticks, exactly as above.
-Written `**Status:**` the status word is not found at all, and the dashboard then
-shows the leg as Success whatever actually happened; written without backticks the
-commit is never attributed to the leg.
 
 ## Implemented
 
