@@ -3,21 +3,40 @@
   "phase": "running",
   "currentStage": "S2",
   "currentLeg": "sharing-core",
+  "run": {
+    "state": "running",
+    "workingDirectory": "/Users/you/dev/password-manager",
+    "startedAt": "2026-09-28T09:14:02Z",
+    "updatedAt": "2026-09-28T15:51:37Z",
+    "initialLegCount": 13,
+    "handoffsDisposed": 9,
+    "pausedReason": null
+  },
   "checks": {
     "ACC-AUTH-001": {
       "status": "passed",
       "stage": "S1",
       "claimedBy": "google-sso-auth-flow",
       "round": 2,
-      "evidence": ".relay/evidence/ACC-AUTH-001-dashboard.png"
+      "markedBy": "behaviour-judge-S1",
+      "evidence": ".relay/evidence/S1/ACC-AUTH-001-dashboard.png"
     },
     "ACC-AUTH-002": {
       "status": "failed",
       "stage": "S1",
       "claimedBy": "google-sso-auth-flow",
       "round": 2,
+      "markedBy": "behaviour-judge-S1",
       "reason": "Expired token returns 500, contract requires 401.",
       "fixLeg": "fix-session-cookie-safari"
+    },
+    "ACC-CONV-001": {
+      "status": "passed",
+      "stage": "S1",
+      "claimedBy": "google-sso-auth-flow",
+      "round": 2,
+      "markedBy": "code-judge-S1",
+      "evidence": ".relay/validation/S1/code/synthesis.json"
     },
     "ACC-SHARE-001": {
       "status": "pending",

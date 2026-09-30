@@ -1,0 +1,44 @@
+{
+  "leg": "sharing-invite-flow",
+  "stage": "sharing",
+  "status": "success",
+  "commit": "a1b2c3d",
+  "sessionId": "a91f04c8-3b2a-4f1e-9c8d-7e6f0a1b2c3d",
+  "returnToCoach": true,
+  "salientSummary": "Wrapped the invite key in a branded type so a leaked link cannot be redeemed by anyone who did not hold the share. The Safari pasteboard path still defers to its own leg; the rest of the flow is green and the mutation battery killed every mutant on the key-wrapping branch.",
+  "implemented": [
+    "src/sharing/invite.ts - InviteKey is now a branded type, not a bare string",
+    "src/sharing/accept.ts - verifies the key before redemption"
+  ],
+  "leftUndone": [
+    "The Safari pasteboard quirk - deferred to the safari-share leg"
+  ],
+  "verification": {
+    "commandsRun": [
+      {"command": "pytest -q", "exitCode": 0, "observation": "412 passed"},
+      {"command": "pnpm typecheck", "exitCode": 0, "observation": "no errors"}
+    ],
+    "interactiveChecks": [
+      {"surface": "web", "action": "opened an invite link in a fresh profile", "observed": "the accept page asked for confirmation, not the resource", "evidence": ".relay/evidence/S1/invite-accept.png"}
+    ]
+  },
+  "tests": {
+    "added": ["tests/test_sharing.py::test_invite_wraps_key"],
+    "mutations": {"run": 10, "survived": 0, "note": "all mutants killed on the key-wrapping branch"},
+    "coverage": "92% of src/sharing/"
+  },
+  "discoveredIssues": [
+    {"severity": "non_blocking", "description": "the invite table has no index on the redeemed_at column", "suggestedFix": "add a partial index where redeemed_at is null"}
+  ],
+  "procedureFollowed": [
+    {"step": "1 tests first", "followed": true, "note": ""},
+    {"step": "2 implement", "followed": true, "note": ""},
+    {"step": "3 verify", "followed": true, "note": "interactive check done in a fresh profile"}
+  ],
+  "decisions": [
+    {"decision": "InviteKey is a branded type, not a class", "reason": "a class would tempt behaviour on the key; a brand is zero-cost at runtime"}
+  ],
+  "repeatFriction": [
+    "the pasteboard quirk needs a shared helper before a second runner hits it"
+  ]
+}

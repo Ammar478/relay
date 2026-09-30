@@ -40,8 +40,32 @@ goes in `.relay/dashboard.json`, which you write:
 }
 ```
 
+`runners[].session` is the runner's own session id — the one route from a row on
+screen to the transcript of the agent that did the work. It comes from the
+handoff's `sessionId` field, which the model carries; quote it from there rather
+than re-typing it.
+
 Log line classes: `gate` (stage cleared), `gatebad` (stage failed), `note` (coach
 decision or warning), omitted for ordinary events.
+
+## The log is recorded, then written
+
+`.relay/progress.jsonl` is the run's history: an append-only, typed event log
+written by script, one JSON object per line — `relay_accepted`, `leg_dispatched`
+with the leg and the session, `leg_completed` with the commit, `gate_cleared`,
+`debt_recorded`. Append to it:
+
+```bash
+python3 scripts/relay_log.py append leg_completed --field leg=sharing-invite-flow \
+    --field status=success --field commit=abc1234 --field sessionId=a91f04c8
+python3 scripts/relay_log.py tail --relay-dir .relay --limit 20
+```
+
+It exists because the `log` array above used to be the only record, and it was
+narrated by the coach rather than recorded by the system: a coach that forgot a
+line produced a run that never happened. The script is the record; the `log`
+array is where you add what events cannot hold, and the Progress Log view reads
+both.
 
 ## The attention band
 
