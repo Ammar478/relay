@@ -32,6 +32,9 @@ REFERENCES   read these first, by absolute path: references/execution.md for the
              handoff and the shared-tree rules — or, for a judge leg,
              references/validation.md, which is where its whole remit lives
 
+COMMITS      subject describes the change for a reader of the target branch;
+             never prefix it with the leg name, stage or fix round
+
 JEV          (advisory when advisors are on; see references/advisors.md)
              - before implementing, when more than one approach is plausible:
                relay-decision with the problem, approaches and constraints
@@ -48,7 +51,7 @@ PROCEDURE    1. bring the stack up if you need it:
                 risk-based verification plan, with a stopping criterion.
                 Restore each from your backup; record zero when none are needed
              5. run: <exact verification commands>
-             6. commit by explicit pathspec, message "<leg>: <summary>"
+             6. commit by explicit pathspec, subject per COMMITS above
              7. write .relay/batons/sharing-invite-flow.json in the shape
                 templates/handoff.json gives, then validate it:
                 python3 scripts/relay_handoff.py validate sharing-invite-flow

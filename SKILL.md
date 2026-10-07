@@ -87,7 +87,12 @@ These bind every relay for this user and override anything softer below.
    commits go through it too. A runner's "gate passed" in a baton is a claim;
    the gate log is the evidence, and the coach reads it before any merge. A
    tool missing on the machine is a gate failure, never a skipped step.
-10. **Jev is advice, never evidence.** It never marks a check, replaces a judge,
+10. **A reviewer sees the change, not the relay.** Commit subjects and MR
+    titles describe what changed in the reader's terms — never a leg name,
+    stage or fix-round prefix. Before merge, the MR description is rewritten
+    to match the final diff, and the MR is squash-merged with a clean message
+    unless another repository pins one of its commits.
+11. **Jev is advice, never evidence.** It never marks a check, replaces a judge,
    a reviewer or a test run; low-confidence (`?`) answers are decided by the coach
    reading the material.
 
