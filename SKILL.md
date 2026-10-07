@@ -92,9 +92,22 @@ These bind every relay for this user and override anything softer below.
     stage or fix-round prefix. Before merge, the MR description is rewritten
     to match the final diff, and the MR is squash-merged with a clean message
     unless another repository pins one of its commits.
-11. **Jev is advice, never evidence.** It never marks a check, replaces a judge,
-   a reviewer or a test run; low-confidence (`?`) answers are decided by the coach
-   reading the material.
+11. **Jev is advice, never evidence.** It never marks a check, replaces a judge
+   or a test run; low-confidence (`?`) answers are decided by the coach reading
+   the material. For a small change (rule 12) Jev plus the gate log and a green
+   pipeline is the review.
+12. **Effort is proportional; do not over-engineer.** A small change (under ~150
+   changed lines, touching no auth/identity, destructive path, schema or prod
+   config) is validated by Jev `code-practice` + `change-value` on its diff, the
+   local gate log and a green MR pipeline — no reviewer agent, no judge, no
+   mutation battery. A reviewer agent is spawned only for auth/identity,
+   destructive, schema or prod-config changes, once per MR; a later delta is
+   re-reviewed only if it changes product logic. Only correctness and security
+   findings are fixed; everything else is one debt line in `relay.md`. Before
+   push, cut any file Jev marks `no_value` or `over_engineered`, and any diff
+   where new scripts and tests outweigh the product change they guard unless the
+   change is security. Prefer the smallest change that makes the thing work and
+   prove it live.
 
 ## Vocabulary
 
