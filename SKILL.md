@@ -80,7 +80,14 @@ These bind every relay for this user and override anything softer below.
 8. **Merge order is a dependency graph.** Merge each reviewed, fresh, green MR as
    soon as its real dependencies are met; never park it behind an unrelated
    blocker.
-9. **Jev is advice, never evidence.** It never marks a check, replaces a judge,
+9. **No push without the local gate, enforced.** Every relay worktree gets a
+   `pre-push` hook (`core.hooksPath` set per worktree) that runs the repo's
+   full gate — lint, format, type check, tests, plus the repo's own CI-mirrored
+   checks — and writes a log to `evidence/prepush-gate-*`. The coach's own
+   commits go through it too. A runner's "gate passed" in a baton is a claim;
+   the gate log is the evidence, and the coach reads it before any merge. A
+   tool missing on the machine is a gate failure, never a skipped step.
+10. **Jev is advice, never evidence.** It never marks a check, replaces a judge,
    a reviewer or a test run; low-confidence (`?`) answers are decided by the coach
    reading the material.
 
