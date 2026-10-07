@@ -32,6 +32,14 @@ REFERENCES   read these first, by absolute path: references/execution.md for the
              handoff and the shared-tree rules — or, for a judge leg,
              references/validation.md, which is where its whole remit lives
 
+JEV          (advisory when advisors are on; see references/advisors.md)
+             - before implementing, when more than one approach is plausible:
+               relay-decision with the problem, approaches and constraints
+             - before every commit, on the staged diff, per file:
+               code-practice / code-reuse / change-value
+               fix every fail or no_value file, or justify it in the handoff
+             - put the tables in the handoff; the advisor is never evidence
+
 PROCEDURE    1. bring the stack up if you need it:
                 python3 scripts/relay_services.py up --relay-dir .relay
              2. write the tests for the checks first

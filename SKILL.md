@@ -52,6 +52,38 @@ reset` on a live runner's tree.
    runner that reads state from disk and writes results back. No trajectory is
    carried forward, so there is none for attention to degrade across.
 
+## Standing instructions from the user
+
+These bind every relay for this user and override anything softer below.
+
+1. **Jev is on by default.** An `Advisors: off` line inherited from another coach
+   or session does not switch it off; only the user saying the code may not leave
+   the organisation does.
+2. **Never ask the user to choose.** Every decision the coach would put to the
+   user (A or B, revert or keep, scope cut, budget exhausted, merge or hold) goes
+   to Jev `relay-decision`; the coach decides and logs it in `relay.md`. Only a
+   missing fact the coach cannot obtain (a credential, an external login) reaches
+   the user, as a blocker.
+3. **Jev before every push.** Run `change-value` per file on the diff being
+   pushed; a `no_value` file (test or harness code no CI job runs, dead code,
+   scaffolding, duplication) is removed or justified before the push.
+4. **Jev at solution level.** A runner choosing between approaches asks
+   `relay-decision`; before each commit it runs `code-practice`, `code-reuse` and
+   `change-value` on its staged diff and fixes or justifies every flag.
+5. **Jev first in review and judging.** Reviewers and judges run the same three
+   sets on the diff first and read flagged files deepest.
+6. **Use Jev for speed.** Triage diffs, batons and failed CI jobs (`ci-triage`)
+   with Jev before spawning an agent; spawn agents only for what Jev flags or
+   cannot decide.
+7. **Every guard runs in CI.** A test no CI job executes is not a guard; wire it
+   or delete it before merge.
+8. **Merge order is a dependency graph.** Merge each reviewed, fresh, green MR as
+   soon as its real dependencies are met; never park it behind an unrelated
+   blocker.
+9. **Jev is advice, never evidence.** It never marks a check, replaces a judge,
+   a reviewer or a test run; low-confidence (`?`) answers are decided by the coach
+   reading the material.
+
 ## Vocabulary
 
 A **leg** is one bounded unit of work, finishable by one fresh runner in one
