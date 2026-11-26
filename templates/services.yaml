@@ -1,0 +1,14 @@
+# No persistent services: leave this file comments-only if a declaration is needed.
+# A daemon-free CLI normally needs only its recorded entrypoint in relay.md.
+# For real services, replace this with top-level named service mappings.
+# The parser does NOT accept {} or a services: wrapper.
+#
+# Example (uncomment and replace commands/paths for an actual service):
+# api:
+#   start: "python3 api.py --port 8000 > /tmp/relay-api.log 2>&1 &"
+#   stop: "your-command-to-stop-this-service"
+#   healthcheck: "curl -fsS http://127.0.0.1:8000/health"
+#   port: 8000
+#   logs: /tmp/relay-api.log
+#   depends_on: []
+# Quote no-op command strings as "true"; unquoted true is a boolean.

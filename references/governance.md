@@ -51,9 +51,9 @@ the stage judges. Its brief is fixed:
 2. **Expert judgement** — read it as a senior engineer would, not as a linter.
 3. **Overhead** — name anything present that the problem did not require.
    Over-engineering is a finding, not a style preference.
-4. **Coverage direction** — if the coverage delta starts with `-`, that is a
-   **blocker**: send it back and have quality add the missing tests. A negative
-   delta is never accepted "just this once".
+4. **Coverage** — investigate decreases; block for an approved threshold
+   violation, a missing required case, or a demonstrated unguarded risk.
+   Preserve stricter approved project policies and name the failed condition.
 5. **Freshness** — the source branch must be rebased onto the current target before
    merge. `git rev-list --count HEAD..origin/<target>` must be `0`.
 

@@ -140,10 +140,9 @@ plan, the dashboard, and the run count instead of hiding in a gate.
 
 ## Things worth knowing before your first run
 
-**Judging will not pass first time.** Expect two to four rounds per stage and
-roughly a third of your legs to be fixes. That is the architecture working. If a
-run goes all-green on the first pass, be suspicious of the contract rather than
-pleased with the code.
+Open a fix round for a demonstrated failed requirement or invalid evidence.
+There is no mandatory number of review rounds or fix legs. Accept first-pass
+success when the contract covers the request and independent evidence supports it.
 
 **It costs real tokens.** Most of that is the judging, which is the part worth
 paying for. The Phase 3 gate shows the run count before you approve. Start with

@@ -1,0 +1,52 @@
+{
+  "schemaVersion": 1,
+  "scopeRevision": 1,
+  "sourceRequest": "Change the Save button label to Save changes; preserve its action.",
+  "workflow": {
+    "bounded": true,
+    "reversible": true,
+    "multipleSystems": false,
+    "authorization": false,
+    "migration": false,
+    "externalContract": false,
+    "criticalUnknowns": [],
+    "rationale": "Local wording only; existing save action is unchanged."
+  },
+  "journeys": [
+    {
+      "id": "J-001",
+      "actor": "editor",
+      "start": "Open existing settings",
+      "outcome": "Save settings using Save changes",
+      "failureCases": "Existing save failure remains visible"
+    }
+  ],
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "kind": "functional",
+      "origin": "explicit",
+      "sourceRef": "sourceRequest",
+      "disposition": "required",
+      "statement": "Save changes labels the existing working save action",
+      "journeyIds": [
+        "J-001"
+      ],
+      "acceptanceIds": [
+        "ACC-SAVE-001"
+      ],
+      "risk": "Low: wording only; verify the action and failure feedback remain intact",
+      "verification": {
+        "tool": "browser and focused UI test",
+        "environment": "local app with seeded settings",
+        "evidence": "Label, successful save and failure feedback captured"
+      }
+    }
+  ],
+  "review": {
+    "reviewer": "",
+    "evidence": "",
+    "verdict": "unverified",
+    "fingerprint": ""
+  }
+}

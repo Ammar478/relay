@@ -1,0 +1,642 @@
+{
+  "type": "targeted synthetic scheduler regressions",
+  "sourceHashes": {
+    "baseline": {
+      "relay_decide.py": "3afa1290f6fb823b20a11bf7c10b673d25a469fcdde15c6b886abe2032971f14",
+      "relay_model.py": "7265bf1c12ac5f7ead7821e559558607a295bf70d276cc203cbbc35819d55b5f"
+    },
+    "candidate": {
+      "relay_decide.py": "499093a6bfa51f32dba27597d0fddacbf4ca3a842ad0d13151d7eb9fb9041336",
+      "relay_model.py": "cd5d5a0585d2046a3ce141a520733e479aefa136744bbfe14013ebc86dafc86c"
+    }
+  },
+  "notMeasured": [
+    "feature quality",
+    "agent latency",
+    "tokens",
+    "human interventions",
+    "48-hour reproduction"
+  ],
+  "harnessWallSeconds": 0.918,
+  "cases": [
+    {
+      "case": "simple-edit/healthy",
+      "expectedDispatch": [
+        "save-label"
+      ],
+      "expectedReason": null,
+      "baseline": {
+        "exitCode": 0,
+        "result": {
+          "stage": "S1",
+          "inFlight": [],
+          "dispatch": [
+            "save-label"
+          ],
+          "waiting": [
+            {
+              "leg": "review-save",
+              "reason": "waiting on save-label"
+            }
+          ],
+          "ceiling": {
+            "runners": 1,
+            "uiJudges": 1,
+            "apiJudges": 0,
+            "note": null
+          }
+        },
+        "matchesExpected": true
+      },
+      "candidate": {
+        "exitCode": 0,
+        "result": {
+          "stage": "S1",
+          "inFlight": [],
+          "dispatch": [
+            "save-label"
+          ],
+          "waiting": [
+            {
+              "leg": "review-save",
+              "reason": "waiting on save-label"
+            }
+          ],
+          "ceiling": {
+            "runners": 1,
+            "uiJudges": 1,
+            "apiJudges": 0,
+            "note": null
+          },
+          "blockers": [],
+          "complete": false,
+          "scope": {
+            "ready": true,
+            "errors": [],
+            "workflow": {
+              "mode": "lite",
+              "reasons": [
+                "bounded, reversible, known impact"
+              ],
+              "mandatoryChecks": [
+                "requirement coverage",
+                "code and behaviour review"
+              ],
+              "requestedMode": null,
+              "requestConflict": false
+            },
+            "fingerprint": "9bbdd4b09dcd858ff8e4cfd9d19faa995be5ff61b4bba66263ac07af700c8542",
+            "scopeRevision": 1,
+            "semanticCoverage": "recorded review; not proven by this validator"
+          }
+        },
+        "matchesExpected": true
+      }
+    },
+    {
+      "case": "simple-edit/blocked",
+      "expectedDispatch": [],
+      "expectedReason": "run is paused",
+      "baseline": {
+        "exitCode": 0,
+        "result": {
+          "stage": "S1",
+          "inFlight": [],
+          "dispatch": [
+            "save-label"
+          ],
+          "waiting": [
+            {
+              "leg": "review-save",
+              "reason": "waiting on save-label"
+            }
+          ],
+          "ceiling": {
+            "runners": 1,
+            "uiJudges": 1,
+            "apiJudges": 0,
+            "note": null
+          }
+        },
+        "matchesExpected": false
+      },
+      "candidate": {
+        "exitCode": 1,
+        "result": {
+          "stage": null,
+          "inFlight": [],
+          "dispatch": [],
+          "waiting": [],
+          "ceiling": {
+            "runners": 1,
+            "uiJudges": 1,
+            "apiJudges": 0,
+            "note": null
+          },
+          "blockers": [
+            "run is paused; no new dispatch"
+          ],
+          "complete": false,
+          "scope": {
+            "ready": true,
+            "errors": [],
+            "workflow": {
+              "mode": "lite",
+              "reasons": [
+                "bounded, reversible, known impact"
+              ],
+              "mandatoryChecks": [
+                "requirement coverage",
+                "code and behaviour review"
+              ],
+              "requestedMode": null,
+              "requestConflict": false
+            },
+            "fingerprint": "9bbdd4b09dcd858ff8e4cfd9d19faa995be5ff61b4bba66263ac07af700c8542",
+            "scopeRevision": 1,
+            "semanticCoverage": "recorded review; not proven by this validator"
+          }
+        },
+        "matchesExpected": true
+      }
+    },
+    {
+      "case": "existing-feature/healthy",
+      "expectedDispatch": [
+        "save-label-next"
+      ],
+      "expectedReason": null,
+      "baseline": {
+        "exitCode": 0,
+        "result": {
+          "stage": "S2",
+          "inFlight": [],
+          "dispatch": [
+            "save-label-next"
+          ],
+          "waiting": [
+            {
+              "leg": "review-save-next",
+              "reason": "waiting on save-label-next"
+            }
+          ],
+          "ceiling": {
+            "runners": 1,
+            "uiJudges": 1,
+            "apiJudges": 0,
+            "note": null
+          }
+        },
+        "matchesExpected": true
+      },
+      "candidate": {
+        "exitCode": 0,
+        "result": {
+          "stage": "S2",
+          "inFlight": [],
+          "dispatch": [
+            "save-label-next"
+          ],
+          "waiting": [
+            {
+              "leg": "review-save-next",
+              "reason": "waiting on save-label-next"
+            }
+          ],
+          "ceiling": {
+            "runners": 1,
+            "uiJudges": 1,
+            "apiJudges": 0,
+            "note": null
+          },
+          "blockers": [],
+          "complete": false,
+          "scope": {
+            "ready": true,
+            "errors": [],
+            "workflow": {
+              "mode": "standard",
+              "reasons": [
+                "change is not both bounded and reversible"
+              ],
+              "mandatoryChecks": [
+                "requirement coverage",
+                "code and behaviour review"
+              ],
+              "requestedMode": null,
+              "requestConflict": false
+            },
+            "fingerprint": "4d0f6f17e0fc40500a17ca718cbecdfbe45b58d1c640ea3f6eb68811396440d4",
+            "scopeRevision": 1,
+            "semanticCoverage": "recorded review; not proven by this validator"
+          }
+        },
+        "matchesExpected": true
+      }
+    },
+    {
+      "case": "existing-feature/blocked",
+      "expectedDispatch": [],
+      "expectedReason": "passed verdict",
+      "baseline": {
+        "exitCode": 0,
+        "result": {
+          "stage": "S2",
+          "inFlight": [],
+          "dispatch": [
+            "save-label-next"
+          ],
+          "waiting": [
+            {
+              "leg": "review-save-next",
+              "reason": "waiting on save-label-next"
+            }
+          ],
+          "ceiling": {
+            "runners": 1,
+            "uiJudges": 1,
+            "apiJudges": 0,
+            "note": null
+          }
+        },
+        "matchesExpected": false
+      },
+      "candidate": {
+        "exitCode": 1,
+        "result": {
+          "stage": "S1",
+          "inFlight": [],
+          "dispatch": [],
+          "waiting": [],
+          "ceiling": {
+            "runners": 1,
+            "uiJudges": 1,
+            "apiJudges": 0,
+            "note": null
+          },
+          "blockers": [
+            "ACC-SAVE-001: independent passed verdict and evidence required"
+          ],
+          "complete": false,
+          "scope": {
+            "ready": true,
+            "errors": [],
+            "workflow": {
+              "mode": "standard",
+              "reasons": [
+                "change is not both bounded and reversible"
+              ],
+              "mandatoryChecks": [
+                "requirement coverage",
+                "code and behaviour review"
+              ],
+              "requestedMode": null,
+              "requestConflict": false
+            },
+            "fingerprint": "4d0f6f17e0fc40500a17ca718cbecdfbe45b58d1c640ea3f6eb68811396440d4",
+            "scopeRevision": 1,
+            "semanticCoverage": "recorded review; not proven by this validator"
+          }
+        },
+        "matchesExpected": true
+      }
+    },
+    {
+      "case": "external-integration/healthy",
+      "expectedDispatch": [
+        "repair-1"
+      ],
+      "expectedReason": null,
+      "baseline": {
+        "exitCode": 0,
+        "result": {
+          "stage": "S1",
+          "inFlight": [],
+          "dispatch": [
+            "repair-1"
+          ],
+          "waiting": [
+            {
+              "leg": "review-save",
+              "reason": "stage legs not landed: repair-1"
+            },
+            {
+              "leg": "behaviour-review",
+              "reason": "stage legs not landed: repair-1"
+            }
+          ],
+          "ceiling": {
+            "runners": 1,
+            "uiJudges": 1,
+            "apiJudges": 0,
+            "note": null
+          }
+        },
+        "matchesExpected": true
+      },
+      "candidate": {
+        "exitCode": 0,
+        "result": {
+          "stage": "S1",
+          "inFlight": [],
+          "dispatch": [
+            "repair-1"
+          ],
+          "waiting": [
+            {
+              "leg": "review-save",
+              "reason": "stage legs not landed: repair-1"
+            },
+            {
+              "leg": "behaviour-review",
+              "reason": "stage legs not landed: repair-1"
+            }
+          ],
+          "ceiling": {
+            "runners": 1,
+            "uiJudges": 1,
+            "apiJudges": 0,
+            "note": null
+          },
+          "blockers": [],
+          "complete": false,
+          "scope": {
+            "ready": true,
+            "errors": [],
+            "workflow": {
+              "mode": "full",
+              "reasons": [
+                "externalContract"
+              ],
+              "mandatoryChecks": [
+                "requirement coverage",
+                "code and behaviour review",
+                "consumer compatibility",
+                "integration failure"
+              ],
+              "requestedMode": null,
+              "requestConflict": false
+            },
+            "fingerprint": "690911fba8ffd46b2f251e83aebd61ee3cbe051b4e1d967088785ac3843b9551",
+            "scopeRevision": 1,
+            "semanticCoverage": "recorded review; not proven by this validator"
+          }
+        },
+        "matchesExpected": true
+      }
+    },
+    {
+      "case": "external-integration/blocked",
+      "expectedDispatch": [],
+      "expectedReason": "attempt budget",
+      "baseline": {
+        "exitCode": 0,
+        "result": {
+          "stage": "S1",
+          "inFlight": [],
+          "dispatch": [
+            "repair-2"
+          ],
+          "waiting": [
+            {
+              "leg": "review-save",
+              "reason": "stage legs not landed: repair-2"
+            },
+            {
+              "leg": "behaviour-review",
+              "reason": "stage legs not landed: repair-2"
+            }
+          ],
+          "ceiling": {
+            "runners": 1,
+            "uiJudges": 1,
+            "apiJudges": 0,
+            "note": null
+          }
+        },
+        "matchesExpected": false
+      },
+      "candidate": {
+        "exitCode": 1,
+        "result": {
+          "stage": "S1",
+          "inFlight": [],
+          "dispatch": [],
+          "waiting": [
+            {
+              "leg": "repair-2",
+              "reason": "ACC-SAVE-001: attempt budget 3 exhausted; user scope decision required"
+            },
+            {
+              "leg": "review-save",
+              "reason": "stage legs not landed: repair-2"
+            },
+            {
+              "leg": "behaviour-review",
+              "reason": "stage legs not landed: repair-2"
+            }
+          ],
+          "ceiling": {
+            "runners": 1,
+            "uiJudges": 1,
+            "apiJudges": 0,
+            "note": null
+          },
+          "blockers": [
+            "no runnable work; resolve waiting reasons before retrying"
+          ],
+          "complete": false,
+          "scope": {
+            "ready": true,
+            "errors": [],
+            "workflow": {
+              "mode": "full",
+              "reasons": [
+                "externalContract"
+              ],
+              "mandatoryChecks": [
+                "requirement coverage",
+                "code and behaviour review",
+                "consumer compatibility",
+                "integration failure"
+              ],
+              "requestedMode": null,
+              "requestConflict": false
+            },
+            "fingerprint": "08a8c3172374187f7974597eac365fab016a356876afb711abbae8433c605bd1",
+            "scopeRevision": 1,
+            "semanticCoverage": "recorded review; not proven by this validator"
+          }
+        },
+        "matchesExpected": true
+      }
+    },
+    {
+      "case": "permissions/healthy",
+      "expectedDispatch": [
+        "save-label-next"
+      ],
+      "expectedReason": null,
+      "baseline": {
+        "exitCode": 0,
+        "result": {
+          "stage": "S2",
+          "inFlight": [],
+          "dispatch": [
+            "save-label-next"
+          ],
+          "waiting": [
+            {
+              "leg": "review-save-next",
+              "reason": "waiting on save-label-next"
+            },
+            {
+              "leg": "behaviour-review-next",
+              "reason": "waiting on save-label-next"
+            }
+          ],
+          "ceiling": {
+            "runners": 1,
+            "uiJudges": 1,
+            "apiJudges": 0,
+            "note": null
+          }
+        },
+        "matchesExpected": true
+      },
+      "candidate": {
+        "exitCode": 0,
+        "result": {
+          "stage": "S2",
+          "inFlight": [],
+          "dispatch": [
+            "save-label-next"
+          ],
+          "waiting": [
+            {
+              "leg": "review-save-next",
+              "reason": "waiting on save-label-next"
+            },
+            {
+              "leg": "behaviour-review-next",
+              "reason": "waiting on save-label-next"
+            }
+          ],
+          "ceiling": {
+            "runners": 1,
+            "uiJudges": 1,
+            "apiJudges": 0,
+            "note": null
+          },
+          "blockers": [],
+          "complete": false,
+          "scope": {
+            "ready": true,
+            "errors": [],
+            "workflow": {
+              "mode": "full",
+              "reasons": [
+                "authorization"
+              ],
+              "mandatoryChecks": [
+                "requirement coverage",
+                "code and behaviour review",
+                "permission boundaries",
+                "denied and permitted journeys"
+              ],
+              "requestedMode": null,
+              "requestConflict": false
+            },
+            "fingerprint": "3300112f9b7ab3a8232abd81edb53608a7414b41eca9c4e437f5a9e701be40db",
+            "scopeRevision": 1,
+            "semanticCoverage": "recorded review; not proven by this validator"
+          }
+        },
+        "matchesExpected": true
+      }
+    },
+    {
+      "case": "permissions/blocked",
+      "expectedDispatch": [],
+      "expectedReason": "scope revision",
+      "baseline": {
+        "exitCode": 0,
+        "result": {
+          "stage": "S2",
+          "inFlight": [],
+          "dispatch": [
+            "save-label-next"
+          ],
+          "waiting": [
+            {
+              "leg": "review-save-next",
+              "reason": "waiting on save-label-next"
+            },
+            {
+              "leg": "behaviour-review-next",
+              "reason": "waiting on save-label-next"
+            }
+          ],
+          "ceiling": {
+            "runners": 1,
+            "uiJudges": 1,
+            "apiJudges": 0,
+            "note": null
+          }
+        },
+        "matchesExpected": false
+      },
+      "candidate": {
+        "exitCode": 1,
+        "result": {
+          "stage": "S1",
+          "inFlight": [],
+          "dispatch": [],
+          "waiting": [],
+          "ceiling": {
+            "runners": 1,
+            "uiJudges": 1,
+            "apiJudges": 0,
+            "note": null
+          },
+          "blockers": [
+            "ACC-SAVE-001: verdict belongs to a different scope revision"
+          ],
+          "complete": false,
+          "scope": {
+            "ready": true,
+            "errors": [],
+            "workflow": {
+              "mode": "full",
+              "reasons": [
+                "authorization"
+              ],
+              "mandatoryChecks": [
+                "requirement coverage",
+                "code and behaviour review",
+                "permission boundaries",
+                "denied and permitted journeys"
+              ],
+              "requestedMode": null,
+              "requestConflict": false
+            },
+            "fingerprint": "3300112f9b7ab3a8232abd81edb53608a7414b41eca9c4e437f5a9e701be40db",
+            "scopeRevision": 1,
+            "semanticCoverage": "recorded review; not proven by this validator"
+          }
+        },
+        "matchesExpected": true
+      }
+    }
+  ],
+  "summary": {
+    "baseline": {
+      "matched": 4,
+      "total": 8
+    },
+    "candidate": {
+      "matched": 8,
+      "total": 8
+    }
+  }
+}

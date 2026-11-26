@@ -10,6 +10,15 @@ stack every round, guesses at ports, misses a service, and reports a failure tha
 belongs to its own setup rather than to the code. `relay-control` spent seven gate
 rounds inside a function because no way to run the product was ever declared.
 
+## CLI without persistent services
+
+Record the exact command, working directory and verification driver in relay.md.
+Run that command directly. Do not create services.yaml or init.sh just to satisfy
+the process. If a uniform tool interface needs a declaration, use the comments-only
+empty templates/services.yaml. An empty mapping written as {} is not supported
+by the minimal parser. For real services, fill the documented declarations and
+quote command strings such as "true" so they are not parsed as booleans.
+
 ## The readiness pre-flight, in Phase 0
 
 Four questions. Ask them before the contract is written, because the answers

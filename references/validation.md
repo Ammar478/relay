@@ -52,7 +52,19 @@ compare. And the contract becomes **shardable** — the coach can split 200 chec
 four judge legs by tool and by flow, which is the only way a large contract gets walked
 honestly.
 
-## The two judges
+## Scope and review boundaries
+
+Apply scope.md before code exists: compare the original request to the register,
+journeys, contract and plan. A structurally valid plan can still omit a requested
+journey; record that as a failing semantic review.
+Blocking findings need a requirement/approved convention or demonstrated defect,
+impact, evidence and severity. Optional refactoring is a proposal, not a gate.
+Use failed for observed wrong behaviour, blocked for unavailable prerequisites,
+and unverified for absent evidence. None counts as passed.
+Use one focused independent code-and-behaviour review for Lite; Standard may
+combine those roles. Full uses the two judges below.
+
+## The two judges (Full)
 
 Both run as legs at the end of a stage: clean context, no knowledge of how the code was
 written, in parallel with each other. **Neither can dispatch its own agents** — assume
@@ -66,7 +78,7 @@ handed to it as reports.
   synthesise one report from them
 - look for regressions in untouched areas, error paths never exercised, integration
   seams between legs, tests that assert the implementation
-- **judge structure, not only whether tests guard behaviour**: name the three largest
+- **judge structure, not only whether tests guard behaviour**: name up to three of the largest
   files the stage touched with their line counts, plus duplication across legs, seams
   that leaked, and dead code. `tests/frame.py` reached 2900 lines over eight legs and no
   judge mentioned it — structure was not in its remit.
@@ -74,17 +86,21 @@ handed to it as reports.
   `Convention` check** in `state.json` — all of them, whatever the project's standards
   demand, because they are measured from the tree. Nobody else can reach them, and a
   check nobody marks reads `blocked` for ever.
-- **apply the floor before calling anything blocking**: a check passes once its
-  behaviour holds and one mutation of the property it names fails the suite. A defect in
-  the guard on that guard — a test about a test, a mutation-harness bug — is `debt` in
-  `relay.md`, not a blocking finding, unless it hides a behavioural defect.
+- **apply the risk-based evidence floor**: verify the acceptance behaviour and
+  the evidence the plan requires. Mutation checks are optional unless a selected
+  guard or an approved project constraint requires them. Inspect credible runner
+  mutation evidence; repeat a battery only for changed code, a new finding or
+  suspect evidence integrity. A harness issue blocks only when it undermines
+  required evidence; the coach cannot accept product debt for the user.
 
 **Behaviour judge** — the system as a black box:
 
-- **Bring the stack up from the declaration, not by discovery.**
+- For persistent services, **bring the stack up from the declaration**.
   `python3 scripts/relay_services.py up --relay-dir .relay`, then `status`. The
   declaration exists so that no judge has to guess a port or miss a service; if it is
-  missing or wrong, that is a finding, and the fix is a leg.
+  missing or wrong for a required service, that is a finding. A CLI with no
+  persistent services uses its recorded README/CLI command directly; do not
+  manufacture a service declaration or init script just to run help.
 - **Start the product before reading a single check.** Find the way in a user has —
   README command, `bin/`, installed script, `--help` — and run it in a shell. **Run it
   from outside the tree that built it**: another directory at least, a clean checkout or
@@ -141,14 +157,12 @@ wrong contract is a finding for the coach, not something to work around.
 
 ## The fix loop
 
-Expect two to four rounds per stage, and roughly a third of your total legs to be fix
-legs. This is the architecture working, not failing.
+Open another round only for a demonstrated unmet requirement or invalid evidence.
+Estimate rework from risk; a stage may pass its first independent review.
 
-**The floor.** A check passes once its behaviour holds and one mutation of the property
-it names fails the suite. A defect in the guard on that guard is `debt` in `relay.md`,
-not a fix leg, unless it hides a behavioural defect — the guard on the guard is not
-itself proof that the underlying behaviour is broken. `relay-control` had no floor and
-spent gate rounds 5, 6 and 7 on guards on guards.
+**The floor.** Accept a check when its specified behavioural evidence holds.
+Require mutation evidence only for selected risk properties or approved constraints.
+Do not create guards on guards without a demonstrated effect on acceptance.
 
 1. Collect every failure and blocking finding that does not clear the floor above.
 2. Group them by root cause — one fix leg per cause, not per symptom.
