@@ -185,3 +185,11 @@ it `debt` with the reason. `ACC-DATA-009` took 10 legs and 7 gate rounds.
 Stop and get a human when a fix breaks a previously passing check twice, when the two
 judges disagree about whether something passed, or when passing a check would require
 changing the contract.
+
+## Advisor triage before reviewing or judging
+
+With advisors on, every reviewer and code judge starts by running `code-practice`,
+`code-reuse` and `change-value` on the diff it judges, split per file, and reads the
+flagged files first and deepest. Advisor answers are leads: a flagged file is
+verified by reading it, and an answer is never cited as evidence or used to mark a
+check.

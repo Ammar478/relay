@@ -52,6 +52,63 @@ reset` on a live runner's tree.
    runner that reads state from disk and writes results back. No trajectory is
    carried forward, so there is none for attention to degrade across.
 
+## Standing instructions from the user
+
+These bind every relay for this user and override anything softer below.
+
+1. **Jev is on by default.** An `Advisors: off` line inherited from another coach
+   or session does not switch it off; only the user saying the code may not leave
+   the organisation does.
+2. **Never ask the user to choose.** Every decision the coach would put to the
+   user (A or B, revert or keep, scope cut, budget exhausted, merge or hold) goes
+   to Jev `relay-decision`; the coach decides and logs it in `relay.md`. Only a
+   missing fact the coach cannot obtain (a credential, an external login) reaches
+   the user, as a blocker.
+3. **Jev before every push.** Run `change-value` per file on the diff being
+   pushed; a `no_value` file (test or harness code no CI job runs, dead code,
+   scaffolding, duplication) is removed or justified before the push.
+4. **Jev at solution level.** A runner choosing between approaches asks
+   `relay-decision`; before each commit it runs `code-practice`, `code-reuse` and
+   `change-value` on its staged diff and fixes or justifies every flag.
+5. **Jev first in review and judging.** Reviewers and judges run the same three
+   sets on the diff first and read flagged files deepest.
+6. **Use Jev for speed.** Triage diffs, batons and failed CI jobs (`ci-triage`)
+   with Jev before spawning an agent; spawn agents only for what Jev flags or
+   cannot decide.
+7. **Every guard runs in CI.** A test no CI job executes is not a guard; wire it
+   or delete it before merge.
+8. **Merge order is a dependency graph.** Merge each reviewed, fresh, green MR as
+   soon as its real dependencies are met; never park it behind an unrelated
+   blocker.
+9. **No push without the local gate, enforced.** Every relay worktree gets a
+   `pre-push` hook (`core.hooksPath` set per worktree) that runs the repo's
+   full gate — lint, format, type check, tests, plus the repo's own CI-mirrored
+   checks — and writes a log to `evidence/prepush-gate-*`. The coach's own
+   commits go through it too. A runner's "gate passed" in a baton is a claim;
+   the gate log is the evidence, and the coach reads it before any merge. A
+   tool missing on the machine is a gate failure, never a skipped step.
+10. **A reviewer sees the change, not the relay.** Commit subjects and MR
+    titles describe what changed in the reader's terms — never a leg name,
+    stage or fix-round prefix. Before merge, the MR description is rewritten
+    to match the final diff, and the MR is squash-merged with a clean message
+    unless another repository pins one of its commits.
+11. **Jev is advice, never evidence.** It never marks a check, replaces a judge
+   or a test run; low-confidence (`?`) answers are decided by the coach reading
+   the material. For a small change (rule 12) Jev plus the gate log and a green
+   pipeline is the review.
+12. **Effort is proportional; do not over-engineer.** A small change (under ~150
+   changed lines, touching no auth/identity, destructive path, schema or prod
+   config) is validated by Jev `code-practice` + `change-value` on its diff, the
+   local gate log and a green MR pipeline — no reviewer agent, no judge, no
+   mutation battery. A reviewer agent is spawned only for auth/identity,
+   destructive, schema or prod-config changes, once per MR; a later delta is
+   re-reviewed only if it changes product logic. Only correctness and security
+   findings are fixed; everything else is one debt line in `relay.md`. Before
+   push, cut any file Jev marks `no_value` or `over_engineered`, and any diff
+   where new scripts and tests outweigh the product change they guard unless the
+   change is security. Prefer the smallest change that makes the thing work and
+   prove it live.
+
 ## Vocabulary
 
 A **leg** is one bounded unit of work, finishable by one fresh runner in one
