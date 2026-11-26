@@ -30,6 +30,7 @@ def write_relay(root, legs, contract=None, stages=None):
                   for s in dict.fromkeys(lg["stage"] for lg in legs)]
     (relay / "legs.json").write_text(json.dumps({"relay": "t", "stages": stages,
                                                  "legs": legs}))
+    (relay / "state.json").write_text(json.dumps({"run": {"state": "running"}, "checks": {}}))
     if contract is not None:
         (relay / "contract.md").write_text("".join(
             f"### {cid} — a check\nBody.\n\n" for cid in contract))
@@ -180,9 +181,9 @@ def test_contract_ids_reads_the_real_fixture_contract():
 
 def test_the_claiming_leg_and_two_repairs_reach_the_budget(tmp_path):
     relay = write_relay(tmp_path, [
-        leg("build", fulfills=["ACC-X-001", "ACC-X-002"]),
-        leg("fix-1", repairs=["ACC-X-001"]),
-        leg("fix-2", repairs=["ACC-X-001"]),
+        leg("build", status="completed", fulfills=["ACC-X-001", "ACC-X-002"]),
+        leg("fix-1", status="completed", repairs=["ACC-X-001"]),
+        leg("fix-2", status="completed", repairs=["ACC-X-001"]),
         leg("code-judge-S1", kind="judge", fulfills=["ACC-X-001"]),
     ])
     result = relay_decide.budget(model_of(relay))
@@ -192,7 +193,7 @@ def test_the_claiming_leg_and_two_repairs_reach_the_budget(tmp_path):
 
 
 def test_a_leg_naming_a_check_twice_counts_once(tmp_path):
-    relay = write_relay(tmp_path, [leg("a", fulfills=["ACC-X-001"],
+    relay = write_relay(tmp_path, [leg("a", status="completed", fulfills=["ACC-X-001"],
                                        repairs=["ACC-X-001"])])
     assert relay_decide.budget(model_of(relay))["legs"] == {"ACC-X-001": 1}
 
@@ -219,8 +220,9 @@ def test_cli_exit_codes_name_blockers(tmp_path):
     relay = write_relay(tmp_path, [leg("a", fulfills=["ACC-X-001"])],
                         contract=["ACC-X-001", "ACC-X-002"])
     ok = run("dispatch", "--relay-dir", str(relay))
-    assert ok.returncode == 0, ok.stderr
-    assert json.loads(ok.stdout)["dispatch"] == ["a"]
+    assert ok.returncode == 1, ok.stderr
+    assert json.loads(ok.stdout)["dispatch"] == []
+    assert json.loads(ok.stdout)["scope"]["migrationRequired"]
 
     gap = run("coverage", "--relay-dir", str(relay))
     assert gap.returncode == 1
@@ -233,8 +235,8 @@ def test_cli_exit_codes_name_blockers(tmp_path):
 def test_cli_reads_the_real_fixture():
     result = run("dispatch", "--relay-dir",
                  str(REPO / "tests/fixtures/agent-service"))
-    assert result.returncode == 0, result.stderr
-    assert "dispatch" in json.loads(result.stdout)
+    assert result.returncode == 1, result.stderr
+    assert json.loads(result.stdout)["scope"]["migrationRequired"]
 
 
 # --------------------------------------------------------------------------

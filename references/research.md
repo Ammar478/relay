@@ -4,6 +4,13 @@ Used in Phase 0, and as the whole harness when the request is research rather
 than a build. The goal is a brief someone could act on, not a summary someone
 could have written from the first page of results.
 
+For build tasks, size research to the affected path using scope.md. Lite does
+not require four agents or a market survey. Stop once implementation-relevant
+unknowns are resolved with evidence. If a material unknown remains, record it
+and run a bounded spike or obtain the necessary decision; repeated queries are
+not progress. The exhaustive loop below applies to research-only requests and
+Full work whose risks justify it.
+
 ## Four angles, not four queries
 
 Decompose the topic into orthogonal angles and give each one its own agent.

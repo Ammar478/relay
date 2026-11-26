@@ -9,6 +9,23 @@ Work too big for one context window, run so a human spends attention on decision
 instead of babysitting. You are the **coach**. You plan, hand out legs, and hold
 the gates. You do not write implementation code yourself.
 
+## Start with scope and process size
+
+Read `references/scope.md` before planning. Preserve the original request in
+`.relay/requirements.json`; classify requirements, journeys, decisions and risk.
+Select Lite, Standard or Full from impact and uncertainty, not file count.
+The process-specific rules in that reference override the default Full phases
+below. Lite uses one implementer and one focused independent review, without
+artificial stages or separate architecture paperwork. Keep the same acceptance
+quality at every size. Existing user authorization remains authorization.
+
+Before implementation, validate scope and plan with `scripts/relay_scope.py`.
+Dispatch refuses missing, invalid or stale-reviewed scope. Old runs remain
+readable; recover their request and review a migration before resuming dispatch.
+Structural validation cannot establish that the request was understood: compare
+the original request, journeys, contract and plan independently before recording
+the review. Never record that review merely because the validator passed.
+
 ## Three invariants
 
 Everything else here is machinery for these — and **every rule below binds you
@@ -51,7 +68,8 @@ Create `.relay/` at the repo root (or working directory) at kickoff:
 ```
 .relay/
   relay.md                 objective, constraints, non-goals, harness, environment, decisions
-  architecture.md          the authoritative design the contract is derived from
+  requirements.json        original request, traceability, workflow and reviewed scope
+  architecture.md          design constrained by requirements (Standard/Full)
   contract.md              the acceptance checks that define done
   services.yaml            how every service starts, stops and reports healthy
   init.sh                  idempotent environment setup, verifying not installing
@@ -92,10 +110,10 @@ rest of the system as surprises, one interrupted week at a time.**
 
 #### 0a — The system map, before anything else
 
-Inventory **every** project the user has given you, not only the one the request
-names. For each, read enough to answer what it is, what it talks to, and how —
-**at least 500 lines**, concentrated on entry points, configuration, clients and
-deployment manifests rather than skimming everywhere.
+Inventory projects on the affected request path, including consumers and
+deployment dependencies. Read enough to establish ownership, contracts and impact.
+Use entry points, configuration, clients and deployment manifests as evidence;
+there is no minimum line count. Record why other projects are outside the impact.
 
 Then write `.relay/research/system-map.md`, and do not proceed without it:
 
@@ -122,8 +140,10 @@ Answer four questions before the contract exists, because a "no" is stage-1 work
 rather than something to discover at the first gate — full detail, and the shape
 of both files, in `references/environment.md`:
 
-1. Is there **one command** that brings the whole stack up? If not, write
-   `.relay/services.yaml` and `.relay/init.sh`, and make them stage-1 legs.
+1. Is there **one command** that starts the product? For persistent services,
+   record `.relay/services.yaml` and required setup in `.relay/init.sh`. For a
+   daemon-free CLI, record its entrypoint and working directory in `relay.md`;
+   no synthetic service or init script is needed.
 2. Do the **logs land on disk**? An agent reads a file; it cannot scroll a
    terminal it does not own.
 3. Can the product be **driven programmatically** — browser, terminal, HTTP? Name
@@ -166,8 +186,10 @@ derives a different answer from the first.
 Keep it short and decided: the seams and who owns each side, the data model and
 where state lives, the boundaries a leg may not cross, the shape of every edge the
 system map named, and the choices that were considered and rejected with why.
-`templates/architecture.md` is the shape. The contract is derived **from this
-file**; when the two disagree, this file is wrong and gets fixed first.
+`templates/architecture.md` is the shape. Derive the contract from the original
+requirements and user journeys, including
+applicable nonfunctional constraints. Architecture serves those requirements;
+resolve disagreement without silently rewriting scope.
 
 #### 1b — `.relay/contract.md`, before planning any implementation
 
@@ -196,8 +218,8 @@ Rules:
 
 - Group by user-facing area, then add cross-area flow checks.
 - Behavioural, not implementational. "Returns 200", not "calls `authService.login`".
-- Aim for coverage, not volume — a real feature is dozens of checks, not five —
-  and spend the time, because ambiguity here becomes rework later.
+- Cover required outcomes and relevant failure cases without a check-count quota.
+  Link checks to requirements, including conventions grounded in project rules.
 - **Write one to three standing checks in the user's own words.** One of them is
   always the sentence that says what the user runs. Quote from the request
   verbatim, mark them `Standing`, and re-verify every one at **every** stage gate,
@@ -276,7 +298,7 @@ Two things the plan carries besides legs:
   the one or two a whole stage depends on **now**, at planning time, rather than
   discovering them at leg six. Name them in each leg's `skills`.
 
-End every stage with two **judge legs** (`code-judge-<stage>` and
+For Full, end every stage with two **judge legs** (`code-judge-<stage>` and
 `behaviour-judge-<stage>`) in the queue like any other leg, so judging shows in the
 plan, the dashboard and the run count instead of hiding inside a gate.
 
@@ -287,9 +309,16 @@ one-runner fit, re-slice every stage that answers `horizontal_layer`.
 With advisors on, lint the finished contract and plan before the approval gate —
 see `references/advisors.md`.
 
+Before dispatch, run `python3 scripts/relay_scope.py --relay-dir .relay --draft`,
+perform the independent semantic coverage review, record its fingerprint and
+evidence in requirements.json.review, then run without --draft.
+Re-review changes to scope, contract or planned work; advance scopeRevision when
+requirements change and record affected legs and evidence in relay.md.
+
 ### Phase 3 — Approval gate
 
-Present to the human, then stop and wait:
+Present the concrete plan. If existing authorization covers it, proceed; otherwise
+obtain the missing scope or spend decision:
 
 ```
 RELAY        one line
@@ -298,7 +327,7 @@ CONTRACT     N checks across M areas
 STAGES       S1: name (n legs) → S2: ...
 SKELETON     the command the user can run once S1 clears
 ENVIRONMENT  one command starts the stack: yes | writing it in S1
-RUNS         ~N agent runs: L legs + 2 per stage, plus about a third again in fixes
+RUNS         planned implementation/review roles for this workflow; rework estimate separate
 CONCURRENCY  R runners, J judges at once; serial if the harness cannot fan out
 FIRST LEG    the opening leg
 RISKS        the two or three things most likely to go wrong
@@ -306,13 +335,17 @@ ADVISORS     on | off  (see references/advisors.md; off if code may not leave th
 ```
 
 **`RUNS` is not optional.** A human approving a twelve-hour spend is entitled to the
-number before it starts, and the arithmetic is simple: one run per leg, two judges
-per stage, and roughly a third again in fix legs. Say it is a floor, because
-judging finds work.
+number before it starts. Count the actual planned implementer and reviewer runs
+for the chosen workflow; estimate rework separately and explain the uncertainty.
+An estimate is not a quota or permission to omit required checks.
 
-Do not start before an explicit go. Log `relay_accepted` when it comes.
+Log `relay_accepted` with applicable user authorization before starting.
 
 ### Phase 4 — Running the legs
+
+Read `references/execution-gates.md`. Initialize explicit run.state before dispatch;
+missing or malformed execution state blocks. Respect blockers and never treat an
+empty dispatch batch as completion without complete=true.
 
 **Dispatch together every pending leg in this stage whose `dependsOn` have landed,
 whose `touches` are disjoint from every other in flight, and that still fits under
@@ -330,10 +363,9 @@ python3 scripts/relay_decide.py dispatch --relay-dir .relay
    `contract.md` whole: it judges against every check, not a `fulfills` list, which
    is empty for judges.
 2. The runner writes tests first, then implements, then runs its own verification
-   steps. **Mutation testing has one purpose — prove the guard exists — and a
-   default budget of about ten per leg, aimed at the properties that leg's checks
-   name.** A runner may exceed it for a stated reason; `relay-control`'s batteries
-   of 60–90 were 20 of its 30 hours, and the 60th found nothing the 10th did not.
+   steps. Select tests against acceptance criteria and failure risks. Use mutation
+   testing for valuable guard properties with a stated stopping criterion.
+   There is no per-leg quota or unchanged repeat without new evidence.
 3. The runner commits **by explicit pathspec**, per `references/execution.md`'s
    shared-tree rules. **Git is the exchange zone** — the next runner inherits the
    codebase, not a message.
@@ -384,12 +416,19 @@ context and no implementation history**, in parallel. **Brief them from
 code judge's structure duties; a judge not handed it is the judge that read
 `relay-control` through `build()` for seven rounds.
 
-Bring the stack up first, from the declaration rather than by discovery:
+For persistent services, bring the stack up from its declaration:
 
 ```bash
 python3 scripts/relay_services.py up --relay-dir .relay && \
 python3 scripts/relay_services.py status --relay-dir .relay
 ```
+
+For a CLI without persistent services, run its recorded entrypoint directly.
+Do not manufacture a service declaration or init script for it.
+
+Judges use templates/check-verdict.json and references/execution-gates.md for
+state records: evidence is a report-path string; multiple artifacts live inside
+the report. Scope review uses verdict "passed", not "approved".
 
 The **code judge** runs the suite, the linter and the type checker, marks every
 `Convention` check, and judges structure. Its per-leg reviews are read-only legs
@@ -415,8 +454,8 @@ covers — `passed`, `failed` or `blocked` — so two never write the same entry
 
 ### Phase 6 — Fix loop
 
-**Judging does not pass first time. That is normal** — expect roughly a third of
-your legs to be fix legs. Advisors on, triage each failure with
+Open a fix round only for a demonstrated failed requirement or invalid evidence.
+A stage may pass its first independent review. Advisors on, triage each failure with
 `relay-failure --input "<the check's reason from state.json>"` before writing a
 fix leg: a `contract` answer goes to the human, never a fix leg. For each
 failure, create a targeted fix leg naming in
@@ -433,17 +472,20 @@ needs two browser contexts, which failure was environmental. They go in
 `.relay/library/<topic>.md` under the stage and round that found them. A relay that
 skips this pays for the same discovery at every gate.
 
-**The floor.** A check passes once its behaviour holds and one mutation of the
-property it names fails the suite. A defect in the guard on that guard is written
-into `relay.md` as debt, not turned into a fix leg, unless it hides a behavioural
-defect. `relay-control` had no floor and spent gate rounds 5, 6 and 7 on guards on
+**The floor.** A check passes when its specified evidence proves its behaviour.
+Require mutation evidence only where the risk-based verification plan calls for it.
+A harness defect needs a fix only if it undermines required evidence or hides a
+behavioural defect. Record other observations without expanding the contract;
+only the user may accept debt against a required check. `relay-control` had no floor and spent gate rounds 5, 6 and 7 on guards on
 guards — round 6 left 18 of 21 mutations green.
 
-**The budget: three legs per check.** Count every leg against it — the leg that
-claims it in `fulfills`, plus each leg whose `repairs` names it. Stop at the third
-failure and put a scope decision to the human — cut it, change it, or mark it `debt`
-in `state.json` with the reason — rather than writing a fourth leg. `ACC-DATA-009`
-took 10 legs and 7 gate rounds.
+**The budget: three attempted legs per check.** Count initial implementation and
+repairs that started or settled; pending plans consume nothing. Failed, partial
+and conservatively cancelled attempts remain counted. Dispatch prevents a fourth
+attempt and overlapping attempts against the same check. Never reset an attempted
+leg to pending to bypass the gate. Diagnose the failure before adding a fresh fix.
+At exhaustion, obtain a real scope/debt decision rather than silently removing
+requirements. A third successful attempt can still be judged and accepted.
 
 When a fix breaks a passing check, revert it, make the regression its own check, and
 re-plan — once. If that same check breaks again, **stop and hand control back to the
@@ -451,7 +493,12 @@ human** with what you tried and what you believe is wrong.
 
 ### Phase 7 — Finish
 
-The relay completes when every check reads `passed` or recorded `debt`. Report:
+The relay completes only when dispatch returns complete=true with every stage
+accepted. Judges record scopeRevision and verifiedLegs for all stage work as
+described in references/execution-gates.md. Save that acceptance result before
+setting run.state to complete. A later dispatch suppresses work and returns
+complete=false for terminal control state; it is not a new acceptance verdict.
+Keep the terminal state complete and retain the earlier acceptance evidence. Report:
 
 ```
 SHIPPED    legs run, of which N were fixes
@@ -498,9 +545,11 @@ gate got wrong and why. Facts are most of what a gate round produces, and the ru
 
 ## Scaling
 
-Not every task deserves a relay — a single-file fix costs more to coordinate than to
-do. Use it when the objective spans multiple legs or must be verifiably rather than
-plausibly correct. For small work keep invariant one: define done first.
+Apply the Lite / Standard / Full policy in `references/scope.md`.
+
+Use Lite for bounded low-risk tasks, even when the user explicitly requests Relay.
+A small diff affecting sensitive behaviour still needs its risk checks.
+Define done first in every mode.
 
 Advisors on, kickoff asks Jev first — `relay-scale --input <objective>` — and its
 `single_session` answer is weighed here. A low-confidence answer is not a verdict:
@@ -516,9 +565,11 @@ implicitly.
 
 ## References
 
+- `references/scope.md` — requirement coverage, sizing and review boundaries
 - `references/harness.md` — the capability pre-flight, and what each harness calls things
 - `references/environment.md` — `services.yaml`, `init.sh`, drivers, isolation, the ceiling
 - `references/research.md` — the deep-search loop and gap analysis
+- `references/execution-gates.md` — run control, stage evidence and attempt budgets
 - `references/execution.md` — briefings, handoffs, parallel runners, recovery plays
 - `references/validation.md` — checks that hold up, and the two judges
 - `references/dashboard.md` — Relay Control: when to render, what to write
@@ -526,5 +577,5 @@ implicitly.
 - `references/governance.md` — review ownership, the merge gate, environments
 - `references/advisors.md` — optional second opinions, and what they may never do
 - `templates/` — the shapes for `relay.md`, `architecture.md`, `contract.md`,
-  `legs.json`, `state.json`, `services.yaml`, `init.sh` and `handoff.json`; read one
+  `requirements.json`, `legs.json`, `state.json`, `check-verdict.json`, `services.yaml`, `init.sh` and `handoff.json`; read one
   before writing that file. `assets/control.html` — dashboard template

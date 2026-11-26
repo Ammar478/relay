@@ -16,7 +16,7 @@ CHECKS       you must make these true (full text, not just IDs):
              ACC-SHARE-002 — ...
              ACC-SHARE-003 — ...
 
-CONTEXT      .relay/architecture.md — the authoritative design; do not re-derive it
+CONTEXT      .relay/architecture.md, or relay.md design decision for Lite; do not re-derive it
              files and modules that matter, and why
              findings from .relay/research/, procedures from .relay/skills/,
              facts from .relay/library/
@@ -36,9 +36,9 @@ PROCEDURE    1. bring the stack up if you need it:
                 python3 scripts/relay_services.py up --relay-dir .relay
              2. write the tests for the checks first
              3. implement until they pass
-             4. mutate to prove each guard exists — about ten, aimed at the
-                properties these checks name, each restored from your own
-                backup. Exceed ten only with a reason written in the handoff
+             4. run mutation checks only for properties selected by the
+                risk-based verification plan, with a stopping criterion.
+                Restore each from your backup; record zero when none are needed
              5. run: <exact verification commands>
              6. commit by explicit pathspec, message "<leg>: <summary>"
              7. write .relay/batons/sharing-invite-flow.json in the shape
@@ -155,7 +155,7 @@ judge's shards at a gate.
 | Runner grinding on one problem | Cut it. Mark the leg partial, capture the handoff, and either narrow the leg or escalate to the human. |
 | Leg keeps failing its checks | At the third leg against that check (the leg that claimed it plus its `repairs` legs — SKILL.md's budget), stop. The leg spec or the check is wrong, not the code. Re-scope. |
 | Fix breaks a passing check | Regression. Revert, make the regression itself a check, and re-plan the fix — once. If that check breaks a second time, stop and hand back to the human. |
-| A mutation battery comes back all-killed | Suspect a driver killed mid-run: the restart reads the mutant as the original and everything looks guarded. `git status` the mutation copy, restore, verify the baseline, re-run. |
+| Mutation evidence has an interrupted run or uncertain restore | Check the mutation copy and restore from a known clean source, verify the baseline, then rerun affected checks. An all-killed result alone is not grounds to repeat a credible battery. |
 | Judge cannot start the product | Not a note and not the judge's problem to work around. `relay_services.py status` first; a service that will not come healthy is a fix leg, and every check that judge owns reads `blocked` until it does. |
 | A runner reports a hallucinated tool | It was briefed with a capability this harness does not have. Re-run the pre-flight in `references/harness.md`, fix the briefing template, and re-dispatch. |
 | Human changes direction mid-run | Pause. Set `run.state` to `paused`, update `architecture.md` and the contract first, then re-scope remaining legs. Never let the code and the contract drift apart. |

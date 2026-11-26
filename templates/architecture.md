@@ -1,6 +1,7 @@
 # Architecture: <relay name>
 
-**Authoritative.** The contract is derived from this file, and every runner is
+**Design constrained by requirements.** Derive acceptance from the original
+request and requirements.json, not solely this design. Every runner is
 briefed with it. When this file and the code disagree, this file is the one that
 gets fixed first — then the code follows.
 
@@ -59,9 +60,9 @@ The choices that shape everything downstream, each with the reason and the
 alternative that lost. A runner that disagrees with a decision reads the reason
 here instead of quietly making the other choice in one leg.
 
-| Decision | Reason | Rejected alternative |
-|---|---|---|
-| | | |
+| Decision | Requirement / risk | Reuse inspected | Simplest alternative | Operational cost |
+|---|---|---|---|---|
+| | | | | |
 
 ## Known unknowns
 

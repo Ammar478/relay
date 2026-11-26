@@ -1,0 +1,8 @@
+{
+  "status": "passed",
+  "stage": "S1",
+  "scopeRevision": 1,
+  "markedBy": "<completed judge leg ID>",
+  "evidence": "<one report path, not an array; record only after real verification>",
+  "verifiedLegs": ["<every stage implementation and repair leg ID>"]
+}

@@ -69,7 +69,7 @@ differ, because this is the file a runner reads.
 
 - **Ships to:** <the development branch, and nothing else>
 - **Review owner:** the relay itself | <team or tool>
-- **Merge gate:** one reviewer who did not write it; negative coverage delta blocks
+- **Merge gate:** one reviewer who did not write it; coverage must satisfy approved thresholds and required cases; investigate decreases
 - **Never touched:** <stage and production branches, manifests, variables>
 
 ## Decisions log

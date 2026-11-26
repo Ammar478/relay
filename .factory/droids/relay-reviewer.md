@@ -20,9 +20,9 @@ and the run count.
   linter reads the diff; you read the change.
 - Overhead: name anything present that the problem did not require.
   Over-engineering is a finding, not a style preference.
-- Coverage direction: if the coverage delta starts with `-`, that is a
-  blocker. Send it back and have quality add the missing tests. A negative
-  delta is never accepted "just this once".
+- Coverage: investigate decreases. Block only for an approved threshold
+  violation, a missing required case, or a demonstrated unguarded risk; name
+  that evidence in the finding. Preserve stricter approved project policies.
 - Freshness: `git rev-list --count HEAD..origin/<target>` must be 0. The
   source branch is rebased onto the current target before merge.
 
@@ -31,7 +31,7 @@ and the run count.
 Read the MR, the acceptance contract, the implementation summary and the CI
 evidence. Check freshness: `git rev-list --count HEAD..origin/<target>` must
 be 0. Read the diff as a senior engineer: correct, complete, no overhead.
-Check the coverage delta; a negative one is a block. Return BLOCK, PASS WITH
+Check coverage against the approved thresholds and required cases. Return BLOCK, PASS WITH
 FINDINGS, or PASS. Write your verdict to `.relay/batons/<leg>.json` in the
 shape `templates/handoff.json` gives, then validate it:
 `python3 scripts/relay_handoff.py validate <leg> --relay-dir .relay`.

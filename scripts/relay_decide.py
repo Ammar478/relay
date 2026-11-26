@@ -31,16 +31,19 @@ a check passed - stays with the coach and the judges.
 Exit status: 0 when the answer needs no action beyond following it, 1 when it
 names a blocker (an orphaned or double-claimed check, a check at its repair
 budget or a fix leg outside it, a leg with no baton, a ceiling already full),
-2 when there is no relay to read.
+2 when there is no relay to read. Dispatch also returns 1 for missing, invalid
+or stale-reviewed scope; diagnostic commands remain available to legacy runs.
 """
 
 import argparse
 import json
+from pathlib import Path
 import re
 import sys
 
 import relay_handoff
 import relay_model
+import relay_scope
 
 #: The baton sections whose every item the coach must dispose of.
 DISPOSAL_SECTIONS = ("Left undone", "Issues discovered")
@@ -90,46 +93,135 @@ def legs_conflict(leg, other):
     return any(paths_overlap(a, b) for a in leg["touches"] for b in other["touches"])
 
 
-def current_stage(model):
-    """The first stage, in plan order, that still has a leg to finish."""
-    for leg in model["legs"]:
-        if leg["status"] not in FINISHED:
-            return leg["stage"]
+def _attempted(leg):
+    # Pending plans do not consume attempts. Cancelled work counts conservatively:
+    # cancellation must not erase a possibly started attempt.
+    return leg["status"] in ("completed", "running", "cancelled") or (
+        (leg["rawStatus"] or "").strip().lower() in ("failed", "partial"))
+
+
+def _settled(leg):
+    return leg["status"] in FINISHED or (
+        leg["kind"] in ("impl", "fix")
+        and (leg["rawStatus"] or "").strip().lower() in ("failed", "partial"))
+
+
+def _check_work(leg):
+    return set(leg["fulfills"] + leg["repairs"]) if leg["kind"] in ("impl", "fix") else set()
+
+
+def stage_blockers(model, stage, state, scope_revision=None):
+    """Gate completed stages on recorded independent evidence, never leg count."""
+    legs = [leg for leg in model["legs"] if leg["stage"] == stage]
+    judges = {leg["id"]: leg for leg in legs if leg["kind"] == "judge"}
+    errors = []
+    if not judges or any(j["status"] != LANDED for j in judges.values()):
+        errors.append("independent stage judges have not completed")
+    checks = set().union(*(_check_work(leg) for leg in legs)) if legs else set()
+    if not checks:
+        errors.append("stage has no acceptance checks")
+    for cid in sorted(checks):
+        record = state.get("checks", {}).get(cid, {})
+        if record.get("stage") != stage:
+            errors.append(f"{cid}: missing or mismatched stage verdict")
+            continue
+        if scope_revision is not None and (type(record.get("scopeRevision")) is not int
+                                           or record["scopeRevision"] != scope_revision):
+            errors.append(f"{cid}: verdict belongs to a different scope revision")
+            continue
+        if record.get("status") == "debt":
+            approval = record.get("approval", {})
+            if not (isinstance(approval, dict) and approval.get("approvedBy") == "user"
+                    and isinstance(approval.get("decisionRef"), str) and approval["decisionRef"].strip()
+                    and isinstance(approval.get("reason"), str) and approval["reason"].strip()):
+                errors.append(f"{cid}: debt needs a recorded user decision and reason")
+            continue
+        judge = record.get("markedBy")
+        if not (isinstance(judge, str) and judge in judges and judges[judge]["status"] == LANDED
+                and record.get("status") == "passed"
+                and isinstance(record.get("evidence"), str) and record["evidence"].strip()):
+            errors.append(f"{cid}: independent passed verdict and evidence required")
+            continue
+        work = [leg for leg in legs if leg["kind"] in ("impl", "fix")]
+        supporting = [leg for leg in work if cid in _check_work(leg)]
+        verified = record.get("verifiedLegs")
+        if (not isinstance(verified, list) or not all(isinstance(x, str) for x in verified)
+                or any(not _settled(leg) or leg["id"] not in verified for leg in work)
+                or not any(leg["status"] == LANDED for leg in supporting)):
+            errors.append(f"{cid}: verdict does not cover all settled stage implementation and repair legs")
+    return errors
+
+
+def current_stage(model, state=None, scope_revision=None):
+    """First unfinished OR unaccepted stage, including the final stage."""
+    state = state if state is not None else relay_model.execution_state(model["relay"]["relayDir"])
+    for stage in dict.fromkeys(leg["stage"] for leg in model["legs"]):
+        legs = [leg for leg in model["legs"] if leg["stage"] == stage]
+        if any(not _settled(leg) for leg in legs):
+            return stage
+        if stage_blockers(model, stage, state, scope_revision):
+            return stage
     return None
 
 
-def dispatch(model):
-    """Every pending leg of the current stage that may start now.
+def _repair_blocker(leg, legs, occupied):
+    if leg["kind"] != "fix":
+        return None
+    if not leg["repairs"]:
+        return "repair must name acceptance IDs"
+    for cid in leg["repairs"]:
+        owners = [other for other in legs if cid in other["fulfills"] and other["kind"] == "impl"]
+        if len(owners) != 1 or owners[0]["stage"] != leg["stage"]:
+            return f"{cid}: repair requires one implementation owner in the same stage"
+        if not _settled(owners[0]):
+            return f"{cid}: implementation attempt must finish before repair"
+        attempts = {other["id"] for other in legs if cid in _check_work(other) and _attempted(other)}
+        attempts.update(other["id"] for other in occupied if cid in _check_work(other))
+        if len(attempts) >= FIX_BUDGET:
+            return f"{cid}: attempt budget {FIX_BUDGET} exhausted; user scope decision required"
+        if any(cid in _check_work(other) for other in occupied):
+            return f"{cid}: another attempt is in flight"
+    return None
 
-    A leg starts when every leg it `dependsOn` has landed, its `touches` are
-    disjoint from every leg in flight and every leg already in this batch, it
-    fits under the plan's concurrency ceiling, and - for a judge - every
-    implementation and fix leg of its stage has landed. Plan order breaks
-    ties: the earlier leg takes the files.
-    """
+
+def dispatch(model, scope_revision=None):
+    """Recommend a batch only after execution control, stage and attempt gates."""
     legs = [leg for leg in model["legs"] if leg["id"]]
-    status = {leg["id"]: leg["status"] for leg in legs}
-    stage = current_stage(model)
     in_flight = [leg for leg in legs if leg["status"] == "running"]
-    ceiling = model["relay"]["concurrency"]
-    batch, waiting = [], []
-
+    result = {"stage": None, "inFlight": [leg["id"] for leg in in_flight],
+              "dispatch": [], "waiting": [], "ceiling": model["relay"]["concurrency"],
+              "blockers": [], "complete": False}
+    try:
+        state = relay_model.execution_state(model["relay"]["relayDir"])
+    except (OSError, ValueError, TypeError, RecursionError) as exc:
+        result["blockers"] = [str(exc)]
+        return result
+    if state["run"]["state"] != "running":
+        result["blockers"] = [f"run is {state['run']['state']}; no new dispatch"]
+        return result
+    stage = current_stage(model, state, scope_revision)
+    result["stage"] = stage
+    if stage is None:
+        result["complete"] = True
+        return result
+    status = {leg["id"]: leg["status"] for leg in legs}
+    batch = []
     for leg in legs:
         if leg["stage"] != stage or leg["status"] != "pending":
             continue
-        reason = _why_not(leg, legs, status, in_flight + batch, ceiling)
+        reason = (_repair_blocker(leg, legs, in_flight + batch)
+                  or _why_not(leg, legs, status, in_flight + batch, result["ceiling"]))
         if reason:
-            waiting.append({"leg": leg["id"], "reason": reason})
+            result["waiting"].append({"leg": leg["id"], "reason": reason})
         else:
             batch.append(leg)
-
-    return {
-        "stage": stage,
-        "inFlight": [leg["id"] for leg in in_flight],
-        "dispatch": [leg["id"] for leg in batch],
-        "waiting": waiting,
-        "ceiling": ceiling,
-    }
+    result["dispatch"] = [leg["id"] for leg in batch]
+    stage_legs = [leg for leg in legs if leg["stage"] == stage]
+    if all(_settled(leg) for leg in stage_legs):
+        result["blockers"] = stage_blockers(model, stage, state, scope_revision)
+    elif not batch and not in_flight:
+        result["blockers"] = ["no runnable work; resolve waiting reasons before retrying"]
+    return result
 
 
 def _over_ceiling(leg, occupied, ceiling):
@@ -166,18 +258,30 @@ def _over_ceiling(leg, occupied, ceiling):
 
 
 def _why_not(leg, legs, status, occupied, ceiling):
-    if (leg["rawStatus"] or "").strip().lower() == "blocked":
+    raw_status = (leg["rawStatus"] or "").strip().lower().replace(" ", "_")
+    known = set().union(*relay_model.STATUS_ALIASES.values())
+    if raw_status and raw_status not in known:
+        return f"status {raw_status}: diagnose and create a fresh repair leg; do not rerun this attempt"
+    if raw_status == "blocked":
         return "marked blocked in legs.json"
     unknown = [d for d in leg["dependsOn"] if d not in status]
     if unknown:
         return f"depends on legs with no entry: {', '.join(unknown)}"
-    open_deps = [d for d in leg["dependsOn"] if status[d] != LANDED]
+    by_id = {other["id"]: other for other in legs}
+    def satisfied(dep):
+        other = by_id[dep]
+        return status[dep] == LANDED or (
+            leg["kind"] == "judge" and other["kind"] in ("impl", "fix") and _settled(other)
+        ) or (
+            leg["kind"] == "fix" and _settled(other)
+            and bool(_check_work(other) & set(leg["repairs"])))
+    open_deps = [d for d in leg["dependsOn"] if not satisfied(d)]
     if open_deps:
         return f"waiting on {', '.join(open_deps)}"
     if leg["kind"] == "judge":
         unlanded = [other["id"] for other in legs
-                    if other["stage"] == leg["stage"] and other["kind"] != "judge"
-                    and other["status"] not in FINISHED]
+                    if other["stage"] == leg["stage"] and other["kind"] in ("impl", "fix", "read")
+                    and not _settled(other)]
         if unlanded:
             return f"stage legs not landed: {', '.join(unlanded)}"
     clash = [other["id"] for other in occupied if legs_conflict(leg, other)]
@@ -216,15 +320,16 @@ def coverage(model, contract):
 def budget(model, limit=FIX_BUDGET):
     """Legs per check, counted from `legs.json` - never from memory.
 
-    Every leg against a check counts: the leg that claims it in `fulfills`
-    plus each leg whose `repairs` names it (SKILL.md, Phase 6). At `limit` the
-    coach stops and puts a scope decision to the human. A fix leg that names no
-    check in `repairs` is counted against nothing, so the budget cannot hold
-    while one exists: it is listed as `unattributed`.
+    Count started or settled implementation/repair attempts, including failed,
+    partial and conservatively cancelled work. Queued plans do not spend the
+    budget. Dispatch reserves a batch's slots and prevents overlapping attempts
+    against the same check. A fix with no repairs is always unattributed.
     """
     counts = {}
     for leg in model["legs"]:
         claims = [] if leg["kind"] == "judge" else leg["fulfills"]
+        if not _attempted(leg):
+            continue
         for cid in dict.fromkeys(claims + leg["repairs"]):
             counts.setdefault(cid, []).append(leg["id"] or "<unidentified leg>")
     return {
@@ -291,6 +396,8 @@ def _handoff_items(path, leg_id):
 
 
 def _blocked(command, result):
+    if command == "dispatch":
+        return bool(result.get("blockers"))
     if command == "coverage":
         return bool(result["orphans"] or result["duplicates"] or result["unknown"]
                     or result.get("missingContract"))
@@ -307,6 +414,12 @@ def main(argv=None):
     ap.add_argument("leg", nargs="?", help="the leg whose baton `items` reads")
     ap.add_argument("--relay-dir", default=".relay")
     args = ap.parse_args(argv)
+    scope = None
+    if args.command == "dispatch" and Path(args.relay_dir).is_dir():
+        scope = relay_scope.check(args.relay_dir)
+        if not scope["ready"]:
+            print(json.dumps({"dispatch": [], "scope": scope}, indent=2))
+            return 1
     try:
         model = relay_model.build(args.relay_dir, now=None)
     except relay_model.RelayNotFound as exc:
@@ -316,7 +429,8 @@ def main(argv=None):
     if args.command == "items" and not args.leg:
         ap.error("items needs a LEG")
     if args.command == "dispatch":
-        result = dispatch(model)
+        result = dispatch(model, scope_revision=scope["scopeRevision"])
+        result["scope"] = scope
     elif args.command == "coverage":
         result = coverage(model, relay_model.contract_ids(args.relay_dir))
     elif args.command == "budget":

@@ -15,8 +15,10 @@ not a note. A check with no evidence is blocked, not passed.
 
 ## What you own
 
-- Starting the stack from the declaration:
+- Starting persistent services from the declaration:
   `python3 scripts/relay_services.py up --relay-dir .relay`, then `status`.
+  For a daemon-free CLI, use the recorded entrypoint directly; no synthetic
+  service or init file is needed.
 - Starting the product before reading a single check, from outside the tree
   that built it. The report's first line is the exact command typed and its
   first output.
@@ -26,10 +28,19 @@ not a note. A check with no evidence is blocked, not passed.
 - A check with no evidence is blocked, not passed. "I could not start it"
   blocks the stage: every check you own reads `blocked` until something starts.
 
+## Verdict records
+
+Follow references/execution-gates.md and templates/check-verdict.json. Write
+state.json check evidence as ONE nonempty report-path string, not an array.
+Put multiple artifact links inside that report. Record the current integer
+scopeRevision, your completed judge leg ID in markedBy, and verifiedLegs for
+ALL stage implementation/repair attempts. These records differ from a handoff's
+interactiveChecks evidence. Never invent passed verdicts or user debt approval.
+
 ## How you work
 
-Bring the stack up: `python3 scripts/relay_services.py up --relay-dir .relay`,
-then `status`. Find the way a user has — README, `bin/`, `--help` — and run
+If persistent services are required, bring them up with relay_services.py and
+check status. Otherwise use the recorded CLI entrypoint. Find the way a user has — README, `bin/`, `--help` — and run
 it from outside the build tree. The report's first line is the exact command
 and its first output; a report without that line is not a report. Walk each
 check with its named driver. Never reach past the entrypoint — a `python -c`

@@ -139,6 +139,12 @@ def _parse_fields(values):
             fields[key] = json.loads(raw)
         except (json.JSONDecodeError, TypeError, ValueError):
             fields[key] = raw
+        # Identifiers are opaque text. A valid short SHA such as 42854e2 is
+        # also valid JSON scientific notation; numeric coercion destroys it.
+        if key in ("commit", "commitId", "sessionId", "spawnId", "leg", "legId",
+                   "stage", "stageId", "check", "checkId", "modelId"):
+            if not isinstance(fields[key], str):
+                fields[key] = raw
     return fields
 
 

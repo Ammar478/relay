@@ -479,6 +479,70 @@ def _load(path):
     return _parse(raw)
 
 
+def scope_inputs(relay_dir):
+    """Strict scope input snapshot, using the model's bounded nonblocking reader.
+
+    Display parsing stays tolerant. Execution rejects duplicate keys and wrong
+    top-level types rather than normalizing away malformed planning evidence.
+    None means a legacy run needs an explicitly reviewed scope migration.
+    """
+    root = pathlib.Path(relay_dir)
+
+    def read(name, optional=False):
+        raw, _mtime, why = _read_relay_file(root / name)
+        if raw is None:
+            if optional and why is None:
+                return None
+            raise ValueError(f"{name}: {why or 'missing'}")
+        return raw.decode("utf-8")
+
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON key: {key}")
+            result[key] = value
+        return result
+
+    def object_data(text, name):
+        data = json.loads(text, object_pairs_hook=unique)
+        if not isinstance(data, dict):
+            raise ValueError(f"{name}: expected an object")
+        return data
+
+    requirements = read("requirements.json", optional=True)
+    if requirements is None:
+        return None
+    return (object_data(requirements, "requirements.json"),
+            object_data(read("legs.json"), "legs.json"), read("contract.md"))
+
+
+def execution_state(relay_dir):
+    """Read execution control strictly without changing tolerant display parsing."""
+    raw, _mtime, why = _read_relay_file(pathlib.Path(relay_dir) / "state.json")
+    if raw is None:
+        raise ValueError(f"state.json: {why or 'missing; initialize run.state before dispatch'}")
+
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"state.json: duplicate key {key}")
+            result[key] = value
+        return result
+
+    data = json.loads(raw.decode("utf-8"), object_pairs_hook=unique)
+    if not isinstance(data, dict):
+        raise ValueError("state.json must be an object")
+    run = data.get("run")
+    if not isinstance(run, dict) or run.get("state") not in ("running", "paused", "blocked", "complete"):
+        raise ValueError("state.json: explicit run.state must be running, paused, blocked or complete")
+    checks = data.get("checks", {})
+    if not isinstance(checks, dict) or any(not isinstance(c, dict) for c in checks.values()):
+        raise ValueError("state.json: checks must map IDs to objects")
+    return data
+
+
 def _parse(raw):
     """(data, state, why) for bytes already read: ok | malformed.
 
